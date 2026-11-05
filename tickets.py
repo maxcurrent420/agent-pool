@@ -16,11 +16,17 @@ from pathlib import Path
 
 try:  # package import (Hermes loads plugins as a package)
     from . import ledger as L
+    from .execution import (BudgetExhausted, BudgetTracker, LifecycleWorkerRunner,
+                            LocalProcessRunner, SandboxPolicy, build_mandate_brief,
+                            create_worktree, run_acceptance, run_worker_loop)
     from .gateway import GatewayAdapter
     from .propagation import Member, RepoPropagator
     from .transport import TransportBackend
 except ImportError:  # flat import (pytest from repo root)
     import ledger as L
+    from execution import (BudgetExhausted, BudgetTracker, LifecycleWorkerRunner,
+                           LocalProcessRunner, SandboxPolicy, build_mandate_brief,
+                           create_worktree, run_acceptance, run_worker_loop)
     from gateway import GatewayAdapter
     from propagation import Member, RepoPropagator
     from transport import TransportBackend
@@ -56,6 +62,7 @@ class PoolService:
         self._caller_sk = caller_signing_key
         self._caller_box_sk = caller_box_sk
         self._budget_defaults = budget_defaults
+        self._workers: dict[str, dict] = {}  # ticket_id -> worker record
 
     # -- pool membership ----------------------------------------------------
 
@@ -157,6 +164,150 @@ class PoolService:
                 f"{STATE_MARKER.format(state='open')} ticket {ticket_id} released",
                 kind="ticket_release")
         return updated
+
+    # -- Phase 4: agent execution --------------------------------------------
+
+    def report_progress(self, ticket_id, text) -> dict:
+        """Milestone progress to the ticket thread ONLY (4 KB guard, no bytes)."""
+        ticket = self.show_ticket(ticket_id)
+        short = f"ticket {ticket_id}: {text}"[:3500]
+        self._gateway.post_notice(ticket["pool_id"], short, kind="progress")
+        return {"ok": True, "ticket_id": ticket_id, "text": short}
+
+    def _budget_exhausted(self, ticket, reason, usage) -> dict:
+        """Structured waiting/blocked report + claim released (re-armable).
+
+        The ticket goes claimed -> blocked with a machine-readable notice;
+        the claim row is released so the ticket can be re-claimed later
+        (blocked -> open is a legal transition).
+        """
+        report = (f"{STATE_MARKER.format(state='blocked')} [blocked] {reason} "
+                  f"usage={json.dumps(usage or {}, sort_keys=True)} "
+                  f"claim released; ticket re-armable")
+        if ticket.get("thread_ref"):
+            self._gateway.set_ticket_state(ticket["thread_ref"], "blocked")
+        self._gateway.post_notice(ticket["pool_id"], report[:3500], kind="blocked_report")
+        L.release_claim_for_ticket(self._conn, ticket["ticket_id"])
+        if ticket["state"] == "claimed":
+            L.set_ticket_state(self._conn, ticket["ticket_id"], "blocked")
+        L.record_event(self._conn, ticket["pool_id"], "budget_exhausted",
+                       {"ticket_id": ticket["ticket_id"], "reason": str(reason),
+                        "usage": usage or {}})
+        self._workers.pop(ticket["ticket_id"], None)
+        return {"ok": False, "ticket_id": ticket["ticket_id"], "state": "blocked",
+                "reason": str(reason), "usage": usage or {},
+                "claim": "released"}
+
+    def start_work(self, ticket_id, *, work_root, lifecycle=None, runner=None,
+                   worker_command=None, acceptance_cmd=None) -> dict:
+        """Fetch latest ACCEPTED version over Iroh, create the ticket worktree,
+        and spawn the worker session seeded with mandate + budget + sandbox.
+
+        ``runner`` overrides backend selection (tests). With no runner and no
+        Hermes ``lifecycle``, a LocalProcessRunner over ``worker_command``
+        is used (CLI / exit-demo path).
+        """
+        ticket = self.show_ticket(ticket_id)
+        if ticket["state"] != "claimed":
+            raise ValueError(f"start work needs a claimed ticket, got {ticket['state']!r}")
+        if ticket["claimant_key_id"] != self._caller_key_id:
+            raise PermissionError("start work: only the claimant may start work")
+        if ticket_id in self._workers:
+            raise ValueError(f"a worker is already running for ticket {ticket_id!r}")
+        claim = L.get_active_claim(self._conn, ticket_id)
+        if claim is None:
+            raise ValueError(f"no active claim for ticket {ticket_id!r}")
+        budget = json.loads(claim["budget_json"] or "{}")
+        manifest = L.get_latest_accepted_manifest(self._conn, ticket["repo_id"])
+        if manifest is None:
+            raise ValueError(f"no ACCEPTED version for repo {ticket['repo_id']!r} to fetch")
+
+        prop = self._propagator(ticket)
+        fetcher = prop._members.get(self._caller_key_id)
+        if fetcher is None or fetcher.box_sk is None:
+            raise PermissionError("start work needs the claimant's local box key for DEK unwrap")
+        work_root = Path(work_root)
+        fetched = prop.fetch(manifest=manifest, fetcher=fetcher,
+                             dest=work_root / "fetch")
+        wt = create_worktree(fetched["clone_dir"], ticket_id, work_root / "worktrees")
+        sandbox = SandboxPolicy()
+        mandate = build_mandate_brief(ticket=ticket, budget=budget, worktree=wt["worktree"],
+                                      branch=wt["branch"], sandbox=sandbox)
+        if runner is None:
+            if lifecycle is not None:
+                runner = LifecycleWorkerRunner(lifecycle)
+            elif worker_command:
+                runner = LocalProcessRunner(list(worker_command), sandbox=sandbox)
+            else:
+                raise ValueError("start work needs a worker_command or Hermes lifecycle")
+        handle = runner.launch(mandate, worktree=wt["worktree"])
+        tracker = BudgetTracker(budget)
+        self._workers[ticket_id] = {
+            "handle": handle, "runner": runner, "tracker": tracker,
+            "worktree": wt["worktree"], "branch": wt["branch"],
+            "clone_dir": wt["clone_dir"], "fetched": fetched,
+            "acceptance_cmd": list(acceptance_cmd or []),
+            "mandate": mandate, "budget": budget,
+        }
+        L.record_event(self._conn, ticket["pool_id"], "worker_started",
+                       {"ticket_id": ticket_id, "branch": wt["branch"],
+                        "worktree": wt["worktree"],
+                        "content_hash": fetched.get("content_hash")})
+        self.report_progress(ticket_id,
+                             f"worker started on {wt['branch']} "
+                             f"(accepted v{manifest['version']}, sandbox={sandbox.describe()[:80]}...)")
+        return {"ok": True, "ticket_id": ticket_id, "branch": wt["branch"],
+                "worktree": wt["worktree"], "repo_version": manifest["version"],
+                "content_hash": fetched.get("content_hash"), "mandate": mandate}
+
+    def complete_work(self, ticket_id, *, timeout_seconds=None,
+                      poll_interval=0.05) -> dict:
+        """Wait for the worker, enforce budget, run acceptance tests sandboxed,
+        then submit the contributor-signed manifest (ticket -> review)."""
+        record = self._workers.get(ticket_id)
+        if record is None:
+            raise ValueError(f"no running worker for ticket {ticket_id!r}")
+        ticket = self.show_ticket(ticket_id)
+        runner, handle, tracker = record["runner"], record["handle"], record["tracker"]
+        try:
+            status = run_worker_loop(runner, handle, tracker,
+                                     poll_interval=poll_interval,
+                                     max_polls=None if timeout_seconds is None else
+                                     max(1, int(timeout_seconds / max(poll_interval, 0.001))))
+        except BudgetExhausted as exc:
+            return self._budget_exhausted(ticket, exc.reason, exc.usage)
+        usage = tracker.usage(status.get("usage") or {})
+        if status.get("state") != "done":
+            return self._budget_exhausted(
+                ticket, f"worker failed: {(status.get('summary') or '')[:200]}", usage)
+        self.report_progress(ticket_id,
+                             f"worker done (turns={usage['turns']}, "
+                             f"wall={usage['wall_clock_seconds']}s); running acceptance tests")
+        acceptance = run_acceptance(record["worktree"], record["acceptance_cmd"])
+        if not acceptance["ok"]:
+            self.report_progress(
+                ticket_id, f"acceptance FAILED rc={acceptance['returncode']}: "
+                           f"{acceptance['output'][-500:]}")
+            return self._budget_exhausted(
+                ticket, f"acceptance tests failed (rc={acceptance['returncode']}, "
+                        f"sandbox={acceptance['sandbox']})", usage)
+        version = L.next_repo_version(self._conn, ticket["repo_id"])
+        result = self.work_submit(ticket_id, record["worktree"], version)
+        self._workers.pop(ticket_id, None)
+        L.record_event(self._conn, ticket["pool_id"], "worker_completed",
+                       {"ticket_id": ticket_id, "branch": record["branch"],
+                        "manifest_hash": result["manifest_hash"], "usage": usage})
+        return {"ok": True, "ticket_id": ticket_id, "state": "review",
+                "manifest_hash": result["manifest_hash"], "version": version,
+                "branch": record["branch"], "acceptance": acceptance, "usage": usage}
+
+    def cancel_work(self, ticket_id, reason="cancelled by operator") -> dict:
+        record = self._workers.get(ticket_id)
+        if record is None:
+            raise ValueError(f"no running worker for ticket {ticket_id!r}")
+        record["runner"].cancel(record["handle"], reason)
+        ticket = self.show_ticket(ticket_id)
+        return self._budget_exhausted(ticket, reason, record["tracker"].usage())
 
     # -- work submit / integrate (real Phase 2 flow) --------------------------
 

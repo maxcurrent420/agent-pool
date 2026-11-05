@@ -223,7 +223,23 @@ def _handle_claim(ctx, raw: str) -> str:
         claim = svc.claim(ticket_id, key_id=opts.get("as") or None,
                           declared_paths=paths, budget=_budget_from_opts(opts),
                           maintainer_override="override" in flags)
-        return _result({"ok": True, "claim": claim})
+        # Phase 4: on successful claim, start the worker (fetch accepted
+        # version over Iroh -> worktree -> worker session) when a lifecycle
+        # or work root is configured. Failure here never rolls back the claim.
+        out = {"ok": True, "claim": claim}
+        try:
+            lifecycle = _lifecycle_for(ctx) if "_lifecycle_for" in globals() else None
+            work_root = _work_root_for(ctx) if "_work_root_for" in globals() else None
+            if lifecycle is not None or "start" in flags:
+                out["start"] = svc.start_work(ticket_id, work_root=work_root,
+                                              lifecycle=lifecycle,
+                                              worker_command=opts.get("worker_command", "").split() or None,
+                                              acceptance_cmd=opts.get("acceptance", "").split() or None)
+            else:
+                out["start"] = {"ok": False, "note": "not started: no Hermes lifecycle; use /work start <ticket> --worker-command ..."}
+        except Exception as exc:
+            out["start"] = {"ok": False, "error": str(exc)}
+        return _result(out)
     except Exception as exc:
         return _error(exc)
 
@@ -240,6 +256,14 @@ def _handle_release(ctx, raw: str) -> str:
 
 
 def _handle_work(ctx, raw: str) -> str:
+    try:
+        pos, _opts, _flags = _parse_args(raw)
+    except ValueError as exc:
+        return _error(exc)
+    if not pos or pos[0] != "submit":
+        if "_handle_work_exec" in globals():
+            return globals()["_handle_work_exec"](ctx, raw)
+        return _result({"ok": False, "error": "usage: /work submit <ticket> --repo-path PATH --version N"})
     try:
         svc = _service_for(ctx)
         pos, opts, _flags = _parse_args(raw)
@@ -309,3 +333,46 @@ def register(ctx):
                                  description=description)
         except Exception as exc:
             logger.warning("agent-pool: command %s registration failed: %s", name, exc)
+
+# --- Phase 4 execution wiring (appended handlers) ----------------------------
+
+def _work_root_for(ctx):
+    configured = _cfg(ctx, "work_root", "") if ctx else ""
+    if configured:
+        return Path(configured)
+    return Path.home() / ".hermes" / "plugin-data" / "agent-pool" / "work"
+
+def _lifecycle_for(ctx):
+    try:
+        return ctx.subagent_lifecycle if ctx is not None else None
+    except Exception:
+        return None
+
+def _handle_work_exec(ctx, raw: str) -> str:
+    """``/work start <ticket> --acceptance "cmd..."`` / ``/work complete <ticket>``
+    / ``/work cancel <ticket>`` / ``/work progress <ticket> <text>``."""
+    try:
+        svc = _service_for(ctx)
+        pos, opts, flags = _parse_args(raw)
+        if not pos:
+            return _result({"ok": False, "error": "usage: /work start|complete|cancel|progress <ticket> ..."})
+        sub, rest = pos[0], pos[1:]
+        ticket_id = rest[0] if rest else opts.get("ticket", "")
+        if sub == "start":
+            acceptance = opts.get("acceptance", "").split() or None
+            out = svc.start_work(ticket_id, work_root=_work_root_for(ctx),
+                                 lifecycle=_lifecycle_for(ctx),
+                                 worker_command=opts.get("worker_command", "").split() or None,
+                                 acceptance_cmd=acceptance)
+        elif sub == "complete":
+            out = svc.complete_work(ticket_id, timeout_seconds=int(opts.get("timeout", "0") or 0) or None)
+        elif sub == "cancel":
+            out = svc.cancel_work(ticket_id, reason=opts.get("reason", "cancelled by operator"))
+        elif sub == "progress":
+            text = " ".join(rest[1:]) or opts.get("text", "")
+            out = svc.report_progress(ticket_id, text)
+        else:
+            return _result({"ok": False, "error": f"unknown /work subcommand: {sub}"})
+        return _result(out)
+    except Exception as exc:
+        return _error(exc)

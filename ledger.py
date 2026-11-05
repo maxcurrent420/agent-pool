@@ -390,6 +390,43 @@ def release_ticket(conn, ticket_id, key_id) -> dict:
     return get_ticket_or_raise(conn, ticket_id)
 
 
+def get_active_claim(conn, ticket_id) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM claims WHERE ticket_id=? AND state='active'", (ticket_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_latest_accepted_manifest(conn, repo_id) -> dict | None:
+    """Latest maintainer-accepted manifest for *repo_id* (chain tip), or None."""
+    row = conn.execute(
+        "SELECT manifest_json FROM repo_versions WHERE repo_id=? AND state='accepted'"
+        " ORDER BY version DESC LIMIT 1", (repo_id,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def release_claim_for_ticket(conn, ticket_id) -> None:
+    """Mark the active claim released and clear the claimant (budget-kill path).
+
+    Unlike release_ticket() this does NOT flip the ticket state: the caller
+    moves the ticket to ``blocked`` with a structured report first.
+    """
+    ticket = get_ticket_or_raise(conn, ticket_id)
+    conn.execute("UPDATE claims SET state='released' WHERE ticket_id=? AND state='active'",
+                 (ticket_id,))
+    conn.execute("DELETE FROM file_claims WHERE ticket_id=?", (ticket_id,))
+    conn.execute("UPDATE tickets SET claimant_key_id=NULL, updated_at=? WHERE ticket_id=?",
+                 (_now(), ticket_id))
+    conn.commit()
+    record_event(conn, ticket["pool_id"], "claim_released_budget",
+                 {"ticket_id": ticket_id})
+
+
+def next_repo_version(conn, repo_id) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(version), 0) FROM repo_versions WHERE repo_id=?",
+                       (repo_id,)).fetchone()
+    return int(row[0]) + 1
+
+
 def get_audit(conn, repo_id, version=None) -> dict | None:
     if version is None:
         row = conn.execute(
