@@ -6,7 +6,7 @@
 # in the hermes-agent PR whenever the plugin advances.
 name: agent-pool
 repo: https://github.com/maxcurrent420/agent-pool
-sha: 03bf367602e2ffced32220b73d585423ca146a51
+sha: 1b1b14123298875a55774a20edc1ca4a6e798725
 description: >-
   Agent Pool — friends form an agent team: repos propagate via Iroh (QUIC,
   BLAKE3-verified bearer tickets via send_hermes), coordination only via
@@ -25,7 +25,7 @@ maintainer: maxcurrent420
 tier: community
 category: tools
 requires_hermes: ">=0.22.0"
-version: "2.0.0"
+version: "2.1.0"
 readme: true
 platforms: []
 capabilities:
