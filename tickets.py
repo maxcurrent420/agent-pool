@@ -1,12 +1,9 @@
-"""Ticket coordination service (Phase 3).
+"""Ticket coordination service — gateway-native.
 
-Thin service over the ledger + gateway adapter + Phase 2 propagator. Slash
-commands in ``__init__`` delegate here so the same code paths run in tests
-(injected fakes) and in Hermes (real ledger / real gateway).
-
-Ticket STATE is represented in the gateway through ``set_ticket_state``
-(thread title/state marker + notice line) because core Discord has no
-``applied_tags`` support; no core file is edited.
+Hermes posts; the plugin only returns content. Every method returns a result
+dict with the state word and a ``notice`` string; handlers format it via
+``replies.format_result`` and Hermes posts it. The service never opens a
+Discord client and never imports ``discord``.
 """
 from __future__ import annotations
 
@@ -20,7 +17,6 @@ try:  # package import (Hermes loads plugins as a package)
     from .execution import (BudgetExhausted, BudgetTracker, LifecycleWorkerRunner,
                             LocalProcessRunner, SandboxPolicy, build_mandate_brief,
                             create_worktree, run_acceptance, run_worker_loop)
-    from .gateway import GatewayAdapter
     from .integration import (apply_edit, merge_branch, rescan_tree, scan_diff)
     from .propagation import Member, RepoPropagator
     from .transport import TransportBackend
@@ -29,7 +25,6 @@ except ImportError:  # flat import (pytest from repo root)
     from execution import (BudgetExhausted, BudgetTracker, LifecycleWorkerRunner,
                            LocalProcessRunner, SandboxPolicy, build_mandate_brief,
                            create_worktree, run_acceptance, run_worker_loop)
-    from gateway import GatewayAdapter
     from integration import (apply_edit, merge_branch, rescan_tree, scan_diff)
     from propagation import Member, RepoPropagator
     from transport import TransportBackend
@@ -52,25 +47,165 @@ def _ticket_payload(ticket: dict) -> dict:
     }
 
 
+class PoolNotLocalError(Exception):
+    """A gateway command named a pool not hosted by this agent (D3)."""
+
+    def __init__(self, detail, pool_id=None):
+        super().__init__(detail)
+        self.detail = detail
+        self.pool_id = pool_id
+
+    @property
+    def error_code(self):
+        return "pool_not_local"
+
+
 class PoolService:
     """Ticket coordination for one pool. Caller identity is injected."""
 
-    def __init__(self, conn, gateway: GatewayAdapter, transport=None, *,
-                 caller_key_id: str = "", caller_signing_key=None,
-                 caller_box_sk=None, budget_defaults=None):
+    def __init__(self, conn, *args,
+                 transport=None, caller_key_id: str = "", caller_signing_key=None,
+                 caller_box_sk=None, budget_defaults=None, pool_resolver=None,
+                 gateway=None):
+        # Backwards-compat: old call sites passed (conn, gateway, transport).
+        # Duck-type: anything with post_notice is a legacy gateway (ignored).
+        if args:
+            for _a in args:
+                if hasattr(_a, "post_notice"):
+                    gateway = _a
+                elif hasattr(_a, "send"):
+                    transport = _a
+                elif transport is None:
+                    transport = _a
+                else:
+                    raise TypeError(f"unexpected positional arg: {_a!r}")
+        if transport is not None and hasattr(transport, "post_notice"):
+            raise TypeError("PoolService no longer takes a gateway adapter")
         self._conn = conn
-        self._gateway = gateway
         self._transport = transport
         self._caller_key_id = caller_key_id
         self._caller_sk = caller_signing_key
         self._caller_box_sk = caller_box_sk
         self._budget_defaults = budget_defaults
+        self._pool_resolver = pool_resolver
         self._workers: dict[str, dict] = {}  # ticket_id -> worker record
         self._integrations: dict[str, dict] = {}  # ticket_id -> gate context
 
+    # -- pool resolution + isolation (D2/D3) ---------------------------------
+
+    def _source_from(self, source=None):
+        if source is not None:
+            return source
+        if callable(self._pool_resolver):
+            try:
+                return self._pool_resolver()
+            except TypeError:
+                return self._pool_resolver(source)
+        return None
+
+    @staticmethod
+    def _source_field(source, *names):
+        for n in names:
+            if isinstance(source, dict) and source.get(n) is not None:
+                return source.get(n)
+            v = getattr(source, n, None) if source is not None else None
+            if v is not None:
+                return v
+        return None
+
+    def _resolve_pool(self, pool_id=None, source=None) -> str:
+        """D2 precedence: explicit --pool -> chat binding -> single local."""
+        if pool_id:
+            pool_id = str(pool_id).strip()
+            if pool_id:
+                row = self._conn.execute("SELECT pool_id FROM pools WHERE pool_id=?",
+                                         (pool_id,)).fetchone()
+                if row is None:
+                    raise PoolNotLocalError(
+                        f"pool_not_local: pool {pool_id!r} is not hosted by this agent"
+                        f" (host identity {self._caller_key_id or 'unknown'});"
+                        " use an Iroh ticket against the owning agent",
+                        pool_id=pool_id)
+                return pool_id
+        src = self._source_from(source)
+        chat_id = self._source_field(src, "chat_id", "parent_chat_id")
+        guild_id = self._source_field(src, "guild_id", "scope_id")
+        thread_id = self._source_field(src, "thread_id")
+        if chat_id is not None:
+            bound = L.get_pool_for_chat(self._conn, chat_id,
+                                        guild_id=guild_id, thread_id=thread_id)
+            if bound:
+                return bound
+        pools = L.list_local_pools(self._conn)
+        if len(pools) == 1:
+            return pools[0]
+        raise PoolNotLocalError(
+            "no pool bound to this chat — pass --pool <pool_id>",
+            pool_id=pool_id or "")
+
+    def _assert_local_owned(self, pool_id=None, *, require_maintainer=False,
+                            source=None) -> str:
+        """D3: pool must exist locally; optionally caller must be maintainer."""
+        resolved = self._resolve_pool(pool_id, source=source)
+        row = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
+                                 (resolved,)).fetchone()
+        if row is None:
+            raise PoolNotLocalError(
+                f"pool_not_local: pool {resolved!r} is not hosted by this agent",
+                pool_id=resolved)
+        if require_maintainer:
+            if self._caller_key_id and row["maintainer_key_id"] != self._caller_key_id:
+                raise PoolNotLocalError(
+                    f"pool_not_local: pool {resolved!r} is not hosted by this agent"
+                    f" (maintainer {row['maintainer_key_id']!r} != caller "
+                    f"{self._caller_key_id!r}); use an Iroh ticket against the owning agent",
+                    pool_id=resolved)
+        else:
+            # Member check: a non-member has no business touching this local
+            # pool through the gateway (remote trigger refused). Members and
+            # maintainers may act; pure-existence is enforced above. Pools
+            # with no member rows (bare test fixtures) are exempt.
+            if self._caller_key_id:
+                n = self._conn.execute(
+                    "SELECT COUNT(*) FROM members WHERE pool_id=?",
+                    (resolved,)).fetchone()[0]
+                if n:
+                    is_member = self._conn.execute(
+                        "SELECT 1 FROM members WHERE pool_id=? AND key_id=?",
+                        (resolved, self._caller_key_id)).fetchone() is not None
+                    if not is_member:
+                        raise PoolNotLocalError(
+                            f"pool_not_local: caller {self._caller_key_id!r} is not a"
+                            f" member of pool {resolved!r}; remote pools are reached"
+                            " only via Iroh",
+                            pool_id=resolved)
+        return resolved
+
+    def _thread_ref_from(self, source=None):
+        src = self._source_from(source)
+        if src is None:
+            return None
+        chat_id = self._source_field(src, "chat_id", "parent_chat_id", "channel_id")
+        thread_id = self._source_field(src, "thread_id")
+        guild_id = self._source_field(src, "guild_id", "scope_id")
+        if chat_id is None and thread_id is None and guild_id is None:
+            return None
+        return {"chat_id": chat_id, "thread_id": thread_id, "guild_id": guild_id}
+
+    def _queue_notice(self, pool_id, text, kind="notice") -> None:
+        L.queue_notice(self._conn, pool_id, text, kind=kind)
+
+    def drain_notices(self, pool_id=None):
+        """Unread notices accumulated since last drain (D5)."""
+        return L.drain_notices(self._conn, pool_id=pool_id)
+
+    def peek_notices(self, pool_id=None):
+        return L.peek_notices(self._conn, pool_id=pool_id)
+
     # -- pool membership ----------------------------------------------------
 
-    def register_pool(self, pool_id, name, relay_url="", key_id=None) -> dict:
+    def register_pool(self, pool_id, name, relay_url="", key_id=None,
+                      source=None, discord_user_id=None) -> dict:
         if L.is_global_frozen(self._conn):
             raise L.ClaimRefused("global kill-switch is set: pool registration blocked")
         maintainer = key_id or self._caller_key_id
@@ -80,25 +215,41 @@ class PoolService:
         L.add_member(self._conn, pool_id, maintainer, role="maintainer")
         L.record_event(self._conn, pool_id, "pool_registered",
                        {"pool_id": pool_id, "maintainer": maintainer})
-        return {"ok": True, "pool_id": pool_id, "name": name, "maintainer": maintainer}
+        # Record chat binding from source (D2/D4).
+        src = self._source_from(source)
+        if src is not None:
+            chat_id = self._source_field(src, "chat_id", "parent_chat_id")
+            if chat_id is not None:
+                guild_id = self._source_field(src, "guild_id", "scope_id")
+                thread_id = self._source_field(src, "thread_id")
+                L.bind_pool_chat(self._conn, chat_id, guild_id, thread_id, pool_id)
+        if discord_user_id:
+            L.bind_discord_user(self._conn, maintainer, discord_user_id)
+        return {"ok": True, "pool_id": pool_id, "name": name, "maintainer": maintainer,
+                "chat_id": chat_id if src is not None else None}
 
-    def invite(self, pool_id, key_id, role="member", box_pubkey_hex="") -> dict:
+    def invite(self, pool_id, key_id, role="member", box_pubkey_hex="",
+               source=None, discord_user_id=None) -> dict:
+        pool_id = self._assert_local_owned(pool_id, source=source)
         self._check_not_frozen(pool_id)
         if role not in ("member", "maintainer"):
             raise ValueError(f"role must be member|maintainer, got {role!r}")
         L.add_member(self._conn, pool_id, key_id, role=role, box_pubkey_hex=box_pubkey_hex)
+        if discord_user_id:
+            L.bind_discord_user(self._conn, key_id, discord_user_id)
         L.record_event(self._conn, pool_id, "invited",
                        {"key_id": key_id, "role": role})
         return {"ok": True, "pool_id": pool_id, "key_id": key_id, "role": role}
 
-    def members(self, pool_id) -> list:
+    def members(self, pool_id, source=None) -> list:
+        pool_id = self._resolve_pool(pool_id, source=source)
         return L.list_members(self._conn, pool_id)
 
     def freeze(self, pool_id, frozen: bool) -> dict:
         L.set_frozen(self._conn, pool_id, frozen)
-        self._gateway.post_notice(pool_id, f"pool {pool_id} {'frozen' if frozen else 'unfrozen'}",
-                                  kind="freeze")
-        return {"ok": True, "pool_id": pool_id, "frozen": frozen}
+        notice = f"pool {pool_id} {'frozen' if frozen else 'unfrozen'}"
+        self._queue_notice(pool_id, notice, kind="freeze")
+        return {"ok": True, "pool_id": pool_id, "frozen": frozen, "notice": notice}
 
     def remove_member(self, pool_id, key_id, *, actor_key_id=None) -> dict:
         """Revoke a member: registry removal + forward-separation notice.
@@ -116,11 +267,11 @@ class PoolService:
         if pool["maintainer_key_id"] != actor:
             raise PermissionError("only the pool maintainer may remove members")
         removed = L.remove_member(self._conn, pool_id, key_id)
-        self._gateway.post_notice(
-            pool_id,
-            f"member removed: {key_id} (forward separation only: "
-            f"{L.REVOCATION_LIMITATION})",
-            kind="member_removed")
+        notice = (f"member removed: {key_id} (forward separation only: "
+                  f"{L.REVOCATION_LIMITATION})")
+        self._queue_notice(pool_id, notice, kind="member_removed")
+        removed = dict(removed)
+        removed["notice"] = notice
         return removed
 
     def is_frozen(self, pool_id) -> bool:
@@ -144,37 +295,56 @@ class PoolService:
         """
         L.set_global_frozen(self._conn, frozen)
         pools = [r[0] for r in self._conn.execute("SELECT pool_id FROM pools")]
+        notices = []
         for pool_id in pools:
             L.set_frozen(self._conn, pool_id, frozen)
-            self._gateway.post_notice(
-                pool_id,
-                f"pool {pool_id} {'frozen' if frozen else 'unfrozen'} "
-                f"(global kill-switch {'set' if frozen else 'cleared'})",
-                kind="freeze")
-        return {"ok": True, "global_frozen": bool(frozen), "pools": pools}
+            notice = (f"pool {pool_id} {'frozen' if frozen else 'unfrozen'} "
+                      f"(global kill-switch {'set' if frozen else 'cleared'})")
+            self._queue_notice(pool_id, notice, kind="freeze")
+            notices.append(notice)
+        return {"ok": True, "global_frozen": bool(frozen), "pools": pools,
+                "notice": "; ".join(notices) if notices else ""}
 
     # -- tickets --------------------------------------------------------------
 
-    def add_ticket(self, pool_id, repo_id, title, brief="", budget=None) -> dict:
+    def add_ticket(self, pool_id, repo_id, title, brief="", budget=None,
+                   source=None) -> dict:
         if not title.strip():
             raise ValueError("ticket title is required")
+        pool_id = self._resolve_pool(pool_id, source=source)
+        self._assert_local_owned(pool_id, source=source)
         self._check_not_frozen(pool_id)
         L.ensure_repo(self._conn, repo_id, pool_id)
         full_budget = L.normalize_budget(budget, self._budget_defaults)
         ticket_id = f"t-{secrets.token_hex(4)}"
+        thread_ref = self._thread_ref_from(source)
+        thread_ref_str = (f"chat:{thread_ref['chat_id']}:thread:{thread_ref['thread_id']}:"
+                          f"guild:{thread_ref['guild_id']}" if thread_ref else None)
         L.create_ticket(self._conn, ticket_id, pool_id, repo_id, title.strip(),
-                        brief=brief, budget=full_budget)
+                        brief=brief, budget=full_budget, thread_ref=thread_ref_str)
         ticket = L.get_ticket(self._conn, ticket_id)
-        ref = self._gateway.open_ticket_thread(pool_id, _ticket_payload(ticket))
-        self._conn.execute("UPDATE tickets SET thread_ref=? WHERE ticket_id=?",
-                           (ref.ref, ticket_id))
-        self._conn.commit()
-        self._gateway.set_ticket_state(ref.ref, "open")
         L.record_event(self._conn, pool_id, "ticket_created",
-                       {"ticket_id": ticket_id, "title": title, "thread_ref": ref.ref})
-        return L.get_ticket(self._conn, ticket_id)
+                       {"ticket_id": ticket_id, "title": title,
+                        "thread_ref": thread_ref_str})
+        ticket = dict(ticket)
+        ticket["thread_ref"] = thread_ref_str
+        ticket["thread_ref_parts"] = thread_ref
+        ticket["notice"] = (f"{STATE_MARKER.format(state='open')} ticket {ticket_id}: "
+                            f"{title}")
+        self._queue_notice(pool_id, ticket["notice"], kind="ticket_created")
+        return ticket
 
-    def list_tickets(self, pool_id=None, state=None) -> list:
+    def list_tickets(self, pool_id=None, state=None, source=None) -> list:
+        if pool_id:
+            pool_id = self._resolve_pool(pool_id, source=source)
+        else:
+            # If source binds a pool, scope to it.
+            src = self._source_from(source)
+            if src is not None:
+                try:
+                    pool_id = self._resolve_pool(None, source=src)
+                except PoolNotLocalError:
+                    pool_id = None
         return L.list_tickets(self._conn, pool_id=pool_id, state=state)
 
     def show_ticket(self, ticket_id) -> dict:
@@ -182,12 +352,11 @@ class PoolService:
 
     def _set_state_and_notify(self, ticket, state) -> dict:
         updated = L.set_ticket_state(self._conn, ticket["ticket_id"], state)
-        if updated.get("thread_ref"):
-            self._gateway.set_ticket_state(updated["thread_ref"], state)
-            self._gateway.post_notice(
-                updated["pool_id"],
-                f"{STATE_MARKER.format(state=state)} ticket {updated['ticket_id']}: {updated['title']}",
-                kind="ticket_state")
+        notice = (f"{STATE_MARKER.format(state=state)} ticket "
+                  f"{updated['ticket_id']}: {updated['title']}")
+        self._queue_notice(updated["pool_id"], notice, kind="ticket_state")
+        updated = dict(updated)
+        updated["notice"] = notice
         return updated
 
     # -- claims ---------------------------------------------------------------
@@ -202,33 +371,31 @@ class PoolService:
             declared_paths=declared_paths, budget=budget,
             maintainer_override=maintainer_override)
         ticket = L.get_ticket(self._conn, ticket_id)
-        if ticket.get("thread_ref"):
-            self._gateway.set_ticket_state(ticket["thread_ref"], "claimed")
-            self._gateway.post_notice(
-                ticket["pool_id"],
-                f"{STATE_MARKER.format(state='claimed')} ticket {ticket_id} claimed by {key}",
-                kind="ticket_claim")
+        notice = (f"{STATE_MARKER.format(state='claimed')} ticket {ticket_id} "
+                  f"claimed by {key}")
+        self._queue_notice(ticket["pool_id"], notice, kind="ticket_claim")
+        claim = dict(claim)
+        claim["notice"] = notice
+        claim["state_word"] = "claimed"
         return claim
 
     def release(self, ticket_id, key_id=None) -> dict:
         key = key_id or self._caller_key_id
         updated = L.release_ticket(self._conn, ticket_id, key)
-        if updated.get("thread_ref"):
-            self._gateway.set_ticket_state(updated["thread_ref"], "open")
-            self._gateway.post_notice(
-                updated["pool_id"],
-                f"{STATE_MARKER.format(state='open')} ticket {ticket_id} released",
-                kind="ticket_release")
+        notice = f"{STATE_MARKER.format(state='open')} ticket {ticket_id} released"
+        self._queue_notice(updated["pool_id"], notice, kind="ticket_release")
+        updated = dict(updated)
+        updated["notice"] = notice
         return updated
 
     # -- Phase 4: agent execution --------------------------------------------
 
     def report_progress(self, ticket_id, text) -> dict:
-        """Milestone progress to the ticket thread ONLY (4 KB guard, no bytes)."""
+        """Milestone progress (4 KB guard, no bytes)."""
         ticket = self.show_ticket(ticket_id)
         short = f"ticket {ticket_id}: {text}"[:3500]
-        self._gateway.post_notice(ticket["pool_id"], short, kind="progress")
-        return {"ok": True, "ticket_id": ticket_id, "text": short}
+        self._queue_notice(ticket["pool_id"], short, kind="progress")
+        return {"ok": True, "ticket_id": ticket_id, "text": short, "notice": short}
 
     def _budget_exhausted(self, ticket, reason, usage) -> dict:
         """Structured waiting/blocked report + claim released (re-armable).
@@ -240,9 +407,7 @@ class PoolService:
         report = (f"{STATE_MARKER.format(state='blocked')} [blocked] {reason} "
                   f"usage={json.dumps(usage or {}, sort_keys=True)} "
                   f"claim released; ticket re-armable")
-        if ticket.get("thread_ref"):
-            self._gateway.set_ticket_state(ticket["thread_ref"], "blocked")
-        self._gateway.post_notice(ticket["pool_id"], report[:3500], kind="blocked_report")
+        self._queue_notice(ticket["pool_id"], report[:3500], kind="blocked_report")
         L.release_claim_for_ticket(self._conn, ticket["ticket_id"])
         if ticket["state"] == "claimed":
             L.set_ticket_state(self._conn, ticket["ticket_id"], "blocked")
@@ -252,7 +417,7 @@ class PoolService:
         self._workers.pop(ticket["ticket_id"], None)
         return {"ok": False, "ticket_id": ticket["ticket_id"], "state": "blocked",
                 "reason": str(reason), "usage": usage or {},
-                "claim": "released"}
+                "claim": "released", "notice": report[:3500]}
 
     def start_work(self, ticket_id, *, work_root, lifecycle=None, runner=None,
                    worker_command=None, acceptance_cmd=None) -> dict:
@@ -401,7 +566,7 @@ class PoolService:
         # submit/audit run as the caller. The caller's key is a safe stand-in
         # until the maintainer gate lands.
         return RepoPropagator(
-            self._conn, self._gateway, self._transport, pool_id=ticket["pool_id"],
+            self._conn, self._transport, pool_id=ticket["pool_id"],
             maintainer_key_id=maintainer_id, maintainer_signing_key=maintainer_sk,
             members=members)
 
@@ -427,7 +592,8 @@ class PoolService:
             self._set_state_and_notify(ticket, "review")
         # Maintainer self-accept leaves the ticket claimed for integrate.
         return {"ok": True, "ticket_id": ticket_id, "version": int(version),
-                "manifest_hash": result["manifest_hash"], "state": result["state"]}
+                "manifest_hash": result["manifest_hash"], "state": result["state"],
+                "notice": result.get("notice", "")}
 
     def _default_work_dir(self):
         return Path.home() / ".hermes" / "plugin-data" / "agent-pool" / "work" / "integrate"
@@ -455,7 +621,7 @@ class PoolService:
         b. sandboxed scan of the branch DIFF (``integration.scan_diff``,
            bwrap ``--unshare-net``) — containment-by-construction;
         c. audit report posted to the ticket thread / pool channel;
-        d. if clean: post approve/edit/discard buttons (``post_buttons``) and
+        d. if clean: return approve/edit/discard decision prompt and
            keep the ticket in ``review`` awaiting a human decision; if the
            scan is FLAGGED the verdict blocks the gate: no buttons are posted,
            the ticket goes to ``blocked`` and canonical is never touched.
@@ -543,15 +709,12 @@ class PoolService:
         combined_verdict = "flagged" if (verdict == "flagged" or report["verdict"] == "flagged") else "clean"
         if report["verdict"] == "flagged" and verdict == "clean":
             diff_report = dict(diff_report, hits=report.get("hits", []), verdict="flagged")
-        # (c) audit report to the ticket thread / gateway.
-        if ticket.get("thread_ref"):
-            self._gateway.post_notice(
-                ticket["pool_id"],
-                f"audit {audit['audit_id']}: verdict={combined_verdict} "
-                f"diff_scan={verdict} sandbox={diff_report.get('sandbox', '?')} "
-                f"diff_files={len(diff_report.get('diff_files', []))} "
-                f"hits={len(hits)} report_hash={audit['report_hash'][:16]}",
-                kind="audit_report")
+        # (c) audit report recorded; notice returned (Hermes posts).
+        audit_notice = (f"audit {audit['audit_id']}: verdict={combined_verdict} "
+                        f"diff_scan={verdict} sandbox={diff_report.get('sandbox', '?')} "
+                        f"diff_files={len(diff_report.get('diff_files', []))} "
+                        f"hits={len(hits)} report_hash={audit['report_hash'][:16]}")
+        self._queue_notice(ticket["pool_id"], audit_notice, kind="audit_report")
         L.record_event(self._conn, ticket["pool_id"], "integrate_gate",
                        {"ticket_id": ticket_id, "verdict": combined_verdict,
                         "audit_id": audit["audit_id"],
@@ -576,17 +739,15 @@ class PoolService:
             # ticket blocked, canonical untouched.
             if ticket["state"] != "blocked":
                 self._set_state_and_notify(ticket, "blocked")
-            if ticket.get("thread_ref"):
-                self._gateway.post_notice(
-                    ticket["pool_id"],
-                    f"{STATE_MARKER.format(state='blocked')} integrate rejected before "
-                    f"human review: scan verdict=flagged hits={json.dumps(hits)[:1200]}; "
-                    f"no approve buttons posted; canonical unchanged",
-                    kind="integrate_rejected")
+            rejected_notice = (f"{STATE_MARKER.format(state='blocked')} integrate rejected before "
+                               f"human review: scan verdict=flagged hits={json.dumps(hits)[:1200]}; "
+                               f"no approve buttons posted; canonical unchanged")
+            self._queue_notice(ticket["pool_id"], rejected_notice, kind="integrate_rejected")
             return {"ok": True, "ticket_id": ticket_id, "verdict": combined_verdict,
                     "report_hash": audit["report_hash"], "audit_id": audit["audit_id"],
                     "ticket_state": "blocked", "buttons_posted": False,
-                    "hits": hits, "diff_files": ctx["diff_files"]}
+                    "hits": hits, "diff_files": ctx["diff_files"],
+                    "notice": rejected_notice}
         if ticket["state"] != "review":
             self._set_state_and_notify(ticket, "review")
         buttons = [
@@ -597,25 +758,17 @@ class PoolService:
             {"id": "discard", "label": "Discard",
              "value": f"discard:{ticket_id}"},
         ]
-        if ticket.get("thread_ref"):
-            self._gateway.post_buttons(
-                ticket["thread_ref"],
-                f"Integration review ticket {ticket_id} repo {ticket['repo_id']} "
-                f"v{pending['version']}: scan verdict=clean report_hash="
-                f"{audit['report_hash'][:16]}. Approve merges the branch into "
-                f"canonical with a rotated DEK; edit applies a maintainer patch "
-                f"or file override first; discard rejects without merging.",
-                buttons)
-            self._gateway.post_notice(
-                ticket["pool_id"],
-                f"{STATE_MARKER.format(state='review')} awaiting maintainer decision "
-                f"(approve/edit/discard buttons posted) ticket {ticket_id}",
-                kind="decision_prompt")
+        decision_notice = (f"{STATE_MARKER.format(state='review')} awaiting maintainer decision "
+                           f"(approve/edit/discard buttons) ticket {ticket_id} "
+                           f"repo {ticket['repo_id']} v{pending['version']}: "
+                           f"scan verdict=clean report_hash={audit['report_hash'][:16]}")
+        self._queue_notice(ticket["pool_id"], decision_notice, kind="decision_prompt")
         return {"ok": True, "ticket_id": ticket_id, "verdict": combined_verdict,
                 "report_hash": audit["report_hash"], "audit_id": audit["audit_id"],
                 "ticket_state": "review", "buttons_posted": True,
-                "buttons": buttons, "branch_ref": branch["head"],
-                "diff_files": ctx["diff_files"]}
+                "buttons": buttons, "button_prompt": decision_notice,
+                "branch_ref": branch["head"],
+                "diff_files": ctx["diff_files"], "notice": decision_notice}
 
     def resolve_integration(self, ticket_id, decision, *, key_id=None,
                             work_dir=None, edit_files=None, edit_patch=None,
@@ -659,16 +812,13 @@ class PoolService:
                             maintainer=maintainer)
             if ticket["state"] != "blocked":
                 self._set_state_and_notify(ticket, "blocked")
-            if ticket.get("thread_ref"):
-                self._gateway.post_notice(
-                    ticket["pool_id"],
-                    f"{STATE_MARKER.format(state='blocked')} discarded ticket {ticket_id}: "
-                    f"{reason or 'discarded by maintainer'}; canonical unchanged",
-                    kind="integrate_discard")
+            discard_notice = (f"{STATE_MARKER.format(state='blocked')} discarded ticket {ticket_id}: "
+                              f"{reason or 'discarded by maintainer'}; canonical unchanged")
+            self._queue_notice(ticket["pool_id"], discard_notice, kind="integrate_discard")
             L.record_event(self._conn, ticket["pool_id"], "integrate_discarded",
                            {"ticket_id": ticket_id, "reason": reason})
             return {"ok": True, "ticket_id": ticket_id, "decision": "discard",
-                    "ticket_state": "blocked", "merged": False}
+                    "ticket_state": "blocked", "merged": False, "notice": discard_notice}
         if ticket["state"] != "review":
             raise ValueError(f"decision needs a ticket in review, got {ticket['state']!r}")
         prop = self._propagator(ticket)
@@ -679,20 +829,18 @@ class PoolService:
         if merge.get("conflict"):
             if ticket["state"] != "blocked":
                 self._set_state_and_notify(ticket, "blocked")
-            if ticket.get("thread_ref"):
-                self._gateway.post_notice(
-                    ticket["pool_id"],
-                    f"{STATE_MARKER.format(state='blocked')} rebase needed ticket {ticket_id}: "
-                    f"merge conflict; canonical_ref={merge['canonical_ref']} "
-                    f"branch_ref={merge['branch_ref']} branch={merge['branch_name']}; "
-                    f"canonical unchanged — contributor must rebase and resubmit",
-                    kind="rebase_needed")
+            rebase_notice = (f"{STATE_MARKER.format(state='blocked')} rebase needed ticket {ticket_id}: "
+                             f"merge conflict; canonical_ref={merge['canonical_ref']} "
+                             f"branch_ref={merge['branch_ref']} branch={merge['branch_name']}; "
+                             f"canonical unchanged — contributor must rebase and resubmit")
+            self._queue_notice(ticket["pool_id"], rebase_notice, kind="rebase_needed")
             L.record_event(self._conn, ticket["pool_id"], "integrate_conflict",
                            {"ticket_id": ticket_id, **merge})
             return {"ok": True, "ticket_id": ticket_id, "decision": decision,
                     "ticket_state": "blocked", "merged": False, "conflict": True,
                     "canonical_ref": merge["canonical_ref"],
-                    "branch_ref": merge["branch_ref"], "branch_name": merge["branch_name"]}
+                    "branch_ref": merge["branch_ref"], "branch_name": merge["branch_name"],
+                    "notice": rebase_notice}
         edit_info = None
         if decision == "edit":
             pre_edit_head = merge["merge_commit"]
@@ -706,16 +854,14 @@ class PoolService:
                         capture_output=True, text=True, timeout=60)
                 if ticket["state"] != "blocked":
                     self._set_state_and_notify(ticket, "blocked")
-                if ticket.get("thread_ref"):
-                    self._gateway.post_notice(
-                        ticket["pool_id"],
-                        f"{STATE_MARKER.format(state='blocked')} maintainer edit rejected: "
-                        f"re-scan flagged hits={json.dumps(rescan.get('hits', []))[:800]}; "
-                        f"edit rolled back",
-                        kind="integrate_rejected")
+                edit_rejected = (f"{STATE_MARKER.format(state='blocked')} maintainer edit rejected: "
+                                 f"re-scan flagged hits={json.dumps(rescan.get('hits', []))[:800]}; "
+                                 f"edit rolled back")
+                self._queue_notice(ticket["pool_id"], edit_rejected, kind="integrate_rejected")
                 return {"ok": True, "ticket_id": ticket_id, "decision": "edit",
                         "ticket_state": "blocked", "merged": False,
-                        "reason": "edit re-scan flagged", "hits": rescan.get("hits", [])}
+                        "reason": "edit re-scan flagged", "hits": rescan.get("hits", []),
+                        "notice": edit_rejected}
         prev = L.get_latest_accepted_manifest(self._conn, ticket["repo_id"])
         from crypto import manifest_hash as _mh
         prev_hash = _mh(prev) if prev else None
@@ -726,13 +872,10 @@ class PoolService:
             prev_manifest_hash=prev_hash, audit_report_hash=ctx["report_hash"])
         if ticket["state"] != "merged":
             self._set_state_and_notify(ticket, "merged")
-        if ticket.get("thread_ref"):
-            self._gateway.post_notice(
-                ticket["pool_id"],
-                f"{STATE_MARKER.format(state='merged')} merged ticket {ticket_id}: "
-                f"version {ctx['version']} manifest {published['manifest_hash'][:16]} "
-                f"merge_commit={(edit_info or merge).get('edit_commit') or merge.get('merge_commit')}",
-                kind="integrate_merged")
+        merged_notice = (f"{STATE_MARKER.format(state='merged')} merged ticket {ticket_id}: "
+                         f"version {ctx['version']} manifest {published['manifest_hash'][:16]} "
+                         f"merge_commit={(edit_info or merge).get('edit_commit') or merge.get('merge_commit')}")
+        self._queue_notice(ticket["pool_id"], merged_notice, kind="integrate_merged")
         L.record_event(self._conn, ticket["pool_id"], "integrate_merged",
                        {"ticket_id": ticket_id, "version": ctx["version"],
                         "manifest_hash": published["manifest_hash"],
@@ -743,7 +886,7 @@ class PoolService:
                 "manifest_hash": published["manifest_hash"],
                 "version": ctx["version"],
                 "merge_commit": (edit_info or {}).get("edit_commit") or merge.get("merge_commit"),
-                "edit": edit_info}
+                "edit": edit_info, "notice": merged_notice}
 
     def audit_show(self, ticket_id=None, repo_id=None, version=None) -> dict:
         if ticket_id:

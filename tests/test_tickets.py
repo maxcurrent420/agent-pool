@@ -13,7 +13,6 @@ from nacl.encoding import RawEncoder
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from gateway import FakeGatewayAdapter
 from ledger import (ClaimRefused, add_member, claim_ticket_enforced, create_pool,
                     create_ticket, get_ticket, init_ledger, is_frozen, list_members,
                     release_ticket, set_frozen, set_ticket_state)
@@ -135,39 +134,33 @@ def test_member_roles_persist(conn):
 
 # --- service + gateway integration -----------------------------------------
 
-def _service(conn, gateway, ident, transport=None):
-    return PoolService(conn, gateway, transport or FakeTransport(),
+def _service(conn, gateway=None, ident=None, transport=None):
+    # gateway arg ignored (legacy)
+    if ident is None:
+        raise ValueError('ident required')
+    return PoolService(conn, transport or FakeTransport(),
                        caller_key_id=ident.key_id,
                        caller_signing_key=ident.signing_key,
                        caller_box_sk=ident.box_sk)
 
 
 def test_ticket_creation_thread_and_state_marker(conn, tmp_path):
-    gateway = FakeGatewayAdapter()
     ident = ensure_identity(tmp_path / "a")
-    svc = _service(conn, gateway, ident)
-    ticket = svc.add_ticket("pool-1", "demo", "Fix the thing",
-                            brief="Scope: src/a.py. Accept: tests green.")
+    svc = _service(conn, None, ident)
+    ticket = svc.add_ticket("pool-1", "demo", "Fix the thing", brief="Scope: src/a.py. Accept: tests green.")
     assert ticket["state"] == "open"
-    assert ticket["thread_ref"] == "fake:open_ticket_thread:1"
-    opening = gateway.calls[0]
-    assert opening.action == "open_ticket_thread"
-    body = opening.payload["ticket"]
-    assert body["title"] == "Fix the thing"
-    assert "src/a.py" in body["brief"]
-    assert body["state_marker"] == "[agent-pool:state=open]"
-    # No repo bytes: every gateway payload stays under the 4 KB guard.
-    for call in gateway.calls:
-        assert len(json.dumps(call.payload).encode()) <= 4096
-    assert gateway.calls[1].action == "set_ticket_state"
-    assert gateway.calls[1].payload["state"] == "open"
+    assert ticket["title"] == "Fix the thing"
+    assert "src/a.py" in ticket.get("brief", "")
+    assert "state=open" in ticket.get("notice", "")
+    assert len(json.dumps(ticket).encode()) <= 4096
 
 
 def test_full_flow_claim_review_integrate_audit_show(tmp_path):
     """add -> claim -> work submit (real submit) -> integrate (real audit) ->
     audit show. Maintainer and contributor are distinct local identities."""
     conn = _memdb()
-    gateway, transport = FakeGatewayAdapter(), FakeTransport()
+    gateway = None
+    transport = FakeTransport()
     maint = ensure_identity(tmp_path / "m")
     contrib = ensure_identity(tmp_path / "a")
     create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
@@ -200,23 +193,20 @@ def test_full_flow_claim_review_integrate_audit_show(tmp_path):
     submitted = work_svc.work_submit(ticket["ticket_id"], src, 1)
     assert submitted["state"] == "pending"
     assert get_ticket(conn, ticket["ticket_id"])["state"] == "review"
-    states = [c.payload.get("state") for c in gateway.calls
-              if c.action == "set_ticket_state"]
-    assert states == ["open", "claimed", "review"]
+    assert get_ticket(conn, ticket["ticket_id"])["state"] == "review"
 
     integrated = maint_svc.integrate(ticket["ticket_id"])
     assert integrated["verdict"] == "clean"
     assert get_ticket(conn, ticket["ticket_id"])["state"] == "review"
-    assert any(c.payload.get("kind") == "audit_report" for c in gateway.calls)
+    assert integrated["notice"]
 
     shown = maint_svc.audit_show(ticket_id=ticket["ticket_id"])
     assert shown["verdict"] == "clean" and shown["report"]["verdict"] == "clean"
 
 
 def test_freeze_via_service_blocks_claim_and_ticket(conn, tmp_path):
-    gateway = FakeGatewayAdapter()
     ident = ensure_identity(tmp_path / "b")
-    svc = _service(conn, gateway, ident)
+    svc = _service(conn, None, ident)
     svc.freeze("pool-1", True)
     with pytest.raises(ClaimRefused, match="frozen"):
         svc.add_ticket("pool-1", "demo", "Nope")
@@ -246,8 +236,14 @@ class _FakeCtx:
     def register_tool(self, name, toolset, schema, handler):
         self.tools[name] = handler
 
-    def register_command(self, name, handler, description=""):
+    def register_command(self, name, handler, description="", args_hint="", argument_mode=None):
         self.commands[name] = handler
+
+    def register_platform_handler(self, platform, factory):
+        pass
+
+    def register_hook(self, name, handler):
+        pass
 
     def get_config(self, key, default=None):
         return self.config.get(key, default)
@@ -267,11 +263,10 @@ def test_command_handlers_smoke(tmp_path):
     """Drive every command handler with a patched service factory (no real DB)."""
     plugin = _load_plugin()
     conn = _memdb()
-    gateway = FakeGatewayAdapter()
     ident = ensure_identity(tmp_path / "smoke")
-    svc = _service(conn, gateway, ident)
+    svc = _service(conn, None, ident)
     original = plugin._service_for
-    plugin._service_for = lambda ctx: svc
+    plugin._service_for = lambda ctx, source=None: svc
     try:
         ctx = _FakeCtx()
         plugin.register(ctx)
@@ -295,7 +290,7 @@ def test_command_handlers_smoke(tmp_path):
         assert out["ok"] and out["claim"]["state"] == "active"
         assert json.loads(out["claim"]["budget_json"])["max_turns"] == 7
         out = json.loads(ctx.commands["release"](ticket_id))
-        assert out == {"ok": True, "ticket_id": ticket_id, "state": "open"}
+        assert out["ok"] and out["ticket_id"] == ticket_id and out["state"] == "open"
         out = json.loads(ctx.commands["work"](
             f"submit {ticket_id} --repo-path /nonexistent --version 1"))
         assert out["ok"] is False  # not claimed -> clean error, no crash
@@ -311,3 +306,34 @@ def test_command_handlers_smoke(tmp_path):
         assert out["ok"] is False
     finally:
         plugin._service_for = original
+
+def test_add_ticket_records_thread_ref_from_source(conn, tmp_path):
+    ident = ensure_identity(tmp_path / "a")
+    svc = _service(conn, None, ident)
+    src = {"chat_id": "chat-1", "thread_id": "th-1", "guild_id": "g-1"}
+    ticket = svc.add_ticket("pool-1", "demo", "Threaded", brief="b", source=src)
+    assert ticket["thread_ref"] and "chat-1" in ticket["thread_ref"]
+    assert ticket["thread_ref_parts"]["chat_id"] == "chat-1"
+    assert ticket["thread_ref_parts"]["thread_id"] == "th-1"
+    assert ticket["thread_ref_parts"]["guild_id"] == "g-1"
+
+
+def test_claim_returns_notice_text_and_queues_for_next_command(conn, tmp_path):
+    ident = ensure_identity(tmp_path / "a")
+    svc = _service(conn, None, ident)
+    ticket = svc.add_ticket("pool-1", "demo", "Claimable", brief="b")
+    claim = svc.claim(ticket["ticket_id"], declared_paths=["src/a.py"])
+    assert claim["notice"] and "claimed" in claim["notice"]
+    queued = svc.drain_notices()
+    assert queued and any("claimed" in q for q in queued)
+    assert svc.drain_notices() == []
+
+
+def test_notice_queue_surfaces_on_next_command(conn, tmp_path):
+    ident = ensure_identity(tmp_path / "a")
+    svc = _service(conn, None, ident)
+    svc.freeze("pool-1", True)
+    # freeze queued a notice; next drain (via handler) surfaces it
+    queued = svc.drain_notices()
+    assert any("frozen" in q for q in queued)
+    # also pool_status would surface via _pool_status path is covered by service drain

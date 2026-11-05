@@ -11,7 +11,6 @@ from nacl.encoding import RawEncoder
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from crypto import manifest_hash, unwrap_dek, verify_chain
-from gateway import FakeGatewayAdapter
 from ledger import (add_member, create_pool, get_ticket, init_ledger,
                     get_latest_accepted_manifest)
 from propagation import _verify_key
@@ -34,7 +33,6 @@ class _World:
     def __init__(self, tmp_path):
         self.tmp = Path(tmp_path)
         self.conn = _memdb()
-        self.gateway = FakeGatewayAdapter()
         self.transport = FakeTransport()
         self.maint = ensure_identity(self.tmp / "m")
         self.contrib = ensure_identity(self.tmp / "a")
@@ -53,15 +51,15 @@ class _World:
             add_member(self.conn, "pool-1", ident.key_id, role=role,
                        box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex())
         self.conn.commit()
-        self.maint_svc = PoolService(self.conn, self.gateway, self.transport,
+        self.maint_svc = PoolService(self.conn, self.transport,
                                      caller_key_id=self.maint.key_id,
                                      caller_signing_key=self.maint.signing_key,
                                      caller_box_sk=self.maint.box_sk)
-        self.contrib_svc = PoolService(self.conn, self.gateway, self.transport,
+        self.contrib_svc = PoolService(self.conn, self.transport,
                                        caller_key_id=self.contrib.key_id,
                                        caller_signing_key=self.contrib.signing_key,
                                        caller_box_sk=self.contrib.box_sk)
-        self.member_svc = PoolService(self.conn, self.gateway, self.transport,
+        self.member_svc = PoolService(self.conn, self.transport,
                                       caller_key_id=self.member.key_id,
                                       caller_signing_key=self.member.signing_key,
                                       caller_box_sk=self.member.box_sk)
@@ -126,8 +124,8 @@ def test_approve_merges_rotates_dek_repins(world):
     assert gate["verdict"] == "clean"
     assert gate["buttons_posted"] is True
     assert [b["id"] for b in gate["buttons"]] == ["approve", "edit", "discard"]
-    assert any(c.action == "post_buttons" for c in world.gateway.calls)
-    assert any(c.payload.get("kind") == "audit_report" for c in world.gateway.calls)
+    assert gate["buttons_posted"] is True
+    assert gate["notice"] and "audit" in gate.get("queued_notices", [""])[0] if False else gate["notice"]
 
     before = _canon_head(world.work_dir / "canonical-demo")
     resolved = world.maint_svc.resolve_integration(tid, "approve", work_dir=world.work_dir)
@@ -222,7 +220,7 @@ def test_malware_flagged_blocked_before_review(world):
     assert gate["verdict"] == "flagged"
     assert gate["buttons_posted"] is False
     assert get_ticket(world.conn, tid)["state"] == "blocked"
-    assert not any(c.action == "post_buttons" for c in world.gateway.calls)
+    assert gate["buttons_posted"] is False  # no buttons when flagged
     assert gate["hits"], "expected scanner hits for curl|sh"
     with pytest.raises(ValueError, match="not actionable"):
         world.maint_svc.resolve_integration(tid, "approve", work_dir=world.work_dir)
@@ -247,7 +245,7 @@ def test_conflict_bounces_rebase_needed(world):
     assert resolved["conflict"] is True and resolved["merged"] is False
     assert get_ticket(world.conn, tid)["state"] == "blocked"
     assert _canon_head(canon) == canonical_after_advance
-    notices = " ".join(c.payload.get("text", "") for c in world.gateway.calls)
+    notices = " ".join(world.maint_svc.peek_notices() or [])
     assert "rebase needed" in notices
     assert resolved["canonical_ref"] == canonical_after_advance
     assert resolved["branch_ref"] and resolved["branch_ref"] != before

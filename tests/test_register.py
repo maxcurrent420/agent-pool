@@ -23,8 +23,14 @@ class FakeCtx:
     def register_tool(self, name, toolset, schema, handler):
         self.tools[name] = handler
 
-    def register_command(self, name, handler, description=""):
+    def register_command(self, name, handler, description="", args_hint="", argument_mode=None):
         self.commands[name] = handler
+
+    def register_platform_handler(self, platform, factory):
+        pass
+
+    def register_hook(self, name, handler):
+        pass
 
     def get_config(self, key, default=None):
         return self.config.get(key, default)

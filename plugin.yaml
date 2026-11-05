@@ -38,10 +38,6 @@ config_schema:
     type: dict
     default: {}
     description: "Per-pool settings keyed by pool_id (budgets, relay overrides)"
-  gateway_channel_id:
-    type: str
-    default: ""
-    description: "Discord channel id for the gateway adapter (empty = in-memory offline adapter)"
   transport:
     type: str
     default: "real"

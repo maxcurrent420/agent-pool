@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from crypto import (blake3_hash, build_manifest, generate_signing_key,
                     manifest_hash, sign_manifest, verify_chain, verify_manifest,
                     wrap_dek, unwrap_dek)
-from gateway import FakeGatewayAdapter
 from ledger import add_member, append_manifest, create_pool, init_ledger, record_event
 from propagation import RepoPropagator, pack_bundle, encrypt_bundle, decrypt_bundle
 from propagation import _sandbox_scan
@@ -65,10 +64,9 @@ def world(tmp_path):
     _git("-C", str(src), "add", ".")
     assert _git("-C", str(src), "commit", "-q", "-m", "v1").returncode == 0
 
-    gateway = FakeGatewayAdapter()
     transport = FakeTransport()
     prop = RepoPropagator(
-        conn, gateway, transport,
+        conn, transport,
         pool_id="pool-1",
         maintainer_key_id=identities["m-maint"].key_id,
         maintainer_signing_key=m_sk,
@@ -76,7 +74,7 @@ def world(tmp_path):
     )
     return {
         "conn": conn, "src": src, "identities": identities, "members": members,
-        "gateway": gateway, "transport": transport, "prop": prop, "tmp": tmp_path,
+        "transport": transport, "prop": prop, "tmp": tmp_path,
         "maint_id": identities["m-maint"].key_id,
         "contrib_id": identities["a-contrib"].key_id,
         "member_id": identities["b-member"].key_id,
@@ -106,13 +104,8 @@ def test_maintainer_self_accept(world):
     assert res["state"] == "accepted"
     chain = world["conn"].execute("SELECT version, state FROM repo_versions").fetchall()
     assert chain == [(1, "accepted")]
-    # gateway got manifest + pin, no manifest exceeds 4KB
-    actions = [c.action for c in world["gateway"].calls]
-    assert "post_manifest" in actions
-    text = " ".join(c.payload.get("text", "") for c in world["gateway"].calls)
-    assert "latest accepted" in text
-    for call in world["gateway"].calls:
-        assert len(json.dumps(call.payload).encode()) <= 4096
+    assert res["notice"] and "latest accepted" in res["notice"]
+    assert res["manifest"]["state"] == "accepted"
 
 
 def test_contributor_pending_audit_accept_chain(world):
@@ -232,11 +225,10 @@ def test_rejection_leaves_chain_unchanged(world):
         submitter=world["members"][world["contrib_id"]],
         submitter_signing_key=world["identities"]["a-contrib"].signing_key)
     before = world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0]
-    world["prop"].reject(manifest=res["manifest"], reason="needs tests",
-                         maintainer=world["members"][world["maint_id"]])
+    rej = world["prop"].reject(manifest=res["manifest"], reason="needs tests", maintainer=world["members"][world["maint_id"]])
+    assert "rejected" in rej["notice"]
     after = world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0]
     assert before == after == 0
-    assert any("rejected" in c.payload.get("text", "") for c in world["gateway"].calls)
 
 
 def test_chain_tamper_detected(world):

@@ -67,9 +67,16 @@ import re
 logger = logging.getLogger(__name__)
 
 DECISIONS = ("approve", "edit", "discard")
-_BUTTON_RE = re.compile(r"^(approve|edit|discard):(t-[A-Za-z0-9_-]+)$")
+_BUTTON_RE = re.compile(r"^(?:agent-pool:)?(approve|edit|discard):(t-[A-Za-z0-9_-]+)$")
 # Button values are embedded in prompt text like "approve:t-a1b2c3d4".
-_TEXT_RE = re.compile(r"\b(approve|edit|discard):(t-[A-Za-z0-9_-]+)\b")
+_TEXT_RE = re.compile(r"\b(?:agent-pool:)?(approve|edit|discard):(t-[A-Za-z0-9_-]+)\b")
+
+
+def _strip_prefix(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("agent-pool:"):
+        raw = raw[len("agent-pool:"):]
+    return raw
 
 
 def parse_button_event(payload) -> dict | None:
@@ -149,6 +156,15 @@ def dispatch_button_event(service, platform, event_type, payload, *,
         for author_id in _author_ids(payload):
             if identity_map and author_id in identity_map:
                 clicker_key = identity_map[author_id]
+                break
+            # Fallback: ledger identities.discord_user_id binding.
+            try:
+                from . import ledger as _L
+                clicker_key = _L.lookup_key_by_discord_user(service._conn, author_id)
+            except ImportError:
+                import ledger as _L
+                clicker_key = _L.lookup_key_by_discord_user(service._conn, author_id)
+            if clicker_key:
                 break
     if clicker_key is None:
         raise PermissionError(

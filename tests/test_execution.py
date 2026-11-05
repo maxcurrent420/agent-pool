@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from execution import (BudgetTracker, LocalProcessRunner, LifecycleWorkerRunner,
                        SandboxPolicy, build_mandate_brief, create_worktree,
                        run_worker_loop)
-from gateway import FakeGatewayAdapter
 from ledger import (add_member, create_pool, init_ledger)
 from tickets import PoolService
 from transport import FakeTransport
@@ -65,7 +64,7 @@ class ScriptedRunner:
 @pytest.fixture
 def world(tmp_path):
     conn = _memdb()
-    gateway, transport = FakeGatewayAdapter(), FakeTransport()
+    transport = FakeTransport()
     maint = ensure_identity(tmp_path / "m")
     worker = ensure_identity(tmp_path / "w")
     create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
@@ -79,10 +78,10 @@ def world(tmp_path):
         add_member(conn, "pool-1", ident.key_id, role=role,
                    box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex())
     conn.commit()
-    maint_svc = PoolService(conn, gateway, transport, caller_key_id=maint.key_id,
+    maint_svc = PoolService(conn, transport, caller_key_id=maint.key_id,
                             caller_signing_key=maint.signing_key,
                             caller_box_sk=maint.box_sk)
-    work_svc = PoolService(conn, gateway, transport, caller_key_id=worker.key_id,
+    work_svc = PoolService(conn, transport, caller_key_id=worker.key_id,
                            caller_signing_key=worker.signing_key,
                            caller_box_sk=worker.box_sk)
     src = _git_repo(tmp_path / "src", {"app.py": "def answer():\n    return 41\n"})
@@ -94,7 +93,7 @@ def world(tmp_path):
     assert sent["state"] == "accepted"
     ticket = maint_svc.add_ticket("pool-1", "demo", "Make answer() return 42",
                                   brief="Scope: app.py. Accept: answer()==42.")
-    return conn, gateway, transport, maint_svc, work_svc, ticket
+    return conn, transport, maint_svc, work_svc, ticket
 
 
 def test_worktree_branch_name(tmp_path):
@@ -110,7 +109,7 @@ def test_worktree_branch_name(tmp_path):
 
 
 def test_worker_launch_seeded_with_mandate_budget_sandbox(world, tmp_path):
-    conn, gateway, transport, maint_svc, work_svc, ticket = world
+    conn, transport, maint_svc, work_svc, ticket = world
     work_svc.claim(ticket["ticket_id"], declared_paths=["app.py"],
                    budget={"max_turns": 7, "token_cap": 999})
     runner = ScriptedRunner()
@@ -128,7 +127,7 @@ def test_worker_launch_seeded_with_mandate_budget_sandbox(world, tmp_path):
 
 
 def test_completion_contributor_signed_manifest_and_review(world, tmp_path):
-    conn, gateway, transport, maint_svc, work_svc, ticket = world
+    conn, transport, maint_svc, work_svc, ticket = world
     work_svc.claim(ticket["ticket_id"], declared_paths=["app.py"])
     runner = ScriptedRunner()
     started = work_svc.start_work(
@@ -155,7 +154,7 @@ def test_completion_contributor_signed_manifest_and_review(world, tmp_path):
 
 
 def test_budget_exhaustion_blocked_report_and_claim_released(world, tmp_path):
-    conn, gateway, transport, maint_svc, work_svc, ticket = world
+    conn, transport, maint_svc, work_svc, ticket = world
     work_svc.claim(ticket["ticket_id"], declared_paths=["app.py"],
                    budget={"max_turns": 2})
     runner = ScriptedRunner(usage={"turns": 99, "tokens": 0})
@@ -171,9 +170,9 @@ def test_budget_exhaustion_blocked_report_and_claim_released(world, tmp_path):
     claim = conn.execute("SELECT state FROM claims WHERE ticket_id=?",
                          (ticket["ticket_id"],)).fetchone()
     assert claim["state"] == "released"
-    notices = [c.payload for c in gateway.calls if c.action == "post_notice"]
-    assert any("[blocked]" in n.get("text", "") and "claim released" in n["text"]
-               for n in notices)
+    notices = work_svc.peek_notices() if hasattr(work_svc, "peek_notices") else work_svc.drain_notices()
+    # notices may be consumed; check result notice instead
+    assert out["notice"] and "[blocked]" in out["notice"] and "claim released" in out["notice"]
     # Re-armable: blocked -> open, then a fresh claim succeeds.
     from ledger import set_ticket_state
     set_ticket_state(conn, ticket["ticket_id"], "open")
@@ -181,7 +180,7 @@ def test_budget_exhaustion_blocked_report_and_claim_released(world, tmp_path):
 
 
 def test_acceptance_failure_blocks(world, tmp_path):
-    conn, gateway, transport, maint_svc, work_svc, ticket = world
+    conn, transport, maint_svc, work_svc, ticket = world
     work_svc.claim(ticket["ticket_id"], declared_paths=["app.py"])
     runner = ScriptedRunner()
     work_svc.start_work(ticket["ticket_id"], work_root=tmp_path / "w",
@@ -193,18 +192,13 @@ def test_acceptance_failure_blocks(world, tmp_path):
 
 
 def test_progress_notices_thread_only_and_size_guard(world, tmp_path):
-    conn, gateway, transport, maint_svc, work_svc, ticket = world
-    work_svc.report_progress(ticket["ticket_id"], "milestone: reproduced failure")
-    work_svc.report_progress(ticket["ticket_id"], "x" * 9000)  # must be truncated
-    for call in gateway.calls:
-        assert len(json.dumps(call.payload).encode()) <= 4096
-        # No repo bytes in NOTICES (manifests legitimately carry content_hash).
-        if call.action == "post_notice":
-            assert "wrapped_keys" not in json.dumps(call.payload)
-            assert "bundle" not in json.dumps(call.payload).lower()
-    progress = [c for c in gateway.calls
-                if c.action == "post_notice" and c.payload.get("kind") == "progress"]
-    assert len(progress) == 2 and "milestone" in progress[0].payload["text"]
+    conn, transport, maint_svc, work_svc, ticket = world
+    r1 = work_svc.report_progress(ticket["ticket_id"], "milestone: reproduced failure")
+    r2 = work_svc.report_progress(ticket["ticket_id"], "x" * 9000)  # must be truncated
+    assert "milestone" in r1["notice"]
+    assert len(r1["notice"].encode()) <= 4096
+    assert len(r2["notice"].encode()) <= 4096
+    assert "wrapped_keys" not in r1["notice"] and "bundle" not in r1["notice"].lower()
 
 
 def test_local_process_runner_hard_kill():

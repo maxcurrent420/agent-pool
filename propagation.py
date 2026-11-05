@@ -42,15 +42,13 @@ try:  # package import (Hermes loads plugins as a package)
     from .crypto import (blake3_hash, build_manifest, manifest_hash,
                          sign_manifest, verify_chain, verify_manifest,
                          wrap_dek, unwrap_dek)
-    from .gateway import GatewayAdapter
-    from .ledger import append_manifest, record_event
+    from .ledger import append_manifest, queue_notice, record_event
     from .transport import TransportBackend, fetch_with_retry
 except ImportError:  # flat import (pytest from repo root)
     from crypto import (blake3_hash, build_manifest, manifest_hash,
                         sign_manifest, verify_chain, verify_manifest,
                         wrap_dek, unwrap_dek)
-    from gateway import GatewayAdapter
-    from ledger import append_manifest, record_event
+    from ledger import append_manifest, queue_notice, record_event
     from transport import TransportBackend, fetch_with_retry
 
 # --------------------------------------------------------------------------
@@ -190,12 +188,32 @@ def _verify_key(member: Member):
 class RepoPropagator:
     """One propagator per pool. All state lives in the shared ledger + Iroh."""
 
-    def __init__(self, conn: sqlite3.Connection, gateway: GatewayAdapter,
-                 transport: TransportBackend, *, pool_id: str,
+    def __init__(self, conn: sqlite3.Connection, *args,
+                 transport: TransportBackend = None, gateway=None, pool_id: str,
                  maintainer_key_id: str, maintainer_signing_key,
                  members: dict[str, Member]):
+        # Positional-compat: old call sites passed (conn, gateway, transport).
+        # Gateway is ignored — Hermes posts; propagator only returns content.
+        if args:
+            _pos = list(args)
+            # Identify gateway vs transport by duck-typing.
+            _gw = gateway
+            _tr = transport
+            for _a in _pos:
+                if hasattr(_a, "post_notice"):
+                    _gw = _a
+                elif hasattr(_a, "send"):
+                    _tr = _a
+                else:
+                    raise TypeError(f"unexpected positional arg: {_a!r}")
+            gateway, transport = _gw, _tr
+        if gateway is not None:
+            if hasattr(gateway, "send") and not hasattr(gateway, "post_notice"):
+                if transport is None:
+                    transport = gateway
+        if transport is not None and hasattr(transport, "post_notice") and not hasattr(transport, "send"):
+            raise TypeError("RepoPropagator no longer takes a gateway adapter")
         self._conn = conn
-        self._gateway = gateway
         self._transport = transport
         self._pool_id = pool_id
         self._maintainer_key_id = maintainer_key_id
@@ -232,13 +250,21 @@ class RepoPropagator:
         return {m.key_id: _verify_key(m) for m in self._members.values()
                 if m.verify_key_hex}
 
-    def _post(self, action: str, payload: dict) -> None:
+    def _notice_content(self, action: str, payload: dict) -> dict:
+        """Build the manifest/notice dict returned inside results (no post)."""
         if action == "post_manifest":
-            self._gateway.post_manifest(self._pool_id, payload["manifest"])
-        elif action == "post_notice":
-            self._gateway.post_notice(self._pool_id, payload["text"], kind=payload.get("kind", "notice"))
-        else:  # pragma: no cover - internal misuse guard
-            raise ValueError(f"unknown gateway action {action}")
+            return {"manifest": payload["manifest"]}
+        if action == "post_notice":
+            return {"notice": payload["text"], "kind": payload.get("kind", "notice")}
+        raise ValueError(f"unknown action {action}")
+
+    def _emit(self, action: str, payload: dict) -> dict:
+        """Queue the notice for next-command surfacing; return content dict."""
+        content = self._notice_content(action, payload)
+        if "notice" in content:
+            queue_notice(self._conn, self._pool_id, content["notice"],
+                         kind=content.get("kind", "notice"))
+        return content
 
     # -- submit -------------------------------------------------------------
 
@@ -289,8 +315,8 @@ class RepoPropagator:
 
         if is_maintainer:
             append_manifest(self._conn, repo_id, signed, m_hash)
-            self._post("post_manifest", {"manifest": signed})
-            self._post("post_notice", {
+            _manifest_emit = self._emit("post_manifest", {"manifest": signed})
+            _notice_emit = self._emit("post_notice", {
                 "text": f"latest accepted: {repo_id} v{version} ({m_hash[:12]})",
                 "kind": "latest_accepted",
             })
@@ -302,16 +328,17 @@ class RepoPropagator:
                 " VALUES (?,?,?,?,?)",
                 (repo_id, version, json.dumps(signed), m_hash, "pending"))
             self._conn.commit()
-            self._post("post_notice", {
+            _notice_emit = self._emit("post_notice", {
                 "text": f"review requested: {repo_id} v{version} by {submitter.key_id}",
                 "kind": "review_request",
             })
+            _manifest_emit = {}
             record_event(self._conn, self._pool_id, "submitted_pending",
                          {"repo_id": repo_id, "version": version, "hash": m_hash})
 
         return {"manifest": signed, "manifest_hash": m_hash,
                 "transfer_id": transfer_id, "content_hash": content_hash,
-                "state": state}
+                "state": state, "notice": _notice_emit.get("notice", "")}
 
     # -- audit + accept/reject ----------------------------------------------
 
@@ -415,8 +442,7 @@ class RepoPropagator:
             (manifest["repo_id"], manifest["version"]))
         self._conn.commit()
         append_manifest(self._conn, manifest["repo_id"], accepted, a_hash)
-        self._post("post_manifest", {"manifest": accepted})
-        self._post("post_notice", {
+        _n = self._emit("post_notice", {
             "text": f"latest accepted: {manifest['repo_id']} v{manifest['version']} ({a_hash[:12]})",
             "kind": "latest_accepted",
         })
@@ -425,19 +451,20 @@ class RepoPropagator:
                       "hash": a_hash, "dek_rotated": True,
                       "pending_ticket": manifest.get("transfer_ticket", "")})
         return {"manifest": accepted, "manifest_hash": a_hash,
-                "transfer_id": sent["transfer_id"], "dek_rotated": True}
+                "transfer_id": sent["transfer_id"], "dek_rotated": True,
+                "notice": _n.get("notice", "")}
 
     def reject(self, *, manifest: dict, reason: str, maintainer: Member) -> dict:
         if maintainer.key_id != self._maintainer_key_id:
             raise PermissionError("rejection is maintainer-only")
-        self._post("post_notice", {
+        _n = self._emit("post_notice", {
             "text": f"rejected: {manifest['repo_id']} v{manifest['version']} — {reason}",
             "kind": "rejection",
         })
         record_event(self._conn, self._pool_id, "rejected",
                      {"repo_id": manifest["repo_id"], "version": manifest["version"],
                       "reason": reason})
-        return {"ok": True, "reason": reason}
+        return {"ok": True, "reason": reason, "notice": _n.get("notice", "")}
 
     # -- fetch ---------------------------------------------------------------
 
@@ -587,8 +614,7 @@ class RepoPropagator:
             (repo_id, version))
         self._conn.commit()
         append_manifest(self._conn, repo_id, signed, m_hash)
-        self._post("post_manifest", {"manifest": signed})
-        self._post("post_notice", {
+        _n = self._emit("post_notice", {
             "text": f"latest accepted: {repo_id} v{version} ({m_hash[:12]}) merged",
             "kind": "latest_accepted",
         })
@@ -597,4 +623,5 @@ class RepoPropagator:
                       "content_hash": content_hash})
         return {"manifest": signed, "manifest_hash": m_hash,
                 "transfer_id": sent["transfer_id"],
-                "content_hash": content_hash, "state": "accepted"}
+                "content_hash": content_hash, "state": "accepted",
+                "notice": _n.get("notice", "")}

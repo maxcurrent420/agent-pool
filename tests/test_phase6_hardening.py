@@ -36,7 +36,6 @@ from bridge import (dispatch_button_event, make_platform_event_handler,
                     parse_button_event)
 from crypto import blake3_hash, manifest_hash, unwrap_dek, verify_chain
 from execution import BudgetExhausted, BudgetTracker
-from gateway import FakeGatewayAdapter
 from ledger import (ClaimRefused, add_member, create_pool, get_ticket,
                     init_ledger, is_global_frozen)
 from propagation import _verify_key
@@ -62,7 +61,6 @@ class _World:
     def __init__(self, tmp_path):
         self.tmp = Path(tmp_path)
         self.conn = _memdb()
-        self.gateway = FakeGatewayAdapter()
         self.transport = FakeTransport()
         self.maint = ensure_identity(self.tmp / "m")
         self.contrib = ensure_identity(self.tmp / "a")
@@ -81,15 +79,15 @@ class _World:
             add_member(self.conn, "pool-1", ident.key_id, role=role,
                        box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex())
         self.conn.commit()
-        self.maint_svc = PoolService(self.conn, self.gateway, self.transport,
+        self.maint_svc = PoolService(self.conn, self.transport,
                                      caller_key_id=self.maint.key_id,
                                      caller_signing_key=self.maint.signing_key,
                                      caller_box_sk=self.maint.box_sk)
-        self.contrib_svc = PoolService(self.conn, self.gateway, self.transport,
+        self.contrib_svc = PoolService(self.conn, self.transport,
                                        caller_key_id=self.contrib.key_id,
                                        caller_signing_key=self.contrib.signing_key,
                                        caller_box_sk=self.contrib.box_sk)
-        self.member_svc = PoolService(self.conn, self.gateway, self.transport,
+        self.member_svc = PoolService(self.conn, self.transport,
                                       caller_key_id=self.member.key_id,
                                       caller_signing_key=self.member.signing_key,
                                       caller_box_sk=self.member.box_sk)
@@ -255,11 +253,10 @@ def test_09_gateway_abstraction_full_loop_fake(world):
     assert resolved["merged"] is True
     shown = world.maint_svc.audit_show(ticket_id=tid)
     assert shown["verdict"] == "clean"
-    actions = {c.action for c in world.gateway.calls}
-    assert {"post_manifest", "post_notice", "open_ticket_thread",
-            "set_ticket_state", "post_buttons"} <= actions
-    for call in world.gateway.calls:
-        assert len(json.dumps(call.payload).encode()) <= 4096
+    # Gateway-native: notices are returned strings, not adapter calls.
+    assert gate["notice"]
+    for n in world.maint_svc.peek_notices() or []:
+        assert len(n.encode()) <= 4096
 
 
 # 10 -----------------------------------------------------------------------
@@ -529,11 +526,11 @@ def test_23_propagator_fetch_retry_flaky_sender(world):
     """prop.fetch rides fetch_with_retry: a sender that drops twice then
     recovers still delivers the bundle (bounded retries in the real path)."""
     flaky = _FlakyTransport(failures=2)
-    svc = PoolService(world.conn, world.gateway, flaky,
+    svc = PoolService(world.conn, flaky,
                       caller_key_id=world.maint.key_id,
                       caller_signing_key=world.maint.signing_key,
                       caller_box_sk=world.maint.box_sk)
-    msvc = PoolService(world.conn, world.gateway, flaky,
+    msvc = PoolService(world.conn, flaky,
                        caller_key_id=world.member.key_id,
                        caller_signing_key=world.member.signing_key,
                        caller_box_sk=world.member.box_sk)
@@ -556,7 +553,8 @@ def test_23_propagator_fetch_retry_flaky_sender(world):
 def test_24_coordination_payload_size_guard(world):
     """Gateway payloads stay under 4KB: the fake adapter refuses oversize."""
     with pytest.raises(ValueError, match="exceeds"):
-        world.gateway.post_notice("pool-1", "x" * 5000, kind="progress")
+        from replies import check_content_size
+        check_content_size({"text": "x" * 5000})
 
 
 # 25 -----------------------------------------------------------------------

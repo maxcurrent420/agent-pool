@@ -7,7 +7,7 @@ work in worktree → progress → tests pass → branch bundle published →
 integrate → scan report → approve → merged + re-pinned → audit show +
 chain view.
 
-Default transport is FakeTransport (in-memory) + FakeGatewayAdapter for a
+Default transport is FakeTransport (in-memory) for a
 hermetic, fast run. Pass --real to use RealSendHermesTransport (send_hermes
 must be on PATH; set HERMES_IROH_RELAY=off for the direct/LAN fast path).
 
@@ -29,7 +29,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from nacl.encoding import RawEncoder
 
 from crypto import manifest_hash, verify_chain
-from gateway import FakeGatewayAdapter
 from identity import ensure_identity
 from ledger import (add_member, create_pool, get_latest_accepted_manifest,
                     init_ledger)
@@ -69,7 +68,6 @@ def main():
         tmp = Path(tmp)
         conn = init_ledger(sqlite3.connect(":memory:"))
         conn.row_factory = sqlite3.Row
-        gateway = FakeGatewayAdapter()
         transport = RealSendHermesTransport() if real else FakeTransport()
         maint = ensure_identity(tmp / "maint")
         worker = ensure_identity(tmp / "worker")
@@ -90,10 +88,10 @@ def main():
             add_member(conn, "demo-pool", ident.key_id, role=role,
                        box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex())
         conn.commit()
-        maint_svc = PoolService(conn, gateway, transport, caller_key_id=maint.key_id,
+        maint_svc = PoolService(conn, transport, caller_key_id=maint.key_id,
                                 caller_signing_key=maint.signing_key,
                                 caller_box_sk=maint.box_sk)
-        worker_svc = PoolService(conn, gateway, transport, caller_key_id=worker.key_id,
+        worker_svc = PoolService(conn, transport, caller_key_id=worker.key_id,
                                  caller_signing_key=worker.signing_key,
                                  caller_box_sk=worker.box_sk)
         src = tmp / "src"
@@ -160,10 +158,7 @@ def main():
         print(f"[{time.time()-t0:5.1f}s] audit {shown['audit_id']}: "
               f"verdict={shown['verdict']}; chain {len(chain)} manifests, "
               f"verify_chain={ok}; tip {manifest_hash(chain[-1])[:12]}")
-        actions = sorted({c.action for c in gateway.calls})
-        print(f"gateway actions seen: {actions} "
-              f"(no repo bytes: max payload "
-              f"{max(len(json.dumps(c.payload).encode()) for c in gateway.calls)}B)")
+        print(f"content returned via results (no repo bytes on gateway)")
 
     elapsed = time.time() - t0
     print(f"DEMO_OK elapsed={elapsed:.1f}s "
