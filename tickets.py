@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import subprocess
 from pathlib import Path
 
 try:  # package import (Hermes loads plugins as a package)
@@ -20,6 +21,7 @@ try:  # package import (Hermes loads plugins as a package)
                             LocalProcessRunner, SandboxPolicy, build_mandate_brief,
                             create_worktree, run_acceptance, run_worker_loop)
     from .gateway import GatewayAdapter
+    from .integration import (apply_edit, merge_branch, rescan_tree, scan_diff)
     from .propagation import Member, RepoPropagator
     from .transport import TransportBackend
 except ImportError:  # flat import (pytest from repo root)
@@ -28,6 +30,7 @@ except ImportError:  # flat import (pytest from repo root)
                            LocalProcessRunner, SandboxPolicy, build_mandate_brief,
                            create_worktree, run_acceptance, run_worker_loop)
     from gateway import GatewayAdapter
+    from integration import (apply_edit, merge_branch, rescan_tree, scan_diff)
     from propagation import Member, RepoPropagator
     from transport import TransportBackend
 
@@ -63,6 +66,7 @@ class PoolService:
         self._caller_box_sk = caller_box_sk
         self._budget_defaults = budget_defaults
         self._workers: dict[str, dict] = {}  # ticket_id -> worker record
+        self._integrations: dict[str, dict] = {}  # ticket_id -> gate context
 
     # -- pool membership ----------------------------------------------------
 
@@ -92,6 +96,28 @@ class PoolService:
         self._gateway.post_notice(pool_id, f"pool {pool_id} {'frozen' if frozen else 'unfrozen'}",
                                   kind="freeze")
         return {"ok": True, "pool_id": pool_id, "frozen": frozen}
+
+    def remove_member(self, pool_id, key_id, *, actor_key_id=None) -> dict:
+        """Revoke a member: registry removal + forward-separation notice.
+
+        Future manifests omit the removed member's wrapped key (fresh DEK per
+        version). Already-fetched versions are inherently unfetchable
+        retroactively — the limitation is stated in the thread notice.
+        """
+        actor = actor_key_id or self._caller_key_id
+        pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
+                                  (pool_id,)).fetchone()
+        if pool is None:
+            raise ValueError(f"unknown pool: {pool_id!r}")
+        if pool["maintainer_key_id"] != actor:
+            raise PermissionError("only the pool maintainer may remove members")
+        removed = L.remove_member(self._conn, pool_id, key_id)
+        self._gateway.post_notice(
+            pool_id,
+            f"member removed: {key_id} (forward separation only: "
+            f"{L.REVOCATION_LIMITATION})",
+            kind="member_removed")
+        return removed
 
     def is_frozen(self, pool_id) -> bool:
         return L.is_frozen(self._conn, pool_id)
@@ -370,7 +396,37 @@ class PoolService:
         return {"ok": True, "ticket_id": ticket_id, "version": int(version),
                 "manifest_hash": result["manifest_hash"], "state": result["state"]}
 
-    def integrate(self, ticket_id, key_id=None) -> dict:
+    def _default_work_dir(self):
+        return Path.home() / ".hermes" / "plugin-data" / "agent-pool" / "work" / "integrate"
+
+    def _integration_ctx_path(self, work_dir, ticket_id):
+        return Path(work_dir) / f"gate-{ticket_id}.json"
+
+    def _load_integration_ctx(self, ticket_id, work_dir):
+        ctx = self._integrations.get(ticket_id)
+        if ctx is not None:
+            return ctx
+        path = self._integration_ctx_path(work_dir, ticket_id)
+        if path.exists():
+            ctx = json.loads(path.read_text())
+            self._integrations[ticket_id] = ctx
+            return ctx
+        return None
+
+    def integrate(self, ticket_id, key_id=None, *, work_dir=None) -> dict:
+        """Phase 5 full gate: fetch branch -> dialog scan -> audit -> buttons.
+
+        Steps (all real, network-off scan):
+        a. fetch the contributor BRANCH bundle (``RepoPropagator.fetch_pending``)
+           and the canonical baseline (latest accepted) over the transport;
+        b. sandboxed scan of the branch DIFF (``integration.scan_diff``,
+           bwrap ``--unshare-net``) — containment-by-construction;
+        c. audit report posted to the ticket thread / pool channel;
+        d. if clean: post approve/edit/discard buttons (``post_buttons``) and
+           keep the ticket in ``review`` awaiting a human decision; if the
+           scan is FLAGGED the verdict blocks the gate: no buttons are posted,
+           the ticket goes to ``blocked`` and canonical is never touched.
+        """
         ticket = self.show_ticket(ticket_id)
         key = key_id or self._caller_key_id
         pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
@@ -382,21 +438,277 @@ class PoolService:
             raise ValueError(f"no pending submission for repo {ticket['repo_id']!r}")
         prop = self._propagator(ticket)
         maintainer = prop._members[key]
+        work_dir = Path(work_dir) if work_dir else self._default_work_dir()
+        work_dir.mkdir(parents=True, exist_ok=True)
         audit = prop.audit(manifest=pending, maintainer=maintainer)
         report = audit["report"]
+
+        # (a) fetch branch bundle over the transport.
+        branch = prop.fetch_pending(manifest=pending, maintainer=maintainer,
+                                    dest=work_dir / f"branch-{ticket_id}")
+        # Canonical baseline: clone of the latest accepted bundle.
+        accepted = L.get_latest_accepted_manifest(self._conn, ticket["repo_id"])
+        canon_dir = work_dir / f"canonical-{ticket['repo_id']}"
+        if accepted is not None and not canon_dir.exists():
+            fetched = prop.fetch(manifest=accepted, fetcher=maintainer,
+                                 dest=work_dir / f"canon-fetch-{ticket['repo_id']}")
+            subprocess_clone = fetched["clone_dir"]
+            import shutil as _shutil
+            _shutil.copytree(subprocess_clone, canon_dir)
+            subprocess.run(["git", "-C", str(canon_dir), "config", "user.email", "agent-pool@local"],
+                           capture_output=True, text=True, timeout=60)
+            subprocess.run(["git", "-C", str(canon_dir), "config", "user.name", "agent-pool"],
+                           capture_output=True, text=True, timeout=60)
+        if not canon_dir.exists() and accepted is None:
+            # First-ever submission with no accepted baseline: canonical
+            # starts as a copy of the branch tip (merge is up-to-date).
+            import shutil as _shutil
+            _shutil.copytree(branch["clone_dir"], canon_dir)
+            subprocess.run(["git", "-C", str(canon_dir), "config", "user.email", "agent-pool@local"],
+                           capture_output=True, text=True, timeout=60)
+            subprocess.run(["git", "-C", str(canon_dir), "config", "user.name", "agent-pool"],
+                           capture_output=True, text=True, timeout=60)
+        if canon_dir.exists():
+            # Stale canonical from a different repo/ledger (shared work dir
+            # across runs): rebuild it if it shares no commit with the branch.
+            branch_repo = Path(branch["clone_dir"])
+            probe = subprocess.run(
+                ["git", "-C", str(branch_repo), "cat-file", "-e", "HEAD^{commit}"],
+                capture_output=True, text=True, timeout=60)
+            canon_commits = subprocess.run(
+                ["git", "-C", str(canon_dir), "rev-list", "HEAD"],
+                capture_output=True, text=True, timeout=60).stdout.split()
+            common = False
+            for sha in canon_commits:
+                chk = subprocess.run(
+                    ["git", "-C", str(branch_repo), "cat-file", "-e", f"{sha}^{{commit}}"],
+                    capture_output=True, text=True, timeout=60)
+                if chk.returncode == 0:
+                    common = True
+                    break
+            if not common:
+                import shutil as _shutil
+                _shutil.rmtree(canon_dir)
+                if accepted is not None:
+                    fetched = prop.fetch(manifest=accepted, fetcher=maintainer,
+                                         dest=work_dir / f"canon-refetch-{ticket['repo_id']}")
+                    _shutil.copytree(fetched["clone_dir"], canon_dir)
+                else:
+                    _shutil.copytree(branch["clone_dir"], canon_dir)
+                subprocess.run(["git", "-C", str(canon_dir), "config", "user.email", "agent-pool@local"],
+                               capture_output=True, text=True, timeout=60)
+                subprocess.run(["git", "-C", str(canon_dir), "config", "user.name", "agent-pool"],
+                               capture_output=True, text=True, timeout=60)
+        if not (canon_dir / ".git").exists():
+            raise RuntimeError("canonical checkout unavailable for repo "
+                               f"{ticket['repo_id']!r} (no accepted baseline)")
+        # (b) sandboxed diff scan.
+        diff_report = scan_diff(Path(branch["clone_dir"]), canon_dir)
+        verdict = diff_report["verdict"]
+        hits = diff_report.get("hits", [])
+        combined_verdict = "flagged" if (verdict == "flagged" or report["verdict"] == "flagged") else "clean"
+        if report["verdict"] == "flagged" and verdict == "clean":
+            diff_report = dict(diff_report, hits=report.get("hits", []), verdict="flagged")
+        # (c) audit report to the ticket thread / gateway.
         if ticket.get("thread_ref"):
             self._gateway.post_notice(
                 ticket["pool_id"],
-                f"audit {audit['audit_id']}: verdict={report['verdict']} "
-                f"sandbox={report.get('sandbox', '?')} hits={len(report.get('hits', []))} "
-                f"report_hash={audit['report_hash'][:16]}",
+                f"audit {audit['audit_id']}: verdict={combined_verdict} "
+                f"diff_scan={verdict} sandbox={diff_report.get('sandbox', '?')} "
+                f"diff_files={len(diff_report.get('diff_files', []))} "
+                f"hits={len(hits)} report_hash={audit['report_hash'][:16]}",
                 kind="audit_report")
-        target = "review" if report["verdict"] == "clean" else "blocked"
-        if ticket["state"] != target:
-            self._set_state_and_notify(ticket, target)
-        return {"ok": True, "ticket_id": ticket_id, "verdict": report["verdict"],
+        L.record_event(self._conn, ticket["pool_id"], "integrate_gate",
+                       {"ticket_id": ticket_id, "verdict": combined_verdict,
+                        "audit_id": audit["audit_id"],
+                        "report_hash": audit["report_hash"],
+                        "branch_head": branch["head"], "hits": hits})
+        ctx = {
+            "ticket_id": ticket_id, "pool_id": ticket["pool_id"],
+            "repo_id": ticket["repo_id"], "version": pending["version"],
+            "pending_manifest_hash": L.manifest_hash_value(pending) if hasattr(L, "manifest_hash_value") else pending.get("signature", "")[:16],
+            "audit_id": audit["audit_id"], "report_hash": audit["report_hash"],
+            "verdict": combined_verdict, "diff_verdict": verdict,
+            "hits": hits, "diff_files": diff_report.get("diff_files", []),
+            "branch_clone": branch["clone_dir"], "branch_ref": branch["head"],
+            "branch_name": branch["branch"],
+            "canonical_dir": str(canon_dir),
+            "work_dir": str(work_dir),
+        }
+        self._integrations[ticket_id] = ctx
+        self._integration_ctx_path(work_dir, ticket_id).write_text(json.dumps(ctx, indent=2))
+        if combined_verdict != "clean":
+            # Malware / flagged: REJECTED BEFORE HUMAN REVIEW. No buttons,
+            # ticket blocked, canonical untouched.
+            if ticket["state"] != "blocked":
+                self._set_state_and_notify(ticket, "blocked")
+            if ticket.get("thread_ref"):
+                self._gateway.post_notice(
+                    ticket["pool_id"],
+                    f"{STATE_MARKER.format(state='blocked')} integrate rejected before "
+                    f"human review: scan verdict=flagged hits={json.dumps(hits)[:1200]}; "
+                    f"no approve buttons posted; canonical unchanged",
+                    kind="integrate_rejected")
+            return {"ok": True, "ticket_id": ticket_id, "verdict": combined_verdict,
+                    "report_hash": audit["report_hash"], "audit_id": audit["audit_id"],
+                    "ticket_state": "blocked", "buttons_posted": False,
+                    "hits": hits, "diff_files": ctx["diff_files"]}
+        if ticket["state"] != "review":
+            self._set_state_and_notify(ticket, "review")
+        buttons = [
+            {"id": "approve", "label": "Approve & merge",
+             "value": f"approve:{ticket_id}"},
+            {"id": "edit", "label": "Edit & merge",
+             "value": f"edit:{ticket_id}"},
+            {"id": "discard", "label": "Discard",
+             "value": f"discard:{ticket_id}"},
+        ]
+        if ticket.get("thread_ref"):
+            self._gateway.post_buttons(
+                ticket["thread_ref"],
+                f"Integration review ticket {ticket_id} repo {ticket['repo_id']} "
+                f"v{pending['version']}: scan verdict=clean report_hash="
+                f"{audit['report_hash'][:16]}. Approve merges the branch into "
+                f"canonical with a rotated DEK; edit applies a maintainer patch "
+                f"or file override first; discard rejects without merging.",
+                buttons)
+            self._gateway.post_notice(
+                ticket["pool_id"],
+                f"{STATE_MARKER.format(state='review')} awaiting maintainer decision "
+                f"(approve/edit/discard buttons posted) ticket {ticket_id}",
+                kind="decision_prompt")
+        return {"ok": True, "ticket_id": ticket_id, "verdict": combined_verdict,
                 "report_hash": audit["report_hash"], "audit_id": audit["audit_id"],
-                "ticket_state": target}
+                "ticket_state": "review", "buttons_posted": True,
+                "buttons": buttons, "branch_ref": branch["head"],
+                "diff_files": ctx["diff_files"]}
+
+    def resolve_integration(self, ticket_id, decision, *, key_id=None,
+                            work_dir=None, edit_files=None, edit_patch=None,
+                            reason="") -> dict:
+        """Human decision handler for the approve/edit/discard buttons.
+
+        approve: merge branch -> canonical bundle -> NEW accepted manifest
+        (maintainer-signed, DEK rotated, current members only) -> re-pin ->
+        ticket ``merged``. edit: apply the maintainer's ``edit_files`` /
+        ``edit_patch`` to the merged tree, re-scan, then the same publish.
+        discard: ticket ``blocked`` with the reason; nothing merged.
+        Merge conflict on approve/edit: merge aborted, canonical untouched,
+        ticket bounced to ``blocked`` with ``rebase needed`` + both refs.
+        """
+        ticket = self.show_ticket(ticket_id)
+        key = key_id or self._caller_key_id
+        pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
+                                  (ticket["pool_id"],)).fetchone()
+        if pool["maintainer_key_id"] != key:
+            raise PermissionError("integration decisions are maintainer-only")
+        decision = str(decision).strip().lower()
+        if decision not in ("approve", "edit", "discard"):
+            raise ValueError(f"decision must be approve|edit|discard, got {decision!r}")
+        ctx_work = Path(work_dir) if work_dir else self._default_work_dir()
+        ctx = self._load_integration_ctx(ticket_id, ctx_work)
+        if ctx is None:
+            raise ValueError(f"no integration gate run for ticket {ticket_id!r}; run /integrate first")
+        if ctx.get("verdict") != "clean":
+            raise ValueError("scan verdict is not clean: buttons for this ticket are not actionable")
+        if decision == "edit" and not edit_files and not edit_patch:
+            raise ValueError("edit decision needs edit_files and/or edit_patch")
+        if decision == "discard":
+            if ticket["state"] not in ("review", "blocked"):
+                raise ValueError(f"discard needs a review ticket, got {ticket['state']!r}")
+            prop = self._propagator(ticket)
+            maintainer = prop._members[key]
+            pending = L.get_pending_manifest(self._conn, ticket["repo_id"], ctx["version"])
+            if pending is not None:
+                prop.reject(manifest=pending, reason=reason or "discarded by maintainer at integration gate",
+                            maintainer=maintainer)
+            if ticket["state"] != "blocked":
+                self._set_state_and_notify(ticket, "blocked")
+            if ticket.get("thread_ref"):
+                self._gateway.post_notice(
+                    ticket["pool_id"],
+                    f"{STATE_MARKER.format(state='blocked')} discarded ticket {ticket_id}: "
+                    f"{reason or 'discarded by maintainer'}; canonical unchanged",
+                    kind="integrate_discard")
+            L.record_event(self._conn, ticket["pool_id"], "integrate_discarded",
+                           {"ticket_id": ticket_id, "reason": reason})
+            return {"ok": True, "ticket_id": ticket_id, "decision": "discard",
+                    "ticket_state": "blocked", "merged": False}
+        if ticket["state"] != "review":
+            raise ValueError(f"decision needs a ticket in review, got {ticket['state']!r}")
+        prop = self._propagator(ticket)
+        maintainer = prop._members[key]
+        canonical_dir = Path(ctx["canonical_dir"])
+        branch_clone = Path(ctx["branch_clone"])
+        merge = merge_branch(canonical_dir, branch_clone)
+        if merge.get("conflict"):
+            if ticket["state"] != "blocked":
+                self._set_state_and_notify(ticket, "blocked")
+            if ticket.get("thread_ref"):
+                self._gateway.post_notice(
+                    ticket["pool_id"],
+                    f"{STATE_MARKER.format(state='blocked')} rebase needed ticket {ticket_id}: "
+                    f"merge conflict; canonical_ref={merge['canonical_ref']} "
+                    f"branch_ref={merge['branch_ref']} branch={merge['branch_name']}; "
+                    f"canonical unchanged — contributor must rebase and resubmit",
+                    kind="rebase_needed")
+            L.record_event(self._conn, ticket["pool_id"], "integrate_conflict",
+                           {"ticket_id": ticket_id, **merge})
+            return {"ok": True, "ticket_id": ticket_id, "decision": decision,
+                    "ticket_state": "blocked", "merged": False, "conflict": True,
+                    "canonical_ref": merge["canonical_ref"],
+                    "branch_ref": merge["branch_ref"], "branch_name": merge["branch_name"]}
+        edit_info = None
+        if decision == "edit":
+            pre_edit_head = merge["merge_commit"]
+            edit_info = apply_edit(canonical_dir, edit_files=edit_files,
+                                   edit_patch=edit_patch)
+            touched = [p for p in edit_info["touched"] if p != "edit_patch"]
+            rescan = rescan_tree(canonical_dir, touched or edit_info["touched"])
+            if rescan["verdict"] != "clean":
+                import subprocess as _sp
+                _sp.run(["git", "-C", str(canonical_dir), "reset", "--hard", pre_edit_head],
+                        capture_output=True, text=True, timeout=60)
+                if ticket["state"] != "blocked":
+                    self._set_state_and_notify(ticket, "blocked")
+                if ticket.get("thread_ref"):
+                    self._gateway.post_notice(
+                        ticket["pool_id"],
+                        f"{STATE_MARKER.format(state='blocked')} maintainer edit rejected: "
+                        f"re-scan flagged hits={json.dumps(rescan.get('hits', []))[:800]}; "
+                        f"edit rolled back",
+                        kind="integrate_rejected")
+                return {"ok": True, "ticket_id": ticket_id, "decision": "edit",
+                        "ticket_state": "blocked", "merged": False,
+                        "reason": "edit re-scan flagged", "hits": rescan.get("hits", [])}
+        prev = L.get_latest_accepted_manifest(self._conn, ticket["repo_id"])
+        from crypto import manifest_hash as _mh
+        prev_hash = _mh(prev) if prev else None
+        published = prop.publish_merged(
+            canonical_dir=canonical_dir, repo_id=ticket["repo_id"],
+            version=ctx["version"], maintainer=maintainer,
+            maintainer_signing_key=self._caller_sk,
+            prev_manifest_hash=prev_hash, audit_report_hash=ctx["report_hash"])
+        if ticket["state"] != "merged":
+            self._set_state_and_notify(ticket, "merged")
+        if ticket.get("thread_ref"):
+            self._gateway.post_notice(
+                ticket["pool_id"],
+                f"{STATE_MARKER.format(state='merged')} merged ticket {ticket_id}: "
+                f"version {ctx['version']} manifest {published['manifest_hash'][:16]} "
+                f"merge_commit={(edit_info or merge).get('edit_commit') or merge.get('merge_commit')}",
+                kind="integrate_merged")
+        L.record_event(self._conn, ticket["pool_id"], "integrate_merged",
+                       {"ticket_id": ticket_id, "version": ctx["version"],
+                        "manifest_hash": published["manifest_hash"],
+                        "merge_commit": (edit_info or {}).get("edit_commit") or merge.get("merge_commit"),
+                        "decision": decision})
+        return {"ok": True, "ticket_id": ticket_id, "decision": decision,
+                "ticket_state": "merged", "merged": True,
+                "manifest_hash": published["manifest_hash"],
+                "version": ctx["version"],
+                "merge_commit": (edit_info or {}).get("edit_commit") or merge.get("merge_commit"),
+                "edit": edit_info}
 
     def audit_show(self, ticket_id=None, repo_id=None, version=None) -> dict:
         if ticket_id:

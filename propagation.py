@@ -59,7 +59,8 @@ except ImportError:  # flat import (pytest from repo root)
 
 AUDIT_KEYWORDS = (
     b"eval(", b"exec(", b"os.system", b"subprocess.call", b"subprocess.Popen",
-    b"curl ", b"wget ", b"base64.b64decode", b"execnet", b"netcat", b"nc -",
+    b"curl ", b"curl|", b"wget ", b"| sh", b"|sh", b"| bash", b"base64.b64decode",
+    b"execnet", b"netcat", b"nc -",
     b"chmod +x", b"__import__(", b"importlib.import_module",
     b"require('http')", b"require(\"http\")",
 )
@@ -70,7 +71,8 @@ root = sys.argv[1]
 hits = []
 KEYWORDS = [k.decode() for k in
     [b"eval(", b"exec(", b"os.system", b"subprocess.call", b"subprocess.Popen",
-     b"curl ", b"wget ", b"base64.b64decode", b"execnet", b"netcat", b"nc -",
+     b"curl ", b"curl|", b"wget ", b"| sh", b"|sh", b"| bash", b"base64.b64decode",
+     b"execnet", b"netcat", b"nc -",
      b"chmod +x", b"__import__(", b"importlib.import_module",
      b"require('http')", b'require("http")']]
 for dirpath, dirnames, filenames in os.walk(root):
@@ -458,3 +460,112 @@ class RepoPropagator:
                       "key_id": fetcher.key_id})
         return {"clone_dir": str(clone_dir), "bundle_file": str(bundle_file),
                 "content_hash": manifest["content_hash"]}
+
+    # -- Phase 5: pending-branch fetch for the integration gate ---------------
+
+    def fetch_pending(self, *, manifest: dict, maintainer: Member, dest: Path) -> dict:
+        """Fetch a PENDING contributor branch bundle (integration gate input).
+
+        Unlike :meth:`fetch`, a pending manifest is NOT a chain tip, so there
+        is no chain check; instead the pending manifest's own submitter
+        signature is verified and the maintainer unwraps the DEK from
+        ``wrapped_keys``. The claimant's bundle is cloned into *dest* and its
+        HEAD branch ref is reported so the maintainer can merge it into the
+        canonical checkout. Network is not used beyond the transport fetch.
+        """
+        if maintainer.key_id != self._maintainer_key_id:
+            raise PermissionError("fetch_pending is maintainer-only")
+        if manifest.get("state") != "pending":
+            raise RuntimeError(
+                f"fetch_pending needs a pending manifest, got {manifest.get('state')!r}")
+        submitter = self._members.get(manifest.get("submitter_key_id", ""))
+        if submitter is None:
+            raise PermissionError("fetch_pending: submitter is not a pool member")
+        if not verify_manifest(_verify_key(submitter), manifest):
+            raise RuntimeError("pending manifest signature does not verify")
+        plaintext, _dek = self._decrypt_for_maintainer(manifest, maintainer)
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        bundle_file = dest / f"bundle-v{manifest['version']}.git"
+        bundle_file.write_bytes(plaintext)
+        clone_dir = dest / f"worktree-v{manifest['version']}"
+        if clone_dir.exists():
+            subprocess.run(["git", "-C", str(clone_dir), "worktree", "prune"],
+                           capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(
+            ["git", "clone", "--quiet", str(bundle_file), str(clone_dir)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"git clone of branch bundle failed: {proc.stderr.strip()[:400]}")
+        branch = subprocess.run(
+            ["git", "-C", str(clone_dir), "branch", "--show-current"],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        head = subprocess.run(
+            ["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=60).stdout.strip()
+        record_event(self._conn, self._pool_id, "branch_fetched",
+                     {"repo_id": manifest["repo_id"], "version": manifest["version"],
+                      "branch": branch, "head": head})
+        return {"clone_dir": str(clone_dir), "bundle_file": str(bundle_file),
+                "branch": branch, "head": head,
+                "content_hash": manifest["content_hash"]}
+
+    def publish_merged(self, *, canonical_dir: Path, repo_id: str, version: int,
+                       maintainer: Member, maintainer_signing_key,
+                       prev_manifest_hash: str | None,
+                       audit_report_hash: str) -> dict:
+        """Pack the merged canonical repo into a NEW maintainer-signed accepted
+        manifest with a ROTATED DEK.
+
+        A fresh random DEK is generated for this version (forward separation:
+        members removed before this version get no ``wrapped_keys`` entry and
+        previous DEKs cannot decrypt this bundle). The merged bundle is
+        re-encrypted and re-sent over the transport; only CURRENT pool members
+        (``self._members``, built from the ledger member registry) receive a
+        wrapped key. The new manifest replaces the pending row for *version*
+        and is appended to the chain (``post_manifest`` + latest-accepted pin).
+        """
+        if maintainer.key_id != self._maintainer_key_id:
+            raise PermissionError("publish_merged is maintainer-only")
+        plaintext = pack_bundle(Path(canonical_dir))
+        content_hash = blake3_hash(plaintext)
+        dek = secrets.token_bytes(32)
+        ciphertext = encrypt_bundle(plaintext, dek)
+        wrapped_keys: dict[str, str] = {}
+        for member_id, member in self._members.items():
+            if not member.box_pubkey_hex:
+                continue
+            pk = PublicKey(bytes.fromhex(member.box_pubkey_hex), encoder=RawEncoder)
+            wrapped_keys[member_id] = wrap_dek(pk, dek).hex()
+        with tempfile.TemporaryDirectory(prefix="agentpool-merged-") as tmp:
+            cipher_file = Path(tmp) / "bundle.enc"
+            cipher_file.write_bytes(ciphertext)
+            sent = self._transport.send(cipher_file)
+            ticket = sent["ticket"]
+        body = build_manifest(
+            repo_id=repo_id, version=version, content_hash=content_hash,
+            size_bytes=len(plaintext), signer_key_id=maintainer.key_id,
+            submitter_key_id=maintainer.key_id, wrapped_keys=wrapped_keys,
+            transfer_ticket=ticket, audit_report_hash=audit_report_hash,
+            prev_manifest_hash=prev_manifest_hash, state="accepted",
+        )
+        signed = sign_manifest(maintainer_signing_key, body)
+        m_hash = manifest_hash(signed)
+        self._conn.execute(
+            "DELETE FROM repo_versions WHERE repo_id=? AND version=? AND state='pending'",
+            (repo_id, version))
+        self._conn.commit()
+        append_manifest(self._conn, repo_id, signed, m_hash)
+        self._post("post_manifest", {"manifest": signed})
+        self._post("post_notice", {
+            "text": f"latest accepted: {repo_id} v{version} ({m_hash[:12]}) merged",
+            "kind": "latest_accepted",
+        })
+        record_event(self._conn, self._pool_id, "merged_published",
+                     {"repo_id": repo_id, "version": version, "hash": m_hash,
+                      "content_hash": content_hash})
+        return {"manifest": signed, "manifest_hash": m_hash,
+                "transfer_id": sent["transfer_id"],
+                "content_hash": content_hash, "state": "accepted"}

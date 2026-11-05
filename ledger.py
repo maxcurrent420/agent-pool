@@ -447,3 +447,35 @@ def get_pending_manifest(conn, repo_id, version=None) -> dict | None:
     query += " ORDER BY version DESC LIMIT 1"
     row = conn.execute(query, params).fetchone()
     return json.loads(row[0]) if row else None
+
+
+# --- Phase 5: member revocation ---------------------------------------------
+# Revocation semantics: the member is removed from the registry and future
+# manifests omit their wrapped key (new DEK per version). Already-fetched
+# versions are inherently unfetchable retroactively — DEK rotation gives
+# forward separation only; this is stated in every revocation notice.
+
+REVOCATION_LIMITATION = (
+    "already-fetched versions cannot be revoked retroactively "
+    "(forward separation only: future manifests omit the removed member's wrapped key)"
+)
+
+
+def remove_member(conn, pool_id, key_id) -> dict:
+    """Remove a member from the pool registry (maintainer guard, logged)."""
+    pool = _pool_row(conn, pool_id)
+    if pool["maintainer_key_id"] == key_id:
+        raise ValueError("cannot remove the pool maintainer; transfer maintainer role first")
+    row = conn.execute(
+        "SELECT role FROM members WHERE pool_id=? AND key_id=?",
+        (pool_id, key_id)).fetchone()
+    if row is None:
+        raise ValueError(f"not a pool member: {key_id!r} in pool {pool_id!r}")
+    conn.execute("DELETE FROM members WHERE pool_id=? AND key_id=?",
+                 (pool_id, key_id))
+    conn.commit()
+    record_event(conn, pool_id, "member_removed",
+                 {"key_id": key_id, "role": row[0],
+                  "limitation": REVOCATION_LIMITATION})
+    return {"ok": True, "pool_id": pool_id, "key_id": key_id, "role": row[0],
+            "limitation": REVOCATION_LIMITATION}

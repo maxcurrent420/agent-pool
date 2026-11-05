@@ -168,6 +168,10 @@ def _handle_pool(ctx, raw: str) -> str:
         elif sub == "freeze":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             out = svc.freeze(pool_id, frozen="unfreeze" not in flags)
+        elif sub == "remove":
+            pool_id = rest[0] if rest else opts.get("pool_id", "")
+            key_id = rest[1] if len(rest) > 1 else opts.get("key_id", "")
+            out = svc.remove_member(pool_id, key_id)
         else:
             return _result({"ok": False,
                             "error": f"unknown /pool subcommand: {sub}",
@@ -282,8 +286,25 @@ def _handle_integrate(ctx, raw: str) -> str:
     try:
         svc = _service_for(ctx)
         pos, opts, _flags = _parse_args(raw)
+        if pos and pos[0] in ("approve", "edit", "discard"):
+            decision = pos[0]
+            ticket_id = pos[1] if len(pos) > 1 else opts.get("ticket", "")
+            edit_files = None
+            edit_patch = None
+            if opts.get("edit_file") and opts.get("edit_content") is not None:
+                edit_files = {opts["edit_file"]: opts["edit_content"]}
+            if opts.get("edit_patch_file"):
+                edit_patch = Path(opts["edit_patch_file"]).read_text()
+            out = svc.resolve_integration(
+                ticket_id, decision, work_dir=_work_root_for(ctx) / "integrate"
+                if "_work_root_for" in globals() else None,
+                edit_files=edit_files, edit_patch=edit_patch,
+                reason=opts.get("reason", ""))
+            return _result(out)
         ticket_id = pos[0] if pos else opts.get("ticket", "")
-        return _result(svc.integrate(ticket_id, key_id=opts.get("as") or None))
+        return _result(svc.integrate(
+            ticket_id, work_dir=_work_root_for(ctx) / "integrate"
+            if "_work_root_for" in globals() else None))
     except Exception as exc:
         return _error(exc)
 
