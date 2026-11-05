@@ -9,7 +9,7 @@ chain view.
 
 Default transport is FakeTransport (in-memory) for a
 hermetic, fast run. Pass --real to use RealSendHermesTransport (send_hermes
-must be on PATH; set HERMES_IROH_RELAY=off for the direct/LAN fast path).
+must be on PATH; transfers are relay-only — HERMES_IROH_RELAY=off is a no-op).
 
 Usage:
   env -u PYTHONNOUSERSITE HOME=/home/maxcurrent PATH=/usr/bin:/bin \

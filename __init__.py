@@ -32,8 +32,9 @@ def _transport_config(ctx):
     2. top-level ``transport_mode`` (default ``relay``) / ``relay_url``
     3. ``HERMES_IROH_RELAY`` env var (inside the transport; an empty
        config relay_url means "unset" so the env still applies)
-    In ``relay`` mode an env ``off`` is ignored by the transport (privacy
-    cannot be silently stripped); ``_pool_status`` warns about it.
+    An env ``off`` is a no-op in every mode (direct does not exist, so
+    there is nothing to fall back to); ``_pool_status`` says so and
+    states that transfers are relay-only on both ends.
     """
     base_mode = _cfg(ctx, "transport_mode", "relay") if ctx else "relay"
     base_relay = _cfg(ctx, "relay_url", "") if ctx else ""
@@ -62,22 +63,21 @@ def _pool_status(args=None, **kwargs):
             ("token_cap", 50000), ("wall_clock_seconds", 1800))}
         status = {"ok": True, "plugin": "agent-pool", "phase": 3,
                   "relay_url": relay_url, "transport_mode": mode,
+                  "transport_privacy": (
+                      "relay-only on both sender and receiver: the peer "
+                      "learns no IP; the relay sees both peers' IPs and "
+                      "transfer metadata but never plaintext; there is "
+                      "no direct mode and no way to opt into one"),
                   "pool_transports": per_pool,
                   "budgets": budgets,
                   "ledger": "ready", "identity": "ready",
                   "queued_notices": []}
         if env_relay.lower() in {"off", "disabled", "none"}:
-            if mode == "relay":
-                status["transport_warning"] = (
-                    "HERMES_IROH_RELAY=off is set but transport_mode=relay: "
-                    "the env var is ignored in relay mode (relay-only "
-                    "ticket, peer learns no IP). Unset it, or set "
-                    "transport_mode=direct for direct/LAN transfers.")
-            else:
-                status["transport_warning"] = (
-                    f"HERMES_IROH_RELAY={env_relay} overrides the relay "
-                    f"config for transport_mode={mode}: in direct mode "
-                    "this disables the relay (peer IP exposed).")
+            status["transport_warning"] = (
+                f"HERMES_IROH_RELAY={env_relay} is set but it is a no-op: "
+                "transfers are relay-only on both ends and the env var "
+                "cannot strip the anonymity layer (there is no direct "
+                "mode). The peer learns no IP.")
         try:
             svc = _service_for(ctx)
             status["queued_notices"] = svc.drain_notices()
@@ -110,7 +110,8 @@ def _service_for(ctx, source=None):
     transport_name = _cfg(ctx, "transport", "fake") if ctx else "fake"
     mode, relay_url, per_pool = _transport_config(ctx)
     # An empty relay_url in config means "unset" (env/CLI default apply);
-    # a non-empty one (incl. "off" in direct mode) beats the env var.
+    # a non-empty one beats the env var. A non-empty "off" is rejected by
+    # the transport constructor (relay-only cannot be opted out of).
     relay_arg = str(relay_url).strip() or None
 
     def _make(m, r):

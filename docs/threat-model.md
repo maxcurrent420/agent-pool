@@ -64,22 +64,20 @@ Stated honestly. Anything not listed here as a guarantee is not one.
 - **Tickets are bearer capabilities for ciphertext only.** Treat a leaked
   ticket as leaking ciphertext, not plaintext. Still: don't post tickets
   in public channels.
-- **Peer IP exposure depends on `transport_mode`.** In `relay` mode (the
-  default) the ticket is relay-only (`--ticket-type relay`): the peer
-  learns no IP, but the relay operator (n0 or self-hosted) learns both
-  IPs, EndpointIds, and connection timing/size — never plaintext. In
-  `direct` mode the ticket embeds your IP addresses and Iroh hole-punches
-  a direct QUIC path: **the peer learns your public IP:port**. Only use
-  `direct` for LAN / trusted peers. `tor` mode is not available and fails
-  closed. See README "Transport privacy".
-- **Relay-only ticket ≠ endpoint relay-only (remaining gap).** The
-  relay-only ticket forbids the receiver from learning/dialing a sender
-  IP, but the `send_hermes` endpoint itself may still publish IP
-  transports; fully closing that needs endpoint-side hardening in
-  hermes-iroh-interconnect's sidecar (`clear_ip_transports()` +
-  `AddrFilter::relay_only()`, behind a relay-only policy), which needs
-  a sidecar rebuild + redeploy — see the implementation report's
-  Remaining gaps.
+- **Peer IP exposure: none — transfers are always relay-only on both
+  ends.** The send argv always uses a relay-only ticket
+  (`--ticket-type relay`) and the `send_hermes` endpoints (send and
+  receive) are built with `clear_ip_transports()` +
+  `AddrFilter::relay_only()`, so neither side publishes or accepts
+  direct IP addresses and **the peer never learns the other side's
+  IP**. There is no direct mode and no way to opt into one;
+  `HERMES_IROH_RELAY=off` is a no-op in every mode and an explicit
+  `relay_url: off` is rejected at construction. The relay operator
+  (n0 by default, or a self-hosted/trusted relay configured via
+  `relay_url` on both ends) still learns both IPs, EndpointIds, and
+  connection timing/size — never plaintext. `tor` mode is not
+  available and fails closed with instructions to use `relay`. See
+  README "Transport privacy".
 - **Maintainer key compromise = pool compromise.** Acceptance is a
   signature over the manifest; whoever holds the maintainer signing key
   can accept anything. Protect it like a root key.

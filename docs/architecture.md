@@ -197,7 +197,7 @@ ticket-thread control. Both share `PoolService.resolve_integration`.
 | **Discord attachments** | 25 MB attachment cap; Discord becomes the de-facto store (ToS/limits risk); zero confidentiality. Measured gateway payloads are ≤ ~1.6 KB with `gateway_calls_over_4KB=0` (`.hermes/reports/phase2-propagation.md:20`) — bytes were never meant to flow there. |
 | **Radicle** | Strong store-and-forward + TCP-only support, but: you run a seed; ACL is per-repo/peer, not per-version DEK; no direct maintainer↔contributor transfer semantics. Kept as fallback #1 (see [fallback-transport.md](fallback-transport.md)). |
 | **IPFS / git-over-I2P** | No built-in access control or confidentiality; content addressing is not an ACL. git-over-I2P kept as fallback #2 for QUIC-blocked networks. |
-| **Chosen: Iroh + `send_hermes`** | No third-party gatekeeper; the relay sees ciphertext + routing metadata only; default `relay` mode sends a relay-only ticket (`--ticket-type relay`) so the peer learns no IP; `direct` mode keeps the hole-punched path (peer learns your IP, LAN/trusted only); ticket = bearer capability for ciphertext only; per-version DEK rotation on top. Cost: sender must stay online during transfer; repos >~1 GB out of scope for v1. |
+| **Chosen: Iroh + `send_hermes`** | No third-party gatekeeper; the relay sees ciphertext + routing metadata only; transfers are **always relay-only on both ends** (`--ticket-type relay` ticket *and* a relay-only endpoint policy on send and receive, so the peer learns no IP; there is no direct mode); ticket = bearer capability for ciphertext only; per-version DEK rotation on top. Cost: sender must stay online during transfer; repos >~1 GB out of scope for v1; relay throughput ~2 MB/s vs ~97 MB/s for the (removed) direct path. |
 
 ## Exact network path of repo bytes
 
@@ -206,23 +206,27 @@ ticket-thread control. Both share `PoolService.resolve_integration`.
    SecretBox) encrypts it — DEKs never reused across versions.
 3. DEK wrapped per current member (sealed box, `propagation.py` submit).
 4. Ciphertext → `send_hermes` provider (`P/transport.py:152`).
-5. QUIC paths depend on `transport_mode` (default `relay`: relay-only
-   `--ticket-type relay` ticket, peer learns no IP; `direct` preserves the
-   hole-punced `RelayAndAddresses` path; `tor` fails closed — see
-   README "Transport privacy"). In `relay` mode `HERMES_IROH_RELAY=off`
-   is ignored (privacy cannot be silently stripped); `direct` mode keeps
-   the historic `off` → `--relay disabled` + `--ticket-type addresses`
-   behaviour.
+5. Transfers are **always relay-only on both ends**: the send argv
+   always uses `--ticket-type relay` (peer learns no IP) and the
+   `send_hermes` endpoints on both send and receive are built with
+   `clear_ip_transports()` + `addr_filter(AddrFilter::relay_only())`
+   so neither side publishes or accepts direct IP addresses. The relay
+   (n0 by default, or an operator-configured `relay_url` pointing both
+   ends at a self-hosted/trusted relay) learns both peers' IPs and
+   metadata, never plaintext. `HERMES_IROH_RELAY=off` is a no-op (there
+   is no direct fallback); `tor` fails closed. See README
+   "Transport privacy".
 6. Receiver `fetch` (`propagation.py:471`): chain + signature verify →
    wrapped-DEK ACL → Iroh fetch → BLAKE3 verify vs manifest
    `content_hash` → DEK unwrap → decrypt → `git clone` bundle →
    chain-signature verification.
 
 Throughput (measured on the build host): **~2 MB/s via relay**
-(50 MB in 25.9 s, `.hermes/reports/phase0-spikes.md:5`) and
-**~97 MB/s direct/LAN** (314,572,800 bytes in 3.2 s, BLAKE3 verified,
-`.hermes/reports/phase6-ship.md:53`; Phase 2 LAN fetch 0.1 s,
-`.hermes/reports/phase2-propagation.md:9`). Sender stays online during
+(50 MB in 25.9 s, `.hermes/reports/phase0-spikes.md:5`). The direct path
+measured ~97 MB/s (314,572,800 bytes in 3.2 s, BLAKE3 verified,
+`.hermes/reports/phase6-ship.md:53`) but disclosed the peer's IP, so it
+was removed — the relay-only cost is the documented price of peer-IP
+anonymity. Sender stays online during
 transfer (Phase 0). **Discord carries only manifests/notices/tickets**;
 gateway payloads ≤ ~1.6 KB, `gateway_calls_over_4KB=0`
 (`phase2-propagation.md:20`).

@@ -14,11 +14,19 @@ Two backends:
   the transfer).
 
 Privacy modes (``transport_mode`` config, default ``relay``):
-- ``direct`` — today's behaviour: default ``RelayAndAddresses`` ticket
-  embeds the sender's IPs; the peer learns them (hole-punched QUIC).
-- ``relay`` — default: send uses ``--ticket-type relay`` so the ticket
-  carries only the relay URL; the peer learns no IP. The relay still sees
-  both IPs + metadata (never plaintext — QUIC/TLS + NaCl SecretBox).
+
+Transfers are ALWAYS relay-only, on both ends. There is no direct mode
+and no way to opt into one: the send argv always uses
+``--ticket-type relay`` and never emits ``--relay disabled``; the
+installed ``send_hermes`` endpoint is built with
+``clear_ip_transports()`` + ``addr_filter(AddrFilter::relay_only())`` so
+neither endpoint publishes or accepts direct IP addresses. The peer
+learns no IP. The relay still sees both IPs + metadata (never plaintext
+— QUIC/TLS + NaCl SecretBox); an operator can point both ends at a
+self-hosted/trusted relay via ``relay_url`` (global or per-pool) for a
+stronger anonymity layer.
+
+- ``relay`` — the only working mode: relay-only ticket, peer learns no IP.
 - ``tor`` — accepted as a config value but fails closed: no Tor daemon on
   this host and Iroh's ``proxy_url`` carries HTTP(S) only, so it cannot
   carry QUIC/UDP. Never a half-working path.
@@ -73,10 +81,11 @@ class TorTransportUnavailable(RuntimeError):
         super().__init__(self.MESSAGE)
 
 
-MODE_DIRECT = "direct"
 MODE_RELAY = "relay"
 MODE_TOR = "tor"
-VALID_MODES = (MODE_DIRECT, MODE_RELAY, MODE_TOR)
+# Direct is deliberately absent: there is no mode value, fallback, or
+# argv branch that can produce a direct (hole-punched) transfer.
+VALID_MODES = (MODE_RELAY, MODE_TOR)
 
 _OFF_VALUES = {"off", "disabled", "none"}
 _DEFAULT_RELAY_VALUES = {"", "default", "n0"}
@@ -95,11 +104,8 @@ def normalize_mode(value, default: str = MODE_RELAY) -> str:
 def mode_note(mode: str) -> str:
     """User-visible privacy note for a mode (echoed in command replies)."""
     if mode == MODE_RELAY:
-        return ("relay-only: peer IP not disclosed; "
+        return ("relay-only: peer IP not disclosed on either end; "
                 "relay sees connection metadata (not plaintext)")
-    if mode == MODE_DIRECT:
-        return ("direct: peer IP exposed via ticket "
-                "(hole-punched QUIC — the peer learns your public IP)")
     if mode == MODE_TOR:
         return ("tor: unavailable on this host (fails closed); "
                 "use relay for peer-IP privacy")
@@ -150,27 +156,22 @@ def fetch_with_retry(transport, ticket: str, dest: Path, *,
     raise TransportUnavailable(ticket, max_attempts, last_error)
 
 
-def _relay_flag(mode: str = MODE_DIRECT, relay_url: str | None = None) -> list[str]:
-    """Mode-aware ``--relay`` argv.
+def _relay_flag(relay_url: str | None = None) -> list[str]:
+    """Relay argv for the send/receive commands.
 
-    ``relay`` mode never emits ``--relay disabled`` (that would leave no
-    transport at all). ``direct`` preserves the historic behaviour:
-    env/config ``off`` → ``--relay disabled``; empty/default/n0 → no flag
-    (CLI default applies). An explicit *relay_url* beats the env var.
+    Relay-only, always: a custom relay URL (explicit config beats the
+    ``HERMES_IROH_RELAY`` env var) yields ``--relay <url>``; empty /
+    default / n0 — and env/config ``off``/``none``/``disabled`` — yield
+    no flag (the CLI default relay applies). ``--relay disabled`` is
+    NEVER emitted: that would remove the anonymity layer. An explicit
+    config relay of ``off`` is rejected in the constructor; the env var
+    is a no-op in every mode.
     """
     relay = (str(relay_url).strip() if relay_url is not None
              else os.environ.get("HERMES_IROH_RELAY", "").strip())
-    if mode == MODE_RELAY:
-        if relay.lower() in _DEFAULT_RELAY_VALUES | _OFF_VALUES:
-            # off/none/disabled from the ENV is a no-op here: relay mode
-            # never disables the relay (nor emits "--relay off"). An
-            # EXPLICIT config relay of off is rejected in the constructor.
-            return []
-        return ["--relay", relay]
-    # direct (historic): off/disabled/none -> --relay disabled
-    if relay in _DEFAULT_RELAY_VALUES:
+    if relay.lower() in _DEFAULT_RELAY_VALUES | _OFF_VALUES:
         return []
-    return ["--relay", "disabled" if relay.lower() in _OFF_VALUES else relay]
+    return ["--relay", relay]
 
 
 class TransportBackend(ABC):
@@ -231,12 +232,15 @@ class RealSendHermesTransport(TransportBackend):
     """Real ``send_hermes`` CLI backend (same mechanics as the iroh plugin's
     ``iroh_send_file``/``iroh_fetch_file``).
 
-    ``transport_mode`` defaults to ``relay`` (relay-only ticket: the peer
-    learns no IP). ``relay_url`` (explicit, from plugin/per-pool config)
-    wins over the ``HERMES_IROH_RELAY`` env var; unset → env applies.
-    In ``relay`` mode an explicit relay of ``off``/``disabled``/``none``
-    is a contradictory config and is rejected; an env ``off`` is ignored
-    (privacy cannot be silently stripped — see ``_pool_status`` warning).
+    ``transport_mode`` is ``relay`` (the only working mode: relay-only
+    ticket on the sender side — the peer learns no IP — and the
+    installed ``send_hermes`` endpoint is relay-only on the receiver
+    side too) or ``tor`` (fails closed). ``relay_url`` (explicit, from
+    plugin/per-pool config) wins over the ``HERMES_IROH_RELAY`` env var;
+    unset → env applies. An explicit relay of ``off``/``disabled``/
+    ``none`` is a contradictory config and is rejected in every mode; an
+    env ``off`` is a no-op (privacy cannot be silently stripped — see
+    ``_pool_status`` warning).
     """
 
     def __init__(self, state_dir: str | Path | None = None, *,
@@ -245,15 +249,14 @@ class RealSendHermesTransport(TransportBackend):
         self.transport_mode = normalize_mode(transport_mode)
         self._explicit_relay = (None if relay_url is None
                                 else str(relay_url).strip())
-        if (self.transport_mode == MODE_RELAY
-                and self._explicit_relay is not None
+        if (self._explicit_relay is not None
                 and self._explicit_relay.lower() in _OFF_VALUES):
             raise TransportConfigError(
-                "transport_mode=relay (relay-only ticket) cannot be "
-                f"combined with relay_url={self._explicit_relay!r}: "
-                "relay disabled means no transport at all. "
-                "Unset relay_url, use a relay URL, or set "
-                "transport_mode=direct for LAN/direct transfers.")
+                "relay-only transport cannot be combined with "
+                f"relay_url={self._explicit_relay!r}: a disabled relay "
+                "means no anonymity layer and no transport at all. "
+                "Unset relay_url or set it to a relay URL "
+                "(global or per-pool) to use a self-hosted/trusted relay.")
         env_dir = os.environ.get("HERMES_IROH_STATE_DIR")
         base = Path(state_dir or env_dir or Path.home() / ".hermes" / "iroh-interconnect")
         self._state_dir = base
@@ -272,11 +275,10 @@ class RealSendHermesTransport(TransportBackend):
         if self.transport_mode == MODE_TOR:
             raise TorTransportUnavailable()
         cmd = [binary, "send", "--no-progress", str(path)]
-        cmd += _relay_flag(self.transport_mode, self.relay_url)
-        if self.transport_mode == MODE_RELAY:
-            cmd += ["--ticket-type", "relay"]
-        elif self.relay_url.lower() in _OFF_VALUES:
-            cmd += ["--ticket-type", "addresses"]
+        cmd += _relay_flag(self.relay_url)
+        # Always a relay-only ticket: the peer learns no IP. There is no
+        # addresses-ticket branch — direct is not constructible.
+        cmd += ["--ticket-type", "relay"]
         return cmd
 
     def _fetch_cmd(self, binary: str, ticket: str) -> list[str]:
@@ -284,7 +286,7 @@ class RealSendHermesTransport(TransportBackend):
         if self.transport_mode == MODE_TOR:
             raise TorTransportUnavailable()
         cmd = [binary, "receive", ticket, "--no-progress"]
-        cmd += _relay_flag(self.transport_mode, self.relay_url)
+        cmd += _relay_flag(self.relay_url)
         return cmd
 
     @staticmethod

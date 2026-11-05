@@ -1,9 +1,13 @@
-"""Transport privacy tests: transport_mode (relay/direct/tor).
+"""Transport privacy tests: transport_mode (relay/tor).
 
-Covers the argv evidence for each mode, the tor fail-closed error, config
-plumbing (plugin config + per-pool override), pool_status surfacing, the
-mode echo in submit results, and a full submit->accept->fetch round trip
-in relay mode (crypto/ACL path unchanged — FakeTransport carrier).
+Covers the argv evidence for the only working mode (relay-only on both
+ends), proof that direct cannot be selected (rejected at construction;
+the pure builders can never emit an addresses ticket or
+"--relay disabled" under any env/config combination), the tor
+fail-closed error, config plumbing (plugin config + per-pool override),
+pool_status surfacing, the mode echo in submit results, and a full
+submit->accept->fetch round trip in relay mode (crypto/ACL path
+unchanged — FakeTransport carrier).
 """
 import json
 import os
@@ -58,25 +62,52 @@ def test_relay_mode_never_direct_even_with_env_off(monkeypatch):
 
 
 def test_relay_mode_rejects_explicit_relay_off():
-    with pytest.raises(TransportConfigError, match="transport_mode=relay"):
-        RealSendHermesTransport(transport_mode="relay", relay_url="off")
+    for off in ("off", "none", "disabled"):
+        with pytest.raises(TransportConfigError):
+            RealSendHermesTransport(transport_mode="relay", relay_url=off)
+    # Rejected in every mode, including tor.
+    with pytest.raises(TransportConfigError):
+        RealSendHermesTransport(transport_mode="tor", relay_url="off")
 
 
-def test_direct_mode_preserves_default_ticket(monkeypatch):
-    monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
-    t = RealSendHermesTransport(transport_mode="direct")
-    cmd = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
-    # No --ticket-type: inherits CLI default RelayAndAddresses (today's behaviour).
-    assert "--ticket-type" not in cmd
-    assert "--relay" not in cmd
+@pytest.mark.parametrize("mode", ["direct", "wireless", "addresses", "none",
+                                  "off", "lan", "holepunch", ""])
+def test_direct_mode_cannot_be_selected(mode):
+    # Direct is not a config value, not a fallback, not an alias: any
+    # mode other than relay/tor — including "direct" itself — is
+    # rejected at construction, and "" means the relay default.
+    if mode == "":
+        assert normalize_mode("") == "relay"
+        return
+    with pytest.raises(TransportConfigError):
+        normalize_mode(mode)
+    with pytest.raises(TransportConfigError):
+        RealSendHermesTransport(transport_mode=mode)
+    with pytest.raises(TransportConfigError):
+        FakeTransport(transport_mode=mode)
 
 
-def test_direct_mode_env_off_is_addresses(monkeypatch):
-    monkeypatch.setenv("HERMES_IROH_RELAY", "off")
-    t = RealSendHermesTransport(transport_mode="direct")
-    cmd = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
-    assert cmd[cmd.index("--relay") + 1] == "disabled"
-    assert cmd[cmd.index("--ticket-type") + 1] == "addresses"
+@pytest.mark.parametrize("env", [None, "", "off", "none", "disabled",
+                                 "default", "n0",
+                                 "https://relay.example.lan"])
+@pytest.mark.parametrize("relay_url", [None, "", "https://relay.example.lan"])
+def test_argv_never_contains_direct_branches(monkeypatch, env, relay_url):
+    # Sweep every env/config combination: the pure builders can never
+    # emit "--relay disabled" or an addresses ticket.
+    if env is None:
+        monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_IROH_RELAY", env)
+    t = RealSendHermesTransport(transport_mode="relay", relay_url=relay_url)
+    for cmd in (t._send_cmd("/bin/true", Path("/tmp/x.enc")),
+                t._fetch_cmd("/bin/true", "blobticket")):
+        assert "addresses" not in cmd
+        assert "disabled" not in cmd
+        if "--relay" in cmd:
+            assert cmd[cmd.index("--relay") + 1] not in {
+                "disabled", "off", "none", "addresses"}
+    send = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
+    assert send[send.index("--ticket-type") + 1] == "relay"
 
 
 def test_tor_mode_fails_closed():
@@ -142,13 +173,15 @@ def test_pool_status_warns_env_off_in_relay(monkeypatch):
 def test_per_pool_override_precedence():
     plugin = _load_plugin()
     ctx = _Ctx({"transport_mode": "relay", "relay_url": "",
-                "pools": {"pool-lan": {"transport_mode": "direct",
-                                       "relay_url": "off"},
+                "pools": {"pool-custom-relay": {
+                                      "transport_mode": "relay",
+                                      "relay_url": "https://relay.example.lan"},
                           "pool-same": {"transport_mode": "relay"}}})
     mode, relay, per_pool = plugin._transport_config(ctx)
     assert mode == "relay"
-    assert per_pool == {"pool-lan": {"transport_mode": "direct",
-                                     "relay_url": "off"}}
+    assert per_pool == {"pool-custom-relay": {
+        "transport_mode": "relay",
+        "relay_url": "https://relay.example.lan"}}
     # pool-same matches top-level -> no override entry needed.
 
 
@@ -215,11 +248,8 @@ def test_submit_result_carries_mode_and_roundtrip(tmp_path, monkeypatch):
     assert (clone_dir / "hello.txt").read_text() == "hello agent pool\n"
 
 
-def test_submit_result_direct_note(tmp_path):
-    w = _world(tmp_path, FakeTransport(transport_mode="direct"))
-    res = w["prop"].submit(
-        repo_path=w["src"], repo_id="demo", version=1,
-        submitter=w["members"][w["maint"].key_id],
-        submitter_signing_key=w["maint"].signing_key)
-    assert res["transport_mode"] == "direct"
-    assert "peer IP exposed" in res["transport_note"]
+def test_submit_result_direct_note_rejected(tmp_path):
+    # There is no direct submit path: constructing the carrier with a
+    # direct mode fails before any bytes move.
+    with pytest.raises(TransportConfigError):
+        FakeTransport(transport_mode="direct")
