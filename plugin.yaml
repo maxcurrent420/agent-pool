@@ -1,0 +1,37 @@
+name: agent-pool
+version: 0.1.0
+description: Agent Pool — friends form an agent team; repos propagate via Iroh, coordination only via the gateway
+manifest_version: 2
+api_version: 1
+license: MIT
+tags: [gateway, discord, iroh, team]
+python_dependencies:
+  - "pynacl>=1.5,<2"
+  - "blake3>=0.4,<2"
+provides_tools:
+  - pool_status
+config_schema:
+  relay_url:
+    type: str
+    default: ""
+    description: "Iroh relay URL (empty = default n0 relay; 'off' = direct/LAN)"
+  max_turns:
+    type: int
+    default: 25
+    description: "Per-claim budget: max agent turns"
+  max_tasks_per_day:
+    type: int
+    default: 5
+    description: "Per-claim budget: max tasks per day per worker"
+  token_cap:
+    type: int
+    default: 50000
+    description: "Per-claim budget: token cap"
+  wall_clock_seconds:
+    type: int
+    default: 1800
+    description: "Per-claim budget: wall-clock limit in seconds"
+  pools:
+    type: dict
+    default: {}
+    description: "Per-pool settings keyed by pool_id (budgets, relay overrides)"
