@@ -88,10 +88,17 @@ def test_budget_fields_persisted(conn):
                               budget={"max_turns": 0})
 
 
-def test_claim_requires_declared_paths(conn):
-    create_ticket(conn, "t-1", "pool-1", "demo", "No paths")
-    with pytest.raises(ClaimRefused, match="declare file paths"):
-        claim_ticket_enforced(conn, "c-1", "t-1", "agent:alice", declared_paths=[])
+def test_claim_without_paths_is_whole_ticket(conn):
+    """Empty declared_paths = whole-ticket claim (no paths pre-declared);
+    recorded with the '*' sentinel and blocks later path claims on the
+    same repo (project-registry feature)."""
+    create_ticket(conn, "t-1", "pool-1", "demo", "Whole ticket")
+    claim = claim_ticket_enforced(conn, "c-1", "t-1", "agent:alice", declared_paths=[])
+    assert claim["state"] == "active" and claim["whole_ticket"] is True
+    create_ticket(conn, "t-2", "pool-1", "demo", "Second")
+    with pytest.raises(ClaimRefused, match="overlap"):
+        claim_ticket_enforced(conn, "c-2", "t-2", "agent:bob",
+                              declared_paths=["src/a.py"])
 
 
 def test_release_frees_claim(conn):
@@ -254,7 +261,8 @@ def test_register_wires_all_commands():
     ctx = _FakeCtx()
     plugin.register(ctx)
     assert set(ctx.commands) == {"pool", "task", "claim", "release", "work",
-                                 "integrate", "audit"}
+                                 "integrate", "audit", "add-repo", "task_add",
+                                 "task_list"}
     out = json.loads(ctx.tools["pool_status"]({}))
     assert out["ok"] is True and out["phase"] == 3
 

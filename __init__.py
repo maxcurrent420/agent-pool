@@ -1,9 +1,12 @@
 """Agent Pool plugin — gateway-native: Hermes posts, plugin returns content.
 
-Slash commands: ``/pool register|invite|members|freeze``,
-``/task add|list|show``, ``/claim``, ``/release``, ``/work submit``,
-``/integrate``, ``/audit show``. Every handler returns a string Hermes
-posts; the plugin never posts to Discord itself.
+Slash commands: ``/pool register|invite|members|remove|freeze|list``,
+``/task add|list|show`` (flat aliases ``/task_add`` / ``/task_list``),
+``/add-repo`` (register a project + submit its bytes as a new version),
+``/claim`` (paths optional — omit ``--paths`` for a whole-ticket claim;
+``--any-project --max-tasks N`` takes up to N open tickets), ``/release``,
+``/work submit``, ``/integrate``, ``/audit show``. Every handler returns a
+string Hermes posts; the plugin never posts to Discord itself.
 """
 import json
 import logging
@@ -183,10 +186,21 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             key_id = rest[1] if len(rest) > 1 else opts.get("key_id", "")
             out = svc.remove_member(pool_id, key_id)
+        elif sub == "list":
+            projects = svc.list_projects(pool_id=opts.get("pool_id") or None,
+                                         source=source)
+            out = {"ok": True,
+                   "projects": [{k: p[k] for k in
+                                 ("repo_id", "pool_id", "display_name",
+                                  "accepted_version", "open_tickets",
+                                  "claimed_tickets", "total_tickets",
+                                  "submitter_key_id") if k in p}
+                                | ({"note": p["note"]} if "note" in p else {})
+                                for p in projects]}
         else:
             return _result({"ok": False,
                             "error": f"unknown /pool subcommand: {sub}",
-                            "usage": "/pool register|invite|members|freeze"})
+                            "usage": "/pool register|invite|members|remove|freeze|list"})
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -207,7 +221,9 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
                    "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
         elif sub == "list":
             rows = svc.list_tickets(pool_id=opts.get("pool_id") or None,
-                                    state=opts.get("state") or None, source=source)
+                                    state=opts.get("state") or None,
+                                    source=source,
+                                    repo_id=opts.get("repo") or None)
             out = {"ok": True, "tickets": [
                 {"ticket_id": t["ticket_id"], "title": t["title"], "state": t["state"],
                  "repo_id": t["repo_id"], "claimant": t.get("claimant_key_id"),
@@ -229,11 +245,88 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
         return _error(exc)
 
 
+def _slugify_path(path: str) -> str:
+    """repo_id from a --path basename: lowercase, non-alnum runs -> '-'."""
+    import re
+    base = Path(path).name.strip() or "repo"
+    slug = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+    return slug or "repo"
+
+
+def _handle_add_repo(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
+    """``/add-repo <repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]``
+
+    Registers the project row and submits its bytes as the next version.
+    Re-running submits a NEW version. --path is required.
+    """
+    try:
+        svc = _service_for(ctx, source=source)
+        pos, opts, _flags = _parse_args(raw)
+        repo_id = pos[0] if pos else opts.get("repo", "")
+        path = opts.get("path", "")
+        if not repo_id and path:
+            repo_id = _slugify_path(path)
+        out = svc.add_repo(opts.get("pool", "") or opts.get("pool_id", ""),
+                           repo_id, path,
+                           display_name=opts.get("name", ""), source=source)
+        return _result(out, svc, source)
+    except Exception as exc:
+        return _error(exc)
+
+
+def _handle_task_add(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
+    """Flat alias for ``/task add``: ``/task_add --repo <repo_id> --title "..." [...]``"""
+    try:
+        svc = _service_for(ctx, source=source)
+        _pos, opts, _flags = _parse_args(raw)
+        if not opts.get("repo"):
+            return _result({"ok": False,
+                            "error": "task_add needs --repo <repo_id> "
+                                     "(see /pool list for registered projects)"})
+        ticket = svc.add_ticket(opts.get("pool", "") or opts.get("pool_id", ""),
+                                opts["repo"], opts.get("title", ""),
+                                brief=opts.get("brief", ""),
+                                budget=_budget_from_opts(opts), source=source)
+        out = {"ok": True, "ticket_id": ticket["ticket_id"],
+               "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
+        return _result(out, svc, source)
+    except Exception as exc:
+        return _error(exc)
+
+
+def _handle_task_list(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
+    """Flat alias for ``/task list``: ``/task_list [--repo <repo_id>] [--pool <pool_id>] [--state open]``"""
+    try:
+        svc = _service_for(ctx, source=source)
+        _pos, opts, _flags = _parse_args(raw)
+        rows = svc.list_tickets(pool_id=opts.get("pool", "") or opts.get("pool_id") or None,
+                                state=opts.get("state") or None, source=source,
+                                repo_id=opts.get("repo") or None)
+        out = {"ok": True, "tickets": [
+            {"ticket_id": t["ticket_id"], "title": t["title"], "state": t["state"],
+             "repo_id": t["repo_id"], "claimant": t.get("claimant_key_id"),
+             "thread_ref": t.get("thread_ref")} for t in rows]}
+        return _result(out, svc, source)
+    except Exception as exc:
+        return _error(exc)
+
+
 def _handle_claim(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
     try:
         svc = _service_for(ctx, source=source)
         pos, opts, flags = _parse_args(raw)
         ticket_id = pos[0] if pos else opts.get("ticket", "")
+        # Bounded bulk form: take up to N open tickets' worth of work,
+        # whole-ticket (no paths pre-declared), across any project.
+        if "any_project" in flags or (not ticket_id and "max_tasks" in opts):
+            out = svc.claim_any(pool_id=opts.get("pool") or opts.get("pool_id") or None,
+                                repo_id=opts.get("repo") or None,
+                                max_tasks=int(opts.get("max_tasks", "1") or 1),
+                                key_id=opts.get("as") or None,
+                                budget=_budget_from_opts(opts),
+                                maintainer_override="override" in flags,
+                                source=source)
+            return _result(out, svc, source)
         paths = [p.strip() for p in opts.get("paths", "").split(",") if p.strip()]
         claim = svc.claim(ticket_id, key_id=opts.get("as") or None,
                           declared_paths=paths, budget=_budget_from_opts(opts),
@@ -361,12 +454,18 @@ _POOL_STATUS_SCHEMA = {
 }
 
 _COMMANDS = (
-    ("pool", _handle_pool, "Agent Pool: register|invite|members|freeze, status",
-     "register|invite|members|freeze [options]"),
+    ("pool", _handle_pool, "Agent Pool: register|invite|members|remove|freeze|list, status",
+     "register|invite|members|remove|freeze|list [options]"),
     ("task", _handle_task, "Agent Pool tickets: add|list|show",
      "add|list|show [options]"),
-    ("claim", _handle_claim, "Claim a ticket (declares file paths + budget)",
-     "[ticket] --paths <paths> [options]"),
+    ("add-repo", _handle_add_repo, "Register a project and submit its repo bytes as a new version",
+     "<repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]"),
+    ("task_add", _handle_task_add, "Create a ticket for a registered project (alias of /task add)",
+     "--repo <repo_id> --title \"...\" [--brief \"...\"] [--pool <pool_id>]"),
+    ("task_list", _handle_task_list, "List tickets, optionally for one project (alias of /task list)",
+     "[--repo <repo_id>] [--pool <pool_id>] [--state open]"),
+    ("claim", _handle_claim, "Claim a ticket (paths optional: omit --paths for a whole-ticket claim) or take up to N open tickets with --any-project",
+     "[ticket] [--paths <paths>] [--any-project --max-tasks N] [options]"),
     ("release", _handle_release, "Release a claimed ticket back to open",
      "[ticket]"),
     ("work", _handle_work, "Submit finished work for a claimed ticket",

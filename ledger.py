@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS repos (
     repo_id TEXT PRIMARY KEY,
     pool_id TEXT NOT NULL REFERENCES pools(pool_id),
     name TEXT NOT NULL,
+    path TEXT,
+    display_name TEXT,
+    submitter_key_id TEXT,
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS repo_versions (
@@ -129,6 +132,12 @@ def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
     for table, col, ddl in (
         ("identities", "discord_user_id",
          "ALTER TABLE identities ADD COLUMN discord_user_id TEXT"),
+        ("repos", "path",
+         "ALTER TABLE repos ADD COLUMN path TEXT"),
+        ("repos", "display_name",
+         "ALTER TABLE repos ADD COLUMN display_name TEXT"),
+        ("repos", "submitter_key_id",
+         "ALTER TABLE repos ADD COLUMN submitter_key_id TEXT"),
     ):
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if col not in cols:
@@ -336,10 +345,12 @@ def get_ticket_or_raise(conn, ticket_id) -> dict:
     return ticket
 
 
-def list_tickets(conn, pool_id=None, state=None) -> list:
+def list_tickets(conn, pool_id=None, state=None, repo_id=None) -> list:
     query, params = "SELECT * FROM tickets WHERE 1=1", []
     if pool_id:
         query += " AND pool_id=?"; params.append(pool_id)
+    if repo_id:
+        query += " AND repo_id=?"; params.append(repo_id)
     if state:
         if state not in TICKET_STATES:
             raise ValueError(f"unknown ticket state: {state!r}")
@@ -364,6 +375,95 @@ def ensure_repo(conn, repo_id, pool_id, name=None) -> None:
     conn.commit()
 
 
+# Sentinel recorded in file_claims for a whole-ticket claim (no paths
+# pre-declared). It overlaps every path on the same repo, in both
+# directions: a whole-ticket claim is refused while other tickets hold
+# live file claims on the repo, and a path claim is refused while a
+# whole-ticket claim is live on the repo.
+WHOLE_TICKET_PATH = "*"
+
+
+def create_repo(conn, repo_id, pool_id, name=None, path=None,
+                display_name=None, submitter_key_id=None) -> None:
+    """Insert a project/registry row (fails if the repo already exists)."""
+    _pool_row(conn, pool_id)
+    conn.execute(
+        "INSERT INTO repos (repo_id, pool_id, name, path, display_name,"
+        " submitter_key_id, created_at) VALUES (?,?,?,?,?,?,?)",
+        (repo_id, pool_id, name or repo_id, path,
+         display_name or name or repo_id, submitter_key_id, _now()))
+    conn.commit()
+
+
+def upsert_repo(conn, repo_id, pool_id, name=None, path=None,
+                display_name=None, submitter_key_id=None) -> None:
+    """Register a project, or update its metadata if it already exists.
+
+    Unlike ensure_repo (INSERT OR IGNORE), a re-run of /add-repo updates
+    path/display_name/submitter on conflict. The pool binding never
+    changes: a repo that already belongs to a different pool is refused.
+    Non-None fields overwrite; the name column is only set when given.
+    """
+    _pool_row(conn, pool_id)
+    row = conn.execute("SELECT pool_id FROM repos WHERE repo_id=?",
+                       (repo_id,)).fetchone()
+    if row is not None and row[0] != pool_id:
+        raise ValueError(
+            f"repo {repo_id!r} already belongs to pool {row[0]!r}, "
+            f"not pool {pool_id!r}")
+    if row is None:
+        create_repo(conn, repo_id, pool_id, name=name, path=path,
+                    display_name=display_name, submitter_key_id=submitter_key_id)
+        return
+    sets, params = [], []
+    if path is not None:
+        sets.append("path=?"); params.append(path)
+    if display_name is not None:
+        sets.append("display_name=?"); params.append(display_name)
+    if name is not None:
+        sets.append("name=?"); params.append(name)
+    if submitter_key_id is not None:
+        sets.append("submitter_key_id=?"); params.append(submitter_key_id)
+    if sets:
+        params.append(repo_id)
+        conn.execute(f"UPDATE repos SET {', '.join(sets)} WHERE repo_id=?", params)
+        conn.commit()
+
+
+def get_repo(conn, repo_id) -> dict | None:
+    row = conn.execute("SELECT * FROM repos WHERE repo_id=?", (repo_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_repos(conn, pool_id=None) -> list:
+    """Projects with accepted-version pointer and per-state ticket counts.
+
+    ``accepted_version`` is None for repos that have no submitted/accepted
+    bytes yet (e.g. registered via a bare ticket before /add-repo ever
+    ran). ``display_name`` falls back to ``name`` for pre-migration rows.
+    """
+    query = (
+        "SELECT r.repo_id, r.pool_id, r.name,"
+        " COALESCE(r.display_name, r.name) AS display_name, r.path,"
+        " r.submitter_key_id, r.created_at,"
+        " (SELECT MAX(rv.version) FROM repo_versions rv"
+        "  WHERE rv.repo_id = r.repo_id AND rv.state = 'accepted')"
+        "   AS accepted_version,"
+        " (SELECT COUNT(*) FROM tickets t WHERE t.repo_id = r.repo_id"
+        "  AND t.state = 'open') AS open_tickets,"
+        " (SELECT COUNT(*) FROM tickets t WHERE t.repo_id = r.repo_id"
+        "  AND t.state = 'claimed') AS claimed_tickets,"
+        " (SELECT COUNT(*) FROM tickets t WHERE t.repo_id = r.repo_id)"
+        "   AS total_tickets"
+        " FROM repos r")
+    params: list = []
+    if pool_id:
+        query += " WHERE r.pool_id=?"
+        params.append(pool_id)
+    query += " ORDER BY r.pool_id, r.repo_id"
+    return [dict(r) for r in conn.execute(query, params)]
+
+
 def set_ticket_state(conn, ticket_id, state) -> dict:
     """Move a ticket through the lifecycle; invalid jumps raise ValueError."""
     if state not in TICKET_STATES:
@@ -381,23 +481,44 @@ def set_ticket_state(conn, ticket_id, state) -> dict:
 
 
 def _overlaps(conn, repo_id, ticket_id, paths) -> list:
-    """Declared paths of OTHER tickets on the same repo that are still live."""
+    """Declared paths of OTHER tickets on the same repo that are still live.
+
+    A live whole-ticket claim (sentinel ``WHOLE_TICKET_PATH``) overlaps
+    every path, so a path claim is refused while one is active.
+    """
     rows = conn.execute(
         "SELECT fc.path, fc.ticket_id FROM file_claims fc"
         " JOIN tickets t ON t.ticket_id = fc.ticket_id"
         " WHERE t.repo_id=? AND fc.ticket_id<>? AND t.state IN ('claimed','review','blocked')",
         (repo_id, ticket_id)).fetchall()
     claimed = {r[0] for r in rows}
+    if WHOLE_TICKET_PATH in claimed:
+        return sorted(set(paths) | {WHOLE_TICKET_PATH})
     return sorted(p for p in paths if p in claimed)
+
+
+def _live_file_claims(conn, repo_id, ticket_id) -> list:
+    """Live declared paths of OTHER tickets on the same repo (sorted)."""
+    rows = conn.execute(
+        "SELECT fc.path FROM file_claims fc"
+        " JOIN tickets t ON t.ticket_id = fc.ticket_id"
+        " WHERE t.repo_id=? AND fc.ticket_id<>? AND t.state IN ('claimed','review','blocked')",
+        (repo_id, ticket_id)).fetchall()
+    return sorted({r[0] for r in rows})
 
 
 def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None,
                           budget=None, maintainer_override=False) -> dict:
-    """Ledger-enforced claim: frozen check, paths required, overlap refused,
-    one-ticket-one-worker, budget persisted. Returns the claim row."""
+    """Ledger-enforced claim: frozen check, overlap refused,
+    one-ticket-one-worker, budget persisted. Returns the claim row.
+
+    An empty ``declared_paths`` is a whole-ticket claim (no paths
+    pre-declared): recorded with the ``WHOLE_TICKET_PATH`` sentinel,
+    refused while other tickets hold live file claims on the same repo,
+    and blocks later path claims on that repo until released.
+    """
     paths = [str(p).strip() for p in (declared_paths or []) if str(p).strip()]
-    if not paths:
-        raise ClaimRefused("claim refused: claimant must declare file paths")
+    whole_ticket = not paths
     ticket = get_ticket_or_raise(conn, ticket_id)
     if ticket["state"] != "open":
         raise ClaimRefused(
@@ -407,7 +528,17 @@ def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None
         raise ClaimRefused("claim refused: global kill-switch is set")
     if is_frozen(conn, ticket["pool_id"]):
         raise ClaimRefused(f"claim refused: pool {ticket['pool_id']!r} is frozen")
-    overlaps = _overlaps(conn, ticket["repo_id"], ticket_id, paths)
+    if whole_ticket:
+        live = _live_file_claims(conn, ticket["repo_id"], ticket_id)
+        if live and not maintainer_override:
+            raise ClaimRefused(
+                "claim refused: whole-ticket claim overlaps live file claims "
+                f"on repo {ticket['repo_id']!r}: {', '.join(live)}")
+        claim_paths = [WHOLE_TICKET_PATH]
+        overlaps = [WHOLE_TICKET_PATH] if live else []
+    else:
+        claim_paths = paths
+        overlaps = _overlaps(conn, ticket["repo_id"], ticket_id, paths)
     if overlaps and not maintainer_override:
         raise ClaimRefused(
             f"claim refused: paths overlap other tickets on repo "
@@ -421,7 +552,7 @@ def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None
     try:
         # claim_ticket() inserts the claim + file_claims and flips the ticket.
         claim_ticket(conn, claim_id, ticket_id, key_id,
-                     declared_paths=paths, budget=full_budget)
+                     declared_paths=claim_paths, budget=full_budget)
     except sqlite3.IntegrityError as exc:  # double-claim race / dup paths
         raise ClaimRefused(f"claim refused: {exc}") from exc
     if overlaps:
@@ -429,9 +560,11 @@ def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None
                      {"ticket_id": ticket_id, "key_id": key_id, "paths": overlaps})
     else:
         record_event(conn, ticket["pool_id"], "claimed",
-                     {"ticket_id": ticket_id, "key_id": key_id, "paths": paths})
+                     {"ticket_id": ticket_id, "key_id": key_id, "paths": claim_paths})
     row = conn.execute("SELECT * FROM claims WHERE claim_id=?", (claim_id,)).fetchone()
-    return dict(row)
+    claim = dict(row)
+    claim["whole_ticket"] = whole_ticket
+    return claim
 
 
 def release_ticket(conn, ticket_id, key_id) -> dict:

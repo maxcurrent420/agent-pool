@@ -334,8 +334,24 @@ class PoolService:
         self._queue_notice(pool_id, ticket["notice"], kind="ticket_created")
         return ticket
 
-    def list_tickets(self, pool_id=None, state=None, source=None) -> list:
-        if pool_id:
+    def list_tickets(self, pool_id=None, state=None, source=None, repo_id=None) -> list:
+        if repo_id:
+            repo = L.get_repo(self._conn, repo_id)
+            if repo is None:
+                raise ValueError(f"unknown repo: {repo_id!r}")
+            if pool_id:
+                pool_id = self._resolve_pool(pool_id, source=source)
+                if repo["pool_id"] != pool_id:
+                    raise PoolNotLocalError(
+                        f"pool_not_local: repo {repo_id!r} belongs to pool "
+                        f"{repo['pool_id']!r}, not pool {pool_id!r}; remote pools "
+                        "are reached only via Iroh",
+                        pool_id=repo["pool_id"])
+                self._assert_local_owned(pool_id, source=source)
+            else:
+                pool_id = repo["pool_id"]
+                self._assert_local_owned(pool_id, source=source)
+        elif pool_id:
             pool_id = self._resolve_pool(pool_id, source=source)
         else:
             # If source binds a pool, scope to it.
@@ -345,7 +361,118 @@ class PoolService:
                     pool_id = self._resolve_pool(None, source=src)
                 except PoolNotLocalError:
                     pool_id = None
-        return L.list_tickets(self._conn, pool_id=pool_id, state=state)
+        return L.list_tickets(self._conn, pool_id=pool_id, state=state, repo_id=repo_id)
+
+    # -- project / repo registry ----------------------------------------------
+
+    def add_repo(self, pool_id, repo_id, path, display_name="", source=None) -> dict:
+        """Register a project and submit its bytes as the next repo version.
+
+        Registry row (upsert) + propagation submit (pack -> BLAKE3 -> DEK
+        wrap -> Iroh send -> signed manifest appended to the chain).
+        Re-running submits a NEW version (next_repo_version), never refuses.
+        ``path`` is required: a project without bytes is not a project.
+        """
+        if not path:
+            raise ValueError(
+                "add-repo needs --path <abs/path>: a project without bytes "
+                "is not a project; pass the local checkout to submit")
+        if not repo_id:
+            raise ValueError("add-repo needs a repo_id (or --path to derive one)")
+        pool_id = self._resolve_pool(pool_id, source=source)
+        self._assert_local_owned(pool_id, source=source)
+        self._check_not_frozen(pool_id)
+        repo_path = Path(path)
+        if not repo_path.is_dir():
+            raise ValueError(f"repo path is not a directory: {path!r}")
+        if self._caller_sk is None:
+            raise RuntimeError("add-repo needs the local signing key")
+        L.upsert_repo(self._conn, repo_id, pool_id,
+                      path=str(repo_path.resolve()),
+                      display_name=display_name or None,
+                      submitter_key_id=self._caller_key_id or None)
+        version = L.next_repo_version(self._conn, repo_id)
+        prop = self._propagator(pool_id)
+        submitter = prop._members.get(self._caller_key_id)
+        if submitter is None:
+            raise PermissionError(
+                f"add-repo refused: caller {self._caller_key_id!r} is not a pool member")
+        result = prop.submit(repo_path=repo_path, repo_id=repo_id, version=version,
+                             submitter=submitter,
+                             submitter_signing_key=self._caller_sk)
+        L.record_event(self._conn, pool_id, "repo_added",
+                       {"repo_id": repo_id, "version": version,
+                        "state": result["state"],
+                        "manifest_hash": result["manifest_hash"]})
+        # DEK timing: members invited AFTER this version have no wrapped
+        # key for it and must wait for the next version.
+        members_with_box = [m for m in prop._members.values() if m.box_pubkey_hex]
+        wrapped = set((result["manifest"].get("wrapped_keys") or {}).keys())
+        missing = [m.key_id for m in members_with_box if m.key_id not in wrapped]
+        notice = (f"project {repo_id} registered: v{version} "
+                  f"{result['state']} ({result['manifest_hash'][:12]})")
+        if result["state"] == "pending":
+            notice += "; awaiting maintainer accept via /integrate"
+        if missing:
+            notice += (f"; WARNING: {len(missing)} member(s) have no DEK key "
+                       f"for this version ({', '.join(sorted(missing))}) — invite "
+                       "members BEFORE /add-repo; late joiners wait for the "
+                       "next version")
+        else:
+            notice += ("; invite members BEFORE /add-repo — members invited "
+                       "later wait for the next version")
+        return {"ok": True, "repo_id": repo_id, "pool_id": pool_id,
+                "version": version, "state": result["state"],
+                "manifest_hash": result["manifest_hash"],
+                "transfer_id": result.get("transfer_id", ""),
+                "notice": notice}
+
+    def list_projects(self, pool_id=None, source=None) -> list:
+        """Local-ledger-only project listing for /pool list.
+
+        With --pool (or a chat binding): that pool's projects, after the
+        usual membership check. Otherwise: every local pool the caller is
+        a member of (pools with no member rows are exempt, the bare-fixture
+        rule). Repos with no accepted version are included and marked via
+        ``accepted_version=None`` with a ``note``, not hidden.
+        """
+        if pool_id:
+            resolved = self._resolve_pool(pool_id, source=source)
+            self._assert_local_owned(resolved, source=source)
+            return self._project_rows(resolved)
+        src = self._source_from(source)
+        if src is not None:
+            try:
+                bound = self._resolve_pool(None, source=src)
+                self._assert_local_owned(bound, source=source)
+                return self._project_rows(bound)
+            except PoolNotLocalError:
+                pass
+        projects: list = []
+        for pid in L.list_local_pools(self._conn):
+            try:
+                self._assert_local_owned(pid, source=source)
+            except PoolNotLocalError:
+                continue
+            projects.extend(self._project_rows(pid))
+        return projects
+
+    def _project_rows(self, pool_id) -> list:
+        rows = []
+        for r in L.list_repos(self._conn, pool_id):
+            accepted = r.get("accepted_version")
+            row = {"repo_id": r["repo_id"], "pool_id": r["pool_id"],
+                   "display_name": r["display_name"], "name": r["name"],
+                   "accepted_version": accepted,
+                   "open_tickets": r["open_tickets"],
+                   "claimed_tickets": r["claimed_tickets"],
+                   "total_tickets": r["total_tickets"],
+                   "submitter_key_id": r.get("submitter_key_id") or ""}
+            if accepted is None:
+                row["note"] = ("registered via ticket, no bytes submitted "
+                               "yet — run /add-repo --path <checkout>")
+            rows.append(row)
+        return rows
 
     def show_ticket(self, ticket_id) -> dict:
         return L.get_ticket_or_raise(self._conn, ticket_id)
@@ -378,6 +505,46 @@ class PoolService:
         claim["notice"] = notice
         claim["state_word"] = "claimed"
         return claim
+
+    def claim_any(self, pool_id=None, repo_id=None, max_tasks=1, key_id=None,
+                  budget=None, maintainer_override=False, source=None) -> dict:
+        """Claim up to ``max_tasks`` open tickets, whole-ticket form (no
+        paths pre-declared), across any project in the pool (or one repo).
+
+        Every individual claim still goes through the enforced path
+        (freeze, one-ticket-one-worker, overlap, budget), so the bound is
+        ``max_tasks`` successful claims. Tickets that refuse (e.g. a live
+        file claim on the same repo) are reported as skipped and the
+        search continues. Bounded hard at 10 tickets per call.
+        """
+        max_tasks = int(max_tasks or 1)
+        if max_tasks < 1:
+            raise ValueError("max_tasks must be >= 1")
+        max_tasks = min(max_tasks, 10)
+        key = key_id or self._caller_key_id
+        if not key:
+            raise ValueError("claim needs a claimant key_id")
+        open_tickets = self.list_tickets(pool_id=pool_id, state="open",
+                                         source=source, repo_id=repo_id)
+        claimed, skipped = [], []
+        for ticket in open_tickets:
+            if len(claimed) >= max_tasks:
+                break
+            try:
+                c = self.claim(ticket["ticket_id"], key_id=key,
+                               declared_paths=[], budget=budget,
+                               maintainer_override=maintainer_override)
+                claimed.append({"ticket_id": ticket["ticket_id"],
+                                "title": ticket["title"],
+                                "repo_id": ticket["repo_id"],
+                                "claim_id": c.get("claim_id", "")})
+            except (L.ClaimRefused, ValueError) as exc:
+                skipped.append({"ticket_id": ticket["ticket_id"],
+                                "reason": str(exc)})
+        notice = (f"claim-any: claimed {len(claimed)} ticket(s)"
+                  + (f"; skipped {len(skipped)}" if skipped else ""))
+        return {"ok": True, "claimed": claimed, "skipped": skipped,
+                "count": len(claimed), "notice": notice}
 
     def release(self, ticket_id, key_id=None) -> dict:
         key = key_id or self._caller_key_id
@@ -552,13 +719,17 @@ class PoolService:
                 box_pubkey_hex="", box_sk=self._caller_box_sk)
         return members
 
-    def _propagator(self, ticket) -> RepoPropagator:
+    def _propagator(self, ticket_or_pool) -> RepoPropagator:
+        """Build the propagator for a pool. Accepts a ticket dict (legacy)
+        or a pool_id string (used by /add-repo, which has no ticket)."""
         if self._transport is None:
             raise RuntimeError("work submit / integrate need a transport backend")
+        pool_id = (ticket_or_pool["pool_id"] if isinstance(ticket_or_pool, dict)
+                   else str(ticket_or_pool))
         pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
-                                  (ticket["pool_id"],)).fetchone()
+                                  (pool_id,)).fetchone()
         maintainer_id = pool["maintainer_key_id"]
-        members = self._members_for_propagator(ticket["pool_id"])
+        members = self._members_for_propagator(pool_id)
         if maintainer_id not in members:
             raise RuntimeError(f"maintainer {maintainer_id!r} is not a pool member")
         maintainer_sk = self._caller_sk
@@ -566,7 +737,7 @@ class PoolService:
         # submit/audit run as the caller. The caller's key is a safe stand-in
         # until the maintainer gate lands.
         return RepoPropagator(
-            self._conn, self._transport, pool_id=ticket["pool_id"],
+            self._conn, self._transport, pool_id=pool_id,
             maintainer_key_id=maintainer_id, maintainer_signing_key=maintainer_sk,
             members=members)
 

@@ -135,13 +135,23 @@ hermes plugins enable agent-pool
 # 3. In Discord (bot allowlist must contain you), run the flow:
 #    /pool register <pool_id> --name <name> --discord-user <your Discord user id>
 #    /pool invite <pool_id> <member key_id> --box-pubkey <hex> --discord-user <their id>
-#    /task add --pool-id <pool_id> --repo <repo> --title "..."
-#    /claim <ticket> --paths a.py,b.py
+#    /add-repo <repo_id> --path /srv/repos/<repo_id> --pool <pool_id> --name "<display name>"
+#    /task_add --repo <repo_id> --pool <pool_id> --title "..." --brief "..."
+#    /pool list --pool <pool_id>          (projects available to work on)
+#    /task_list --repo <repo_id> --pool <pool_id> --state open
+#    /claim <ticket>                      (whole-ticket claim, no paths)
+#    /claim --any-project --max-tasks 2   (take up to 2 open tickets, any project)
 #    /work submit <ticket> --repo-path <path> --version 1
 #    /integrate <ticket>     → audit; then click Approve (buttons), or use
 #    /integrate approve <ticket>   (same code path + maintainer check)
 #    /audit show <ticket>
 ```
+
+> **DEK timing rule:** invite members **before** `/add-repo`. The repo
+> version's decryption key is wrapped only for members who exist at submit
+> time; members invited later cannot fetch that version and wait for the
+> next version (each version rotates the key). The `/add-repo` reply
+> states this, and warns if a member with a box key has no wrapped key.
 
 Requirements: `git`; `bubblewrap` (audit/worker sandbox — without it the
 scanner says so and runs unsandboxed, see
@@ -152,7 +162,7 @@ cargo).
 > Version note: the gateway-native migration is a **breaking
 > communication-layer change** — the plugin no longer posts to Discord
 > itself (the old `GatewayAdapter`/`gateway.py` architecture is deleted,
-> not deprecated). The manifest is version **2.0.0**; `gateway_channel_id`
+> not deprecated). The manifest is version **2.1.0**; `gateway_channel_id`
 > no longer exists (gateway routing is Hermes's).
 
 ## Commands
@@ -164,9 +174,14 @@ cargo).
 | `/pool members <pool_id>` | List members |
 | `/pool remove <pool_id> <key_id>` | Revoke a member (forward separation) |
 | `/pool freeze [--global] [--unfreeze]` | Per-pool freeze; **no pool id / `--global` = global kill-switch** across every pool |
+| `/pool list [--pool <pool_id>]` | List projects (repos) in this agent's ledger for pools you are a member of: display name, accepted version, open/claimed ticket counts. Repos with no submitted bytes are marked, not hidden |
+| `/add-repo <repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]` | **Register a project and submit its bytes** (git bundle → BLAKE3 → per-member DEK wrap → Iroh send → signed manifest). `--path` is required; `repo_id` may be omitted and is derived from the `--path` basename. Re-running submits a **new version**. Invite members **before** this command (DEK timing) |
 | `/task add --pool-id … --repo … --title … --brief … [--max-turns …]` | Create a ticket |
+| `/task_add --repo <repo_id> --title … --brief … [--pool <pool_id>]` | Flat alias of `/task add` |
 | `/task list\|show [--pool-id …]` | List/show tickets |
-| `/claim <ticket> --paths a.py,b.py [--max-turns …] [--override]` | Claim (declares paths; overlap refused) |
+| `/task_list [--repo <repo_id>] [--pool <pool_id>] [--state open]` | Flat alias of `/task list`, with `--repo` filter (cross-pool repo refused) |
+| `/claim <ticket> [--paths a.py,b.py] [--max-turns …] [--override]` | Claim. `--paths` optional: **omit it for a whole-ticket claim** (no paths pre-declared; recorded as `*`, blocks later path claims on that repo until released). Declared-path claims keep the overlap refusal |
+| `/claim --any-project [--max-tasks N] [--repo <repo_id>] [--pool <pool_id>]` | Take up to N (default 1, hard cap 10) open tickets' worth of work, whole-ticket form, across any project in the pool. Each claim still passes the freeze / one-ticket-one-worker / overlap / budget checks; refused tickets are reported as skipped |
 | `/release <ticket>` | Release a claim back to open |
 | `/work submit <ticket> --repo-path PATH --version N` | Submit finished work (contributor-signed, pending; bytes go over Iroh) |
 | `/integrate <ticket>` | Maintainer gate: fetch branch, sandbox diff scan, audit, then offer approve/edit/discard (buttons + `ask_choice`) |

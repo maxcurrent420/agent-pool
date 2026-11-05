@@ -1,5 +1,5 @@
 name: agent-pool
-version: 2.0.0
+version: 2.1.0
 description: Agent Pool — friends form an agent team; repos propagate via Iroh, coordination only via the gateway
 manifest_version: 2
 api_version: 1
