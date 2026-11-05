@@ -203,3 +203,210 @@ def claim_ticket(conn, claim_id, ticket_id, key_id, declared_paths=None, budget=
             "INSERT INTO file_claims (ticket_id, path, key_id) VALUES (?,?,?)",
             (ticket_id, path, key_id))
     conn.commit()
+
+# --- Phase 3: ticket coordination (freeze, overlap, budgets, lifecycle) -----
+
+TICKET_STATES = ("open", "claimed", "review", "merged", "blocked")
+# Allowed transitions enforced by set_ticket_state().
+_TRANSITIONS = {
+    "open": {"claimed", "blocked"},
+    "claimed": {"review", "open", "blocked"},
+    "review": {"merged", "blocked", "review"},
+    "blocked": {"open", "review"},
+    "merged": set(),
+}
+BUDGET_FIELDS = ("max_turns", "max_tasks_per_day", "token_cap", "wall_clock_seconds")
+BUDGET_DEFAULTS = {"max_turns": 25, "max_tasks_per_day": 5, "token_cap": 50000,
+                   "wall_clock_seconds": 1800}
+
+
+class ClaimRefused(Exception):
+    """A claim violated a ledger rule (double-claim, overlap, frozen, no paths)."""
+
+
+def is_frozen(conn, pool_id) -> bool:
+    row = _pool_row(conn, pool_id)
+    settings = json.loads(row["settings_json"] or "{}")
+    return bool(settings.get("frozen"))
+
+
+def _pool_row(conn, pool_id):
+    row = conn.execute("SELECT * FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"unknown pool: {pool_id!r}")
+    return row
+
+
+def set_frozen(conn, pool_id, frozen: bool) -> bool:
+    row = _pool_row(conn, pool_id)
+    settings = json.loads(row["settings_json"] or "{}")
+    settings["frozen"] = bool(frozen)
+    conn.execute("UPDATE pools SET settings_json=? WHERE pool_id=?",
+                 (json.dumps(settings), pool_id))
+    conn.commit()
+    record_event(conn, pool_id, "pool_frozen" if frozen else "pool_unfrozen",
+                 {"frozen": bool(frozen)})
+    return bool(frozen)
+
+
+def normalize_budget(budget=None, defaults=None) -> dict:
+    """Fill every budget field from defaults; reject non-positive values."""
+    base = dict(BUDGET_DEFAULTS if defaults is None else defaults)
+    out = {}
+    for field in BUDGET_FIELDS:
+        value = (budget or {}).get(field, base.get(field))
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"budget field {field!r} must be a positive int, got {value!r}")
+        out[field] = value
+    return out
+
+
+def get_ticket(conn, ticket_id):
+    row = conn.execute("SELECT * FROM tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_ticket_or_raise(conn, ticket_id) -> dict:
+    ticket = get_ticket(conn, ticket_id)
+    if ticket is None:
+        raise ValueError(f"unknown ticket: {ticket_id!r}")
+    return ticket
+
+
+def list_tickets(conn, pool_id=None, state=None) -> list:
+    query, params = "SELECT * FROM tickets WHERE 1=1", []
+    if pool_id:
+        query += " AND pool_id=?"; params.append(pool_id)
+    if state:
+        if state not in TICKET_STATES:
+            raise ValueError(f"unknown ticket state: {state!r}")
+        query += " AND state=?"; params.append(state)
+    query += " ORDER BY created_at, ticket_id"
+    return [dict(r) for r in conn.execute(query, params)]
+
+
+def list_members(conn, pool_id) -> list:
+    _pool_row(conn, pool_id)
+    rows = conn.execute(
+        "SELECT key_id, role, box_pubkey_hex FROM members WHERE pool_id=? ORDER BY key_id",
+        (pool_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def ensure_repo(conn, repo_id, pool_id, name=None) -> None:
+    _pool_row(conn, pool_id)
+    conn.execute(
+        "INSERT OR IGNORE INTO repos (repo_id, pool_id, name, created_at) VALUES (?,?,?,?)",
+        (repo_id, pool_id, name or repo_id, _now()))
+    conn.commit()
+
+
+def set_ticket_state(conn, ticket_id, state) -> dict:
+    """Move a ticket through the lifecycle; invalid jumps raise ValueError."""
+    if state not in TICKET_STATES:
+        raise ValueError(f"unknown ticket state: {state!r}")
+    ticket = get_ticket_or_raise(conn, ticket_id)
+    if state not in _TRANSITIONS.get(ticket["state"], set()):
+        raise ValueError(
+            f"ticket {ticket_id!r}: transition {ticket['state']!r} -> {state!r} not allowed")
+    conn.execute("UPDATE tickets SET state=?, updated_at=? WHERE ticket_id=?",
+                 (state, _now(), ticket_id))
+    conn.commit()
+    record_event(conn, ticket["pool_id"], "ticket_state",
+                 {"ticket_id": ticket_id, "from": ticket["state"], "to": state})
+    return get_ticket_or_raise(conn, ticket_id)
+
+
+def _overlaps(conn, repo_id, ticket_id, paths) -> list:
+    """Declared paths of OTHER tickets on the same repo that are still live."""
+    rows = conn.execute(
+        "SELECT fc.path, fc.ticket_id FROM file_claims fc"
+        " JOIN tickets t ON t.ticket_id = fc.ticket_id"
+        " WHERE t.repo_id=? AND fc.ticket_id<>? AND t.state IN ('claimed','review','blocked')",
+        (repo_id, ticket_id)).fetchall()
+    claimed = {r[0] for r in rows}
+    return sorted(p for p in paths if p in claimed)
+
+
+def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None,
+                          budget=None, maintainer_override=False) -> dict:
+    """Ledger-enforced claim: frozen check, paths required, overlap refused,
+    one-ticket-one-worker, budget persisted. Returns the claim row."""
+    paths = [str(p).strip() for p in (declared_paths or []) if str(p).strip()]
+    if not paths:
+        raise ClaimRefused("claim refused: claimant must declare file paths")
+    ticket = get_ticket_or_raise(conn, ticket_id)
+    if ticket["state"] != "open":
+        raise ClaimRefused(
+            f"claim refused: ticket {ticket_id!r} is {ticket['state']!r}, not open "
+            "(one-ticket-one-worker)")
+    if is_frozen(conn, ticket["pool_id"]):
+        raise ClaimRefused(f"claim refused: pool {ticket['pool_id']!r} is frozen")
+    overlaps = _overlaps(conn, ticket["repo_id"], ticket_id, paths)
+    if overlaps and not maintainer_override:
+        raise ClaimRefused(
+            f"claim refused: paths overlap other tickets on repo "
+            f"{ticket['repo_id']!r}: {', '.join(overlaps)}")
+    if overlaps and maintainer_override:
+        pool = _pool_row(conn, ticket["pool_id"])
+        if pool["maintainer_key_id"] != key_id:
+            raise ClaimRefused(
+                "claim refused: only the pool maintainer may override a path overlap")
+    full_budget = normalize_budget(budget)
+    try:
+        # claim_ticket() inserts the claim + file_claims and flips the ticket.
+        claim_ticket(conn, claim_id, ticket_id, key_id,
+                     declared_paths=paths, budget=full_budget)
+    except sqlite3.IntegrityError as exc:  # double-claim race / dup paths
+        raise ClaimRefused(f"claim refused: {exc}") from exc
+    if overlaps:
+        record_event(conn, ticket["pool_id"], "claim_override",
+                     {"ticket_id": ticket_id, "key_id": key_id, "paths": overlaps})
+    else:
+        record_event(conn, ticket["pool_id"], "claimed",
+                     {"ticket_id": ticket_id, "key_id": key_id, "paths": paths})
+    row = conn.execute("SELECT * FROM claims WHERE claim_id=?", (claim_id,)).fetchone()
+    return dict(row)
+
+
+def release_ticket(conn, ticket_id, key_id) -> dict:
+    """Return a claimed ticket to open; frees the claim and file claims."""
+    ticket = get_ticket_or_raise(conn, ticket_id)
+    if ticket["state"] != "claimed":
+        raise ClaimRefused(f"release refused: ticket {ticket_id!r} is {ticket['state']!r}, not claimed")
+    if ticket["claimant_key_id"] != key_id:
+        raise ClaimRefused("release refused: only the claimant may release the ticket")
+    if is_frozen(conn, ticket["pool_id"]):
+        raise ClaimRefused(f"release refused: pool {ticket['pool_id']!r} is frozen")
+    conn.execute("UPDATE claims SET state='released' WHERE ticket_id=? AND state='active'",
+                 (ticket_id,))
+    conn.execute("DELETE FROM file_claims WHERE ticket_id=?", (ticket_id,))
+    conn.execute(
+        "UPDATE tickets SET state='open', claimant_key_id=NULL, updated_at=? WHERE ticket_id=?",
+        (_now(), ticket_id))
+    conn.commit()
+    record_event(conn, ticket["pool_id"], "released",
+                 {"ticket_id": ticket_id, "key_id": key_id})
+    return get_ticket_or_raise(conn, ticket_id)
+
+
+def get_audit(conn, repo_id, version=None) -> dict | None:
+    if version is None:
+        row = conn.execute(
+            "SELECT * FROM audits WHERE repo_id=? ORDER BY created_at DESC LIMIT 1",
+            (repo_id,)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM audits WHERE repo_id=? AND version=? ORDER BY created_at DESC LIMIT 1",
+            (repo_id, version)).fetchone()
+    return dict(row) if row else None
+
+
+def get_pending_manifest(conn, repo_id, version=None) -> dict | None:
+    query = "SELECT manifest_json FROM repo_versions WHERE repo_id=? AND state='pending'"
+    params = [repo_id]
+    if version is not None:
+        query += " AND version=?"; params.append(version)
+    query += " ORDER BY version DESC LIMIT 1"
+    row = conn.execute(query, params).fetchone()
+    return json.loads(row[0]) if row else None

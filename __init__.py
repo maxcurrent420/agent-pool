@@ -1,11 +1,15 @@
-"""Agent Pool plugin — registration (Phase 1: foundations).
+"""Agent Pool plugin — registration (Phase 3: ticket coordination).
 
-Exposes ``pool_status`` (tool) and ``/pool`` (command). Real pool operations
-(submit/fetch/claim/integrate) land in Phase 2+; this phase wires config,
-the ledger, local identity, and the gateway abstraction.
+Slash commands (in-session) wire the ledger, gateway adapter, and Phase 2
+propagator: ``/pool register|invite|members|freeze``, ``/task add|list|show``,
+``/claim``, ``/release``, ``/work submit``, ``/integrate``, ``/audit show``.
+``/work submit`` and ``/integrate`` call the real Phase 2 flow; ticket state is
+represented in the gateway via ``set_ticket_state`` (core has no applied_tags).
 """
 import json
 import logging
+import shlex
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +29,7 @@ def _pool_status(args=None, **kwargs):
         budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
             ("max_turns", 25), ("max_tasks_per_day", 5),
             ("token_cap", 50000), ("wall_clock_seconds", 1800))}
-        status = {"ok": True, "plugin": "agent-pool", "phase": 1,
+        status = {"ok": True, "plugin": "agent-pool", "phase": 3,
                   "relay_url": relay_url, "budgets": budgets,
                   "ledger": "ready", "identity": "ready"}
         return json.dumps(status)
@@ -33,8 +37,243 @@ def _pool_status(args=None, **kwargs):
         return json.dumps({"ok": False, "error": str(exc)})
 
 
-def _handle_pool(ctx, raw_args: str):
-    return _pool_status(ctx=ctx)
+# ---------------------------------------------------------------------------
+# Service construction (lazy: no DB/identity work at register() time)
+# ---------------------------------------------------------------------------
+
+def _service_for(ctx):
+    """Build a PoolService from the plugin context. Raises with a clear msg."""
+    try:
+        from . import ledger as L
+        from .gateway import (DiscordGatewayAdapter, FakeGatewayAdapter,
+                              discord_gateway_send_factory)
+        from .identity import ensure_identity
+        from .tickets import PoolService
+        from .transport import FakeTransport, RealSendHermesTransport
+    except ImportError:  # flat import (tests / standalone)
+        import ledger as L
+        from gateway import (DiscordGatewayAdapter, FakeGatewayAdapter,
+                             discord_gateway_send_factory)
+        from identity import ensure_identity
+        from tickets import PoolService
+        from transport import FakeTransport, RealSendHermesTransport
+    conn = L.get_db()
+    data_dir = Path.home() / ".hermes" / "plugin-data" / "agent-pool"
+    try:
+        from . import ledger as _L
+        _ = _L.default_db_path().parent
+        data_dir = _L.default_db_path().parent
+    except Exception:
+        pass
+    identity = ensure_identity(data_dir)
+    # Gateway: the host may inject a live adapter through ctx.state; otherwise
+    # fall back to the in-memory adapter (offline/CLI) and say so in events.
+    gateway = None
+    try:
+        gateway = ctx.state.get("gateway_adapter") if ctx is not None else None
+    except Exception:
+        gateway = None
+    if gateway is None:
+        channel_id = _cfg(ctx, "gateway_channel_id", "") if ctx else ""
+        discord_adapter = None
+        try:
+            discord_adapter = getattr(ctx, "discord_adapter", None)
+        except Exception:
+            discord_adapter = None
+        if channel_id and discord_adapter is not None:
+            gateway = DiscordGatewayAdapter(
+                discord_gateway_send_factory(discord_adapter, channel_id))
+        else:
+            gateway = FakeGatewayAdapter()
+    transport_name = _cfg(ctx, "transport", "real") if ctx else "real"
+    transport = FakeTransport() if transport_name == "fake" else RealSendHermesTransport()
+    budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
+        ("max_turns", 25), ("max_tasks_per_day", 5),
+        ("token_cap", 50000), ("wall_clock_seconds", 1800))}
+    return PoolService(conn, gateway, transport, caller_key_id=identity.key_id,
+                       caller_signing_key=identity.signing_key,
+                       caller_box_sk=identity.box_sk, budget_defaults=budgets)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing: "sub rest --key value --flag"
+# ---------------------------------------------------------------------------
+
+def _parse_args(raw: str):
+    try:
+        tokens = shlex.split(raw or "")
+    except ValueError as exc:
+        raise ValueError(f"bad arguments: {exc}")
+    positionals, options, flags = [], {}, set()
+    it = iter(range(len(tokens)))
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith("--"):
+            key = tok[2:].replace("-", "_")
+            if "=" in key:
+                k, v = key.split("=", 1)
+                options[k] = v
+            elif i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                options[key] = tokens[i + 1]
+                i += 1
+            else:
+                flags.add(key)
+        else:
+            positionals.append(tok)
+        i += 1
+    return positionals, options, flags
+
+
+def _budget_from_opts(options):
+    budget = {}
+    for opt, field in (("max_turns", "max_turns"), ("max_tasks_per_day", "max_tasks_per_day"),
+                       ("token_cap", "token_cap"), ("wall_clock_seconds", "wall_clock_seconds")):
+        if opt in options:
+            budget[field] = int(options[opt])
+    return budget or None
+
+
+def _result(payload) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _error(exc) -> str:
+    return _result({"ok": False, "error": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Command handlers (each takes ctx via closure from register())
+# ---------------------------------------------------------------------------
+
+def _handle_pool(ctx, raw: str) -> str:
+    try:
+        svc = _service_for(ctx)
+        pos, opts, flags = _parse_args(raw)
+        if not pos:
+            return _pool_status(ctx=ctx)
+        sub, rest = pos[0], pos[1:]
+        if sub == "register":
+            pool_id = rest[0] if rest else opts.get("pool_id", "")
+            out = svc.register_pool(pool_id, opts.get("name", pool_id),
+                                    relay_url=opts.get("relay_url", ""))
+        elif sub == "invite":
+            pool_id = rest[0] if rest else opts.get("pool_id", "")
+            key_id = rest[1] if len(rest) > 1 else opts.get("key_id", "")
+            out = svc.invite(pool_id, key_id, role=opts.get("role", "member"),
+                             box_pubkey_hex=opts.get("box_pubkey", ""))
+        elif sub == "members":
+            pool_id = rest[0] if rest else opts.get("pool_id", "")
+            out = {"ok": True, "pool_id": pool_id, "members": svc.members(pool_id)}
+        elif sub == "freeze":
+            pool_id = rest[0] if rest else opts.get("pool_id", "")
+            out = svc.freeze(pool_id, frozen="unfreeze" not in flags)
+        else:
+            return _result({"ok": False,
+                            "error": f"unknown /pool subcommand: {sub}",
+                            "usage": "/pool register|invite|members|freeze"})
+        return _result(out)
+    except Exception as exc:
+        return _error(exc)
+
+
+def _handle_task(ctx, raw: str) -> str:
+    try:
+        svc = _service_for(ctx)
+        pos, opts, flags = _parse_args(raw)
+        if not pos:
+            return _result({"ok": False, "error": "usage: /task add|list|show"})
+        sub, rest = pos[0], pos[1:]
+        if sub == "add":
+            ticket = svc.add_ticket(opts.get("pool_id", ""), opts.get("repo", ""),
+                                    opts.get("title", ""), brief=opts.get("brief", ""),
+                                    budget=_budget_from_opts(opts))
+            out = {"ok": True, "ticket_id": ticket["ticket_id"],
+                   "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
+        elif sub == "list":
+            rows = svc.list_tickets(pool_id=opts.get("pool_id") or None,
+                                    state=opts.get("state") or None)
+            out = {"ok": True, "tickets": [
+                {"ticket_id": t["ticket_id"], "title": t["title"], "state": t["state"],
+                 "repo_id": t["repo_id"], "claimant": t.get("claimant_key_id"),
+                 "thread_ref": t.get("thread_ref")} for t in rows]}
+        elif sub == "show":
+            ticket_id = rest[0] if rest else opts.get("ticket", "")
+            t = svc.show_ticket(ticket_id)
+            out = {"ok": True, "ticket": {
+                "ticket_id": t["ticket_id"], "title": t["title"], "state": t["state"],
+                "repo_id": t["repo_id"], "pool_id": t["pool_id"],
+                "brief": t["brief"], "claimant": t.get("claimant_key_id"),
+                "budget": json.loads(t["budget_json"] or "{}"),
+                "thread_ref": t.get("thread_ref")}}
+        else:
+            return _result({"ok": False, "error": f"unknown /task subcommand: {sub}",
+                            "usage": "/task add|list|show"})
+        return _result(out)
+    except Exception as exc:
+        return _error(exc)
+
+
+def _handle_claim(ctx, raw: str) -> str:
+    try:
+        svc = _service_for(ctx)
+        pos, opts, flags = _parse_args(raw)
+        ticket_id = pos[0] if pos else opts.get("ticket", "")
+        paths = [p.strip() for p in opts.get("paths", "").split(",") if p.strip()]
+        claim = svc.claim(ticket_id, key_id=opts.get("as") or None,
+                          declared_paths=paths, budget=_budget_from_opts(opts),
+                          maintainer_override="override" in flags)
+        return _result({"ok": True, "claim": claim})
+    except Exception as exc:
+        return _error(exc)
+
+
+def _handle_release(ctx, raw: str) -> str:
+    try:
+        svc = _service_for(ctx)
+        pos, opts, _flags = _parse_args(raw)
+        ticket_id = pos[0] if pos else opts.get("ticket", "")
+        updated = svc.release(ticket_id, key_id=opts.get("as") or None)
+        return _result({"ok": True, "ticket_id": ticket_id, "state": updated["state"]})
+    except Exception as exc:
+        return _error(exc)
+
+
+def _handle_work(ctx, raw: str) -> str:
+    try:
+        svc = _service_for(ctx)
+        pos, opts, _flags = _parse_args(raw)
+        if not pos or pos[0] != "submit":
+            return _result({"ok": False, "error": "usage: /work submit <ticket> "
+                            "--repo-path PATH --version N"})
+        ticket_id = pos[1] if len(pos) > 1 else opts.get("ticket", "")
+        out = svc.work_submit(ticket_id, opts.get("repo_path", ""),
+                              opts.get("version", "1"))
+        return _result(out)
+    except Exception as exc:
+        return _error(exc)
+
+
+def _handle_integrate(ctx, raw: str) -> str:
+    try:
+        svc = _service_for(ctx)
+        pos, opts, _flags = _parse_args(raw)
+        ticket_id = pos[0] if pos else opts.get("ticket", "")
+        return _result(svc.integrate(ticket_id, key_id=opts.get("as") or None))
+    except Exception as exc:
+        return _error(exc)
+
+
+def _handle_audit(ctx, raw: str) -> str:
+    try:
+        svc = _service_for(ctx)
+        pos, opts, _flags = _parse_args(raw)
+        if not pos or pos[0] != "show":
+            return _result({"ok": False, "error": "usage: /audit show <ticket>"})
+        ticket_id = pos[1] if len(pos) > 1 else opts.get("ticket", "")
+        return _result(svc.audit_show(ticket_id=ticket_id))
+    except Exception as exc:
+        return _error(exc)
 
 
 _POOL_STATUS_SCHEMA = {
@@ -44,23 +283,29 @@ _POOL_STATUS_SCHEMA = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+_COMMANDS = (
+    ("pool", _handle_pool, "Agent Pool: register|invite|members|freeze, status"),
+    ("task", _handle_task, "Agent Pool tickets: add|list|show"),
+    ("claim", _handle_claim, "Claim a ticket (declares file paths + budget)"),
+    ("release", _handle_release, "Release a claimed ticket back to open"),
+    ("work", _handle_work, "Submit finished work for a claimed ticket"),
+    ("integrate", _handle_integrate, "Maintainer: audit a submitted ticket"),
+    ("audit", _handle_audit, "Show the audit report for a ticket"),
+)
+
 
 def register(ctx):
-    """Wire the Phase 1 surface. Fail-soft: Hermes disables on exception, so
-    optional pieces are probed rather than assumed."""
-    # Ledger + identity are created lazily by their modules (plugin_db /
-    # plugin_data_dir); register() only needs config + surface wiring here.
+    """Wire the full Phase 3 surface. Fail-soft: Hermes disables on exception,
+    so optional pieces are probed rather than assumed."""
     try:
         ctx.register_tool(name="pool_status", toolset="agent_pool",
                           schema=_POOL_STATUS_SCHEMA,
                           handler=lambda args=None, **kw: _pool_status(args, ctx=ctx, **kw))
     except Exception as exc:
         logger.warning("agent-pool: tool registration failed: %s", exc)
-    try:
-        ctx.register_command(
-            "pool",
-            lambda raw="": _handle_pool(ctx, raw),
-            description="Agent Pool status (Phase 1 foundations)",
-        )
-    except Exception as exc:
-        logger.warning("agent-pool: command registration failed: %s", exc)
+    for name, handler, description in _COMMANDS:
+        try:
+            ctx.register_command(name, lambda raw="", _h=handler: _h(ctx, raw),
+                                 description=description)
+        except Exception as exc:
+            logger.warning("agent-pool: command %s registration failed: %s", name, exc)

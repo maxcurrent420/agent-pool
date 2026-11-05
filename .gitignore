@@ -8,3 +8,4 @@ iroh*/
 data/
 state/
 *.db
+.hermes/

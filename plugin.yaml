@@ -1,5 +1,5 @@
 name: agent-pool
-version: 0.1.0
+version: 0.2.0
 description: Agent Pool — friends form an agent team; repos propagate via Iroh, coordination only via the gateway
 manifest_version: 2
 api_version: 1
@@ -35,3 +35,11 @@ config_schema:
     type: dict
     default: {}
     description: "Per-pool settings keyed by pool_id (budgets, relay overrides)"
+  gateway_channel_id:
+    type: str
+    default: ""
+    description: "Discord channel id for the gateway adapter (empty = in-memory offline adapter)"
+  transport:
+    type: str
+    default: "real"
+    description: "Bundle transport: real (send_hermes/Iroh) or fake (in-memory, tests/CLI)"
