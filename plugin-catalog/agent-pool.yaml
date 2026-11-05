@@ -6,7 +6,7 @@
 # in the hermes-agent PR whenever the plugin advances.
 name: agent-pool
 repo: https://github.com/maxcurrent420/agent-pool
-sha: c7fa200c98d3ff7b3484821d8e7fb4500ef3ec79
+sha: 241e58f372eb335bf5997a6df318b77a05f16840
 description: >-
   Agent Pool — friends form an agent team: repos propagate via Iroh (QUIC,
   BLAKE3-verified bearer tickets via send_hermes), coordination only via
@@ -17,7 +17,9 @@ description: >-
   member, sandbox audit gate, global freeze kill-switch, per-profile
   pool isolation (pool_not_local refusal for foreign pools).
   Disclosure — spawns git/bubblewrap/send_hermes child processes; network
-  calls go to Iroh peers/relay (HERMES_IROH_RELAY=off for direct/LAN);
+  calls go to Iroh peers/relay (relay-only on both ends: the peer never
+  learns your IP; the relay sees both peers' IPs + metadata, never
+  plaintext; HERMES_IROH_RELAY=off is a no-op — there is no direct mode);
   reads profile plugin-data dir for ledger, identities, worktrees; stores
   ed25519/box keys under the plugin data dir; no telemetry, no stored
   credentials beyond its own keypairs.
@@ -25,7 +27,7 @@ maintainer: maxcurrent420
 tier: community
 category: tools
 requires_hermes: ">=0.22.0"
-version: "2.2.0"
+version: "2.3.0"
 readme: true
 platforms: []
 capabilities:
