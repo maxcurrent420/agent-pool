@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Agent Pool demo: full loop end-to-end (see scripts/demo.py).
-#   ./scripts/demo.sh          # hermetic (fake transport + fake gateway)
+#   ./scripts/demo.sh          # hermetic (fake transport, no gateway needed)
 #   ./scripts/demo.sh --real   # real send_hermes/Iroh transport
 set -euo pipefail
 cd "$(dirname "$0")/.."

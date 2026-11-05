@@ -242,8 +242,9 @@ def test_08_conflict_bounce(world):
 # 09 -----------------------------------------------------------------------
 def test_09_gateway_abstraction_full_loop_fake(world):
     """The ENTIRE flow (register->ticket->claim->submit->gate->approve->audit)
-    passes through FakeGatewayAdapter: every gateway action is exercised and
-    no coordination payload exceeds the 4KB guard (no repo bytes on gateway)."""
+    runs end-to-end (formerly exercised through the deleted FakeGatewayAdapter;
+    now asserted via returned result dicts) and no coordination payload
+    exceeds the 4KB guard (no repo bytes on gateway)."""
     ticket = world.make_ticket("Full loop")
     tid = ticket["ticket_id"]
     world.submit_contrib(tid)

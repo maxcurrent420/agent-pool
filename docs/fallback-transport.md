@@ -7,7 +7,11 @@ throughput; the sender must stay alive during transfer; repos well above
 ~1 GB are out of scope for v1.
 
 If the Iroh spike had failed (or on a network where QUIC/UDP is blocked),
-the plan's fallbacks were, in order:
+the plan's fallbacks were, in order. Migration note: the gateway-native
+rewrite changed only who posts to Discord (Hermes now posts; the plugin
+returns content) — it did not change the transport below. The measured
+throughput figures here (~2 MB/s relay path, ~97 MB/s direct/LAN) and the
+decision rule remain accurate.
 
 ## 1. Radicle self-hosted seed
 

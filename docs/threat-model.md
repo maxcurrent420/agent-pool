@@ -30,8 +30,10 @@ Stated honestly. Anything not listed here as a guarantee is not one.
    clock) with process-group kill on exhaustion.
 6. **Coordination payloads are small and signed.** Only manifests, notices,
    and ticket metadata (< 4 KB) travel the gateway. Repo bytes never touch
-   Discord. The plugin never imports `discord` and never opens its own
-   client — it goes through the Hermes gateway adapter.
+   Discord. The plugin never imports `discord` outside the button factory
+   (`buttons.py`, lazily, inside the factory) and never opens its own
+   client — Hermes's gateway bot does all posting and all button routing;
+   the plugin only returns strings for Hermes to post.
 7. **Kill-switch.** `/pool freeze` (global) blocks all pool-mutating and
    claim/work/integrate actions across every pool in the process,
    persisted in the ledger so it survives restarts.
@@ -65,10 +67,21 @@ Stated honestly. Anything not listed here as a guarantee is not one.
 - **Maintainer key compromise = pool compromise.** Acceptance is a
   signature over the manifest; whoever holds the maintainer signing key
   can accept anything. Protect it like a root key.
-- **Discord button clicks do not reach the plugin in Hermes v0.22.7**
-  (see README). The approve/edit/discard decision is made through
-  `/integrate approve|edit|discard`, authenticated by the session's
-  identity. When the host normalizes interactions, the bridge re-verifies
-  maintainer identity before dispatching.
+- **Discord user id ≠ agent identity (new residual risk from the button
+  gate).** The `identities.discord_user_id` binding is operator-recorded
+  at `/pool invite --discord-user <id>`; it is the only link between a
+  Discord account and a pool `key_id`. Unmapped clickers are refused, but
+  a **mis-bound mapping lets the wrong Discord account authorize an
+  integration**. Mitigations: record the binding only on the
+  maintainer's own gateway, double-check the id before inviting, and note
+  the second layer — `resolve_integration` re-checks maintainer identity
+  against the ledger (`tickets.py`), so a mis-binding still needs the
+  ledger row to agree.
+- **No plugin-side Discord client.** There is no second credential
+  surface: the gateway bot's allowlist
+  (`H/plugins/platforms/discord/adapter.py:4159-4167`) is the only
+  ingress gate, and slash authorization is evaluated there, not by
+  per-command Discord permissions. The plugin's platform handler receives
+  the gateway's own bot (`buttons.py` factory) and touches nothing else.
 - **No encryption-at-rest beyond the per-version DEK.** The local ledger
   and worktrees on a member's machine are plaintext. Protect the machine.

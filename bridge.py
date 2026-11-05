@@ -1,63 +1,28 @@
 """Button-click -> ``resolve_integration`` bridge (Phase 6).
 
-What this is, honestly: the plugin posts approve/edit/discard buttons via
-``GatewayAdapter.post_buttons`` (Discord renders them through the Hermes
-gateway). For a click to *reach* the plugin, the host gateway must deliver
-the interaction to the plugin as a ``gateway_platform_event`` hook call.
+Gateway-native (spec §4): the plugin does NOT post buttons itself. The
+Hermes Discord gateway bot owns the message. The approve/edit/discard gate
+is delivered by two paths that both land on the Hermes bot:
 
-Verified against the Hermes source in this checkout (Hermes Agent v0.22.7,
-``gateway/run_adapters.py::_handle_gateway_platform_event`` and
-``website/docs/user-guide/features/hooks.md#gateway_platform_event``):
-the ``gateway_platform_event`` hook fires ONLY for the normalized per-event
-contracts — ``reaction`` (telegram), ``message_edited``, ``message_deleted``,
-``thread_created``, ``thread_renamed``. **Discord button interactions
-(component clicks / ``custom_id`` payloads) are NOT part of the normalized
-contract in this Hermes version** — the raw-SDK capability
-(``gateway.raw_events``, tracked upstream as #64228) does not exist yet.
-So no plugin-side code can receive a real Discord button click from the
-host today; claiming otherwise would be a lie.
+(a) ``buttons.py`` registers ``ctx.register_platform_handler("discord", factory)``
+    — the gateway's own discord.py bot gets a listener + ``discord.ui.View``
+    with ``custom_id = agent-pool:{decision}:{ticket_id}``. Button clicks are
+    ``Component`` interactions routed by Hermes's bot to this listener.
+(b) ``ctx.ask_choice`` inside ``/integrate`` — Hermes renders clarify
+    buttons in the invoking chat and routes the tap back.
 
-What IS built here (the narrowest correct seam):
+This module is the shared parsing/dispatch core both paths use:
+``parse_button_event`` (custom_id / value / text shapes, ``agent-pool:``
+prefix optional) and ``dispatch_button_event`` (clicker → ``key_id`` via the
+ledger ``identities.discord_user_id`` binding recorded at ``/pool invite
+--discord-user <id>``, maintainer check, dispatch to
+``PoolService.resolve_integration``). Unmapped or non-maintainer clickers
+are refused, never dispatched.
 
-1. :func:`parse_button_event` — a strict parser for the button *value*
-   strings the plugin itself posts (``approve:<ticket_id>`` etc.). It
-   accepts the shapes a host could plausibly deliver: a component-style
-   payload (``custom_id``/``value`` + ``user_id``/``author_id``), a
-   message-text payload (``text`` containing the button value), or a bare
-   value string. Anything else returns ``None`` (ignored, fail closed).
-
-2. :func:`dispatch_button_event` — matches the parsed decision to its
-   ticket, resolves the clicking author to a pool ``key_id`` through a
-   host-supplied identity map (``{platform_user_id: key_id}`` — the plugin
-   has no way to know Discord user ids), checks the clicker IS the pool
-   maintainer, and dispatches to ``PoolService.resolve_integration``.
-   Unresolvable or non-maintainer clickers are refused — never dispatched.
-
-3. :func:`make_platform_event_handler` — the ``gateway_platform_event``
-   hook handler registered by ``register()``. It runs the parser over
-   every hook payload (today: only the normalized events above, which
-   parse to ``None`` and are ignored — zero behaviour change) and, if a
-   future Hermes version normalizes button interactions into this hook,
-   the bridge lights up with no plugin change. It never raises (hook
-   contract: observer failures must not break the gateway).
-
-HOST CONTRACT (what the host must do — in this Hermes version, a human or
-the operator drives the decision through the plugin's own slash command):
-
-    /integrate approve <ticket_id>
-    /integrate edit <ticket_id> --edit-file PATH --edit-content TEXT
-    /integrate discard <ticket_id> --reason "..."
-
-which calls exactly ``PoolService.resolve_integration`` with the same
-maintainer check. The buttons in Discord are a visual prompt; the command
-is the actionable control until a raw-interaction seam ships. If/when the
-host can deliver interactions, it must call::
-
-    dispatch_button_event(service, platform, event_type, payload,
-                          identity_map={discord_user_id: agent_pool_key_id})
-
-with the clicking user's Discord id, and the maintainer check + dispatch
-above is the single code path.
+The ``gateway_platform_event`` hook (registered for compatibility) only
+carries normalized events in Hermes v0.22.7 — Discord button interactions
+are NOT delivered to it — so it parses to ``None`` and is behaviour-neutral
+today. Details: ``buttons.py`` factory + spec §4.
 """
 from __future__ import annotations
 
