@@ -103,6 +103,10 @@ CREATE TABLE IF NOT EXISTS events (
     payload_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 TABLES = ("pools", "members", "identities", "repos", "repo_versions",
@@ -249,6 +253,48 @@ def set_frozen(conn, pool_id, frozen: bool) -> bool:
     return bool(frozen)
 
 
+# --- Global kill-switch (Phase 6) -------------------------------------------
+# Stored in the meta table so it spans every pool in the process (and survives
+# restarts — it is ledger state, not process state). While set, every
+# pool-mutating and claim/work/integrate action is refused; only the freeze
+# command itself (to unfreeze) is allowed through. Per-pool freeze remains
+# available for a single pool.
+
+_GLOBAL_FROZEN_KEY = "global_frozen"
+
+
+def is_global_frozen(conn) -> bool:
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?",
+                           (_GLOBAL_FROZEN_KEY,)).fetchone()
+    except Exception:  # pre-Phase-6 ledger without the meta table
+        return False
+    return bool(row and row[0] == "1")
+
+
+def set_global_frozen(conn, frozen: bool) -> bool:
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)",
+                 (_GLOBAL_FROZEN_KEY, "1" if frozen else "0"))
+    conn.commit()
+    record_event(conn, None, "global_frozen" if frozen else "global_unfrozen",
+                 {"frozen": bool(frozen)})
+    return bool(frozen)
+
+
+def is_frozen_any(conn, pool_id) -> bool:
+    """True if the pool is frozen per-pool OR the global kill-switch is set."""
+    return is_global_frozen(conn) or is_frozen(conn, pool_id)
+
+
+def check_not_frozen(conn, pool_id) -> None:
+    """Raise ClaimRefused if any freeze (global or per-pool) blocks *pool_id*."""
+    if is_global_frozen(conn):
+        raise ClaimRefused("global kill-switch is set: all pools frozen "
+                           "(unfreeze with /pool freeze --unfreeze)")
+    if is_frozen(conn, pool_id):
+        raise ClaimRefused(f"pool {pool_id!r} is frozen")
+
+
 def normalize_budget(budget=None, defaults=None) -> dict:
     """Fill every budget field from defaults; reject non-positive values."""
     base = dict(BUDGET_DEFAULTS if defaults is None else defaults)
@@ -340,6 +386,8 @@ def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None
         raise ClaimRefused(
             f"claim refused: ticket {ticket_id!r} is {ticket['state']!r}, not open "
             "(one-ticket-one-worker)")
+    if is_global_frozen(conn):
+        raise ClaimRefused("claim refused: global kill-switch is set")
     if is_frozen(conn, ticket["pool_id"]):
         raise ClaimRefused(f"claim refused: pool {ticket['pool_id']!r} is frozen")
     overlaps = _overlaps(conn, ticket["repo_id"], ticket_id, paths)
@@ -376,6 +424,8 @@ def release_ticket(conn, ticket_id, key_id) -> dict:
         raise ClaimRefused(f"release refused: ticket {ticket_id!r} is {ticket['state']!r}, not claimed")
     if ticket["claimant_key_id"] != key_id:
         raise ClaimRefused("release refused: only the claimant may release the ticket")
+    if is_global_frozen(conn):
+        raise ClaimRefused("release refused: global kill-switch is set")
     if is_frozen(conn, ticket["pool_id"]):
         raise ClaimRefused(f"release refused: pool {ticket['pool_id']!r} is frozen")
     conn.execute("UPDATE claims SET state='released' WHERE ticket_id=? AND state='active'",

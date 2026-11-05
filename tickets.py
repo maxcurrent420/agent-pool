@@ -71,6 +71,8 @@ class PoolService:
     # -- pool membership ----------------------------------------------------
 
     def register_pool(self, pool_id, name, relay_url="", key_id=None) -> dict:
+        if L.is_global_frozen(self._conn):
+            raise L.ClaimRefused("global kill-switch is set: pool registration blocked")
         maintainer = key_id or self._caller_key_id
         if not maintainer:
             raise ValueError("register needs a maintainer key_id")
@@ -81,6 +83,7 @@ class PoolService:
         return {"ok": True, "pool_id": pool_id, "name": name, "maintainer": maintainer}
 
     def invite(self, pool_id, key_id, role="member", box_pubkey_hex="") -> dict:
+        self._check_not_frozen(pool_id)
         if role not in ("member", "maintainer"):
             raise ValueError(f"role must be member|maintainer, got {role!r}")
         L.add_member(self._conn, pool_id, key_id, role=role, box_pubkey_hex=box_pubkey_hex)
@@ -104,6 +107,7 @@ class PoolService:
         version). Already-fetched versions are inherently unfetchable
         retroactively — the limitation is stated in the thread notice.
         """
+        self._check_not_frozen(pool_id)
         actor = actor_key_id or self._caller_key_id
         pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
                                   (pool_id,)).fetchone()
@@ -122,13 +126,39 @@ class PoolService:
     def is_frozen(self, pool_id) -> bool:
         return L.is_frozen(self._conn, pool_id)
 
+    def is_global_frozen(self) -> bool:
+        return L.is_global_frozen(self._conn)
+
+    def _check_not_frozen(self, pool_id) -> None:
+        """Global kill-switch first, then per-pool freeze (Phase 6)."""
+        L.check_not_frozen(self._conn, pool_id)
+
+    def freeze_global(self, frozen: bool) -> dict:
+        """GLOBAL kill-switch: freeze/unfreeze EVERY pool in the process.
+
+        Sets the ledger ``meta`` flag (persists across restarts) and mirrors
+        it into each pool's per-pool flag so ``is_frozen`` stays truthful.
+        While set, all pool-mutating and claim/work/integrate actions raise
+        (see ``_check_not_frozen``); only this command (to unfreeze) and
+        read-only queries are allowed. Notice posted to every pool channel.
+        """
+        L.set_global_frozen(self._conn, frozen)
+        pools = [r[0] for r in self._conn.execute("SELECT pool_id FROM pools")]
+        for pool_id in pools:
+            L.set_frozen(self._conn, pool_id, frozen)
+            self._gateway.post_notice(
+                pool_id,
+                f"pool {pool_id} {'frozen' if frozen else 'unfrozen'} "
+                f"(global kill-switch {'set' if frozen else 'cleared'})",
+                kind="freeze")
+        return {"ok": True, "global_frozen": bool(frozen), "pools": pools}
+
     # -- tickets --------------------------------------------------------------
 
     def add_ticket(self, pool_id, repo_id, title, brief="", budget=None) -> dict:
         if not title.strip():
             raise ValueError("ticket title is required")
-        if L.is_frozen(self._conn, pool_id):
-            raise L.ClaimRefused(f"pool {pool_id!r} is frozen")
+        self._check_not_frozen(pool_id)
         L.ensure_repo(self._conn, repo_id, pool_id)
         full_budget = L.normalize_budget(budget, self._budget_defaults)
         ticket_id = f"t-{secrets.token_hex(4)}"
@@ -234,6 +264,7 @@ class PoolService:
         is used (CLI / exit-demo path).
         """
         ticket = self.show_ticket(ticket_id)
+        self._check_not_frozen(ticket["pool_id"])
         if ticket["state"] != "claimed":
             raise ValueError(f"start work needs a claimed ticket, got {ticket['state']!r}")
         if ticket["claimant_key_id"] != self._caller_key_id:
@@ -294,6 +325,7 @@ class PoolService:
         if record is None:
             raise ValueError(f"no running worker for ticket {ticket_id!r}")
         ticket = self.show_ticket(ticket_id)
+        self._check_not_frozen(ticket["pool_id"])
         runner, handle, tracker = record["runner"], record["handle"], record["tracker"]
         try:
             status = run_worker_loop(runner, handle, tracker,
@@ -375,6 +407,7 @@ class PoolService:
 
     def work_submit(self, ticket_id, repo_path, version, key_id=None) -> dict:
         ticket = self.show_ticket(ticket_id)
+        self._check_not_frozen(ticket["pool_id"])
         key = key_id or self._caller_key_id
         if ticket["state"] != "claimed":
             raise ValueError(f"work submit needs a claimed ticket, got {ticket['state']!r}")
@@ -428,6 +461,7 @@ class PoolService:
            the ticket goes to ``blocked`` and canonical is never touched.
         """
         ticket = self.show_ticket(ticket_id)
+        self._check_not_frozen(ticket["pool_id"])
         key = key_id or self._caller_key_id
         pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
                                   (ticket["pool_id"],)).fetchone()
@@ -597,6 +631,7 @@ class PoolService:
         ticket bounced to ``blocked`` with ``rebase needed`` + both refs.
         """
         ticket = self.show_ticket(ticket_id)
+        self._check_not_frozen(ticket["pool_id"])
         key = key_id or self._caller_key_id
         pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
                                   (ticket["pool_id"],)).fetchone()

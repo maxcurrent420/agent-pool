@@ -31,6 +31,50 @@ _HASH_RE = re.compile(r"hash ([0-9a-f]{16,})")
 _EXPORT_RE = re.compile(r"exporting to (.+)", re.IGNORECASE)
 
 
+class TransportUnavailable(Exception):
+    """Structured failure after bounded fetch retries (sender offline, etc.).
+
+    Carries ``attempts`` (how many tries were made) and ``last_error`` so
+    callers surface a machine-readable failure instead of a raw traceback.
+    """
+
+    def __init__(self, ticket: str, attempts: int, last_error: Exception):
+        self.ticket = ticket
+        self.attempts = attempts
+        self.last_error = last_error
+        super().__init__(
+            f"transport unavailable for ticket {ticket!r} after {attempts} "
+            f"attempt(s); last error: {last_error}")
+
+
+def fetch_with_retry(transport, ticket: str, dest: Path, *,
+                     max_attempts: int = 3, base_delay: float = 0.5,
+                     max_delay: float = 8.0, sleep=time.sleep) -> Path:
+    """Fetch *ticket* with bounded exponential backoff.
+
+    The real sender (``send_hermes`` provider) must stay alive during a
+    transfer; if it drops mid-fetch the first attempt fails and a retry
+    after a short backoff is the correct behaviour (the sender may have
+    been briefly unreachable). After ``max_attempts`` failures a
+    :class:`TransportUnavailable` is raised — never an unbounded loop.
+    Delays double from ``base_delay`` and are capped at ``max_delay``.
+    ``sleep`` is injectable so tests run with zero real delay.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    last_error: Exception | None = None
+    delay = base_delay
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return transport.fetch(ticket, dest)
+        except Exception as exc:  # sender offline / transient network error
+            last_error = exc
+            if attempt < max_attempts:
+                sleep(min(delay, max_delay))
+                delay *= 2
+    raise TransportUnavailable(ticket, max_attempts, last_error)
+
+
 def _relay_flag() -> list[str]:
     relay = os.environ.get("HERMES_IROH_RELAY", "").strip()
     if relay in ("", "default", "n0"):

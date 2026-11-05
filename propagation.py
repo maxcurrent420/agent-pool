@@ -44,14 +44,14 @@ try:  # package import (Hermes loads plugins as a package)
                          wrap_dek, unwrap_dek)
     from .gateway import GatewayAdapter
     from .ledger import append_manifest, record_event
-    from .transport import TransportBackend
+    from .transport import TransportBackend, fetch_with_retry
 except ImportError:  # flat import (pytest from repo root)
     from crypto import (blake3_hash, build_manifest, manifest_hash,
                         sign_manifest, verify_chain, verify_manifest,
                         wrap_dek, unwrap_dek)
     from gateway import GatewayAdapter
     from ledger import append_manifest, record_event
-    from transport import TransportBackend
+    from transport import TransportBackend, fetch_with_retry
 
 # --------------------------------------------------------------------------
 # Static audit (network-off sandbox).
@@ -324,7 +324,7 @@ class RepoPropagator:
                 f"audit refused: maintainer has no wrapped DEK for {manifest.get('repo_id')}")
         dek = unwrap_dek(maintainer.box_sk, bytes.fromhex(wrapped_hex))
         with tempfile.TemporaryDirectory(prefix="agentpool-fetch-") as tmp:
-            materialised = self._transport.fetch(ticket, Path(tmp))
+            materialised = fetch_with_retry(self._transport, ticket, Path(tmp))
             ciphertext = Path(materialised).read_bytes()
         plaintext = decrypt_bundle(ciphertext, dek)
         if blake3_hash(plaintext) != manifest["content_hash"]:
@@ -362,20 +362,47 @@ class RepoPropagator:
 
     def accept(self, *, manifest: dict, report_hash: str, maintainer: Member,
                maintainer_signing_key) -> dict:
-        """Maintainer signs acceptance; appends the ACCEPTED manifest to the chain."""
+        """Maintainer signs acceptance; appends the ACCEPTED manifest to the chain.
+
+        DEK ROTATION (Phase 6): the accepted version never reuses the pending
+        submission's DEK. The plaintext bundle is re-encrypted under a fresh
+        random DEK, re-sent over the transport, and the new DEK is wrapped
+        per CURRENT pool member (``self._members`` — a member removed before
+        acceptance gets no entry). The accepted manifest therefore carries a
+        new ``transfer_ticket`` and new ``wrapped_keys``; ``content_hash``
+        (of the plaintext bundle) is unchanged. A member removed before
+        acceptance cannot unwrap the accepted version even if they could
+        unwrap the pending one (forward separation).
+        """
         if maintainer.key_id != self._maintainer_key_id:
             raise PermissionError("acceptance is maintainer-only")
         pending_vk = _verify_key(self._members[manifest["submitter_key_id"]])
         if not verify_manifest(pending_vk, manifest):
             raise RuntimeError("pending manifest signature does not verify")
+        # Re-encrypt under a fresh DEK: fetch + decrypt the pending bundle.
+        plaintext, _old_dek = self._decrypt_for_maintainer(manifest, maintainer)
+        if blake3_hash(plaintext) != manifest["content_hash"]:
+            raise RuntimeError("BLAKE3 mismatch on acceptance re-encryption")
+        new_dek = secrets.token_bytes(32)
+        ciphertext = encrypt_bundle(plaintext, new_dek)
+        wrapped_keys: dict[str, str] = {}
+        for member_id, member in self._members.items():
+            if not member.box_pubkey_hex:
+                continue
+            pk = PublicKey(bytes.fromhex(member.box_pubkey_hex), encoder=RawEncoder)
+            wrapped_keys[member_id] = wrap_dek(pk, new_dek).hex()
+        with tempfile.TemporaryDirectory(prefix="agentpool-accept-") as tmp:
+            cipher_file = Path(tmp) / "bundle.enc"
+            cipher_file.write_bytes(ciphertext)
+            sent = self._transport.send(cipher_file)
         prev_hash = self._last_chain_hash(manifest["repo_id"])
         accepted_body = build_manifest(
             repo_id=manifest["repo_id"], version=manifest["version"],
             content_hash=manifest["content_hash"], size_bytes=manifest["size_bytes"],
             signer_key_id=maintainer.key_id,
             submitter_key_id=manifest["submitter_key_id"],
-            wrapped_keys=manifest.get("wrapped_keys") or {},
-            transfer_ticket=manifest.get("transfer_ticket", ""),
+            wrapped_keys=wrapped_keys,
+            transfer_ticket=sent["ticket"],
             audit_report_hash=report_hash,
             prev_manifest_hash=prev_hash,
             state="accepted",
@@ -395,8 +422,10 @@ class RepoPropagator:
         })
         record_event(self._conn, self._pool_id, "accepted",
                      {"repo_id": manifest["repo_id"], "version": manifest["version"],
-                      "hash": a_hash})
-        return {"manifest": accepted, "manifest_hash": a_hash}
+                      "hash": a_hash, "dek_rotated": True,
+                      "pending_ticket": manifest.get("transfer_ticket", "")})
+        return {"manifest": accepted, "manifest_hash": a_hash,
+                "transfer_id": sent["transfer_id"], "dek_rotated": True}
 
     def reject(self, *, manifest: dict, reason: str, maintainer: Member) -> dict:
         if maintainer.key_id != self._maintainer_key_id:
@@ -440,7 +469,7 @@ class RepoPropagator:
         dek = unwrap_dek(fetcher.box_sk, bytes.fromhex(wrapped_hex))
         ticket = manifest.get("transfer_ticket", "")
         with tempfile.TemporaryDirectory(prefix="agentpool-dl-") as tmp:
-            materialised = self._transport.fetch(ticket, Path(tmp))
+            materialised = fetch_with_retry(self._transport, ticket, Path(tmp))
             ciphertext = Path(materialised).read_bytes()
         plaintext = decrypt_bundle(ciphertext, dek)
         # Client-side BLAKE3 (never trust sendme's own hash).

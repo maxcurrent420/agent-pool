@@ -166,8 +166,16 @@ def _handle_pool(ctx, raw: str) -> str:
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             out = {"ok": True, "pool_id": pool_id, "members": svc.members(pool_id)}
         elif sub == "freeze":
+            # `/pool freeze` (no pool id, or --global) = GLOBAL kill-switch
+            # across every pool; `/pool freeze <pool_id>` = per-pool only.
+            # `--unfreeze` clears it. The freeze command itself is never
+            # blocked by the freeze (it must be able to unfreeze).
+            frozen = "unfreeze" not in flags
             pool_id = rest[0] if rest else opts.get("pool_id", "")
-            out = svc.freeze(pool_id, frozen="unfreeze" not in flags)
+            if not pool_id or "global" in flags or pool_id in ("all", "*"):
+                out = svc.freeze_global(frozen)
+            else:
+                out = svc.freeze(pool_id, frozen=frozen)
         elif sub == "remove":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             key_id = rest[1] if len(rest) > 1 else opts.get("key_id", "")
@@ -354,6 +362,38 @@ def register(ctx):
                                  description=description)
         except Exception as exc:
             logger.warning("agent-pool: command %s registration failed: %s", name, exc)
+    # Button-click -> resolve_integration bridge (bridge.py). The
+    # gateway_platform_event hook is observer-only and, in this Hermes
+    # version, does not yet carry Discord button interactions — the
+    # handler parses defensively and ignores everything else, so
+    # registering it is behaviour-neutral today and lights up when the
+    # host normalizes interactions. The actionable control remains
+    # `/integrate approve|edit|discard <ticket>` (same code path).
+    try:
+        try:
+            from .bridge import make_platform_event_handler
+        except ImportError:
+            from bridge import make_platform_event_handler
+        identity_map = {}
+        try:
+            identity_map = ctx.state.get("agent_pool_identity_map", {}) if ctx is not None else {}
+        except Exception:
+            identity_map = {}
+
+        def _button_hook(platform, event_type, payload, **kwargs):
+            # Work dir: same default the /integrate handler uses.
+            try:
+                work_dir = _work_root_for(ctx) / "integrate"
+            except Exception:
+                work_dir = None
+            handler = make_platform_event_handler(
+                lambda: _service_for(ctx), identity_map=identity_map,
+                work_dir=work_dir)
+            return handler(platform, event_type, payload, **kwargs)
+
+        ctx.register_hook("gateway_platform_event", _button_hook)
+    except Exception as exc:
+        logger.warning("agent-pool: button bridge hook registration failed: %s", exc)
 
 # --- Phase 4 execution wiring (appended handlers) ----------------------------
 

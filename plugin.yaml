@@ -1,15 +1,18 @@
 name: agent-pool
-version: 0.2.0
+version: 1.0.0
 description: Agent Pool — friends form an agent team; repos propagate via Iroh, coordination only via the gateway
 manifest_version: 2
 api_version: 1
 license: MIT
 tags: [gateway, discord, iroh, team]
+requires_hermes: ">=0.22.0"
 python_dependencies:
   - "pynacl>=1.5,<2"
   - "blake3>=0.4,<2"
 provides_tools:
   - pool_status
+provides_hooks:
+  - gateway_platform_event
 config_schema:
   relay_url:
     type: str
