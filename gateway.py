@@ -131,3 +131,57 @@ class DiscordGatewayAdapter(GatewayAdapter):
     def post_buttons(self, ticket_ref, prompt, buttons):
         return self._dispatch("post_buttons",
                               {"ticket_ref": ticket_ref, "prompt": prompt, "buttons": list(buttons)})
+
+
+# ---------------------------------------------------------------------------
+# Real gateway bridge (Phase 2): route DiscordGatewayAdapter through the
+# Discord platform adapter's own ``send()`` (which already auto-creates
+# forum threads for forum channels). The plugin never imports discord and
+# never opens its own client; the host supplies the live adapter.
+# ---------------------------------------------------------------------------
+
+def discord_gateway_send_factory(discord_adapter, channel_id: str):
+    """Build a ``send(action, payload) -> ref`` for DiscordGatewayAdapter.
+
+    ``discord_adapter`` is the host's DiscordAdapter (async ``send(chat_id,
+    content)``). Must be called from outside a running event loop; inside a
+    running Hermes gateway loop use :func:`discord_gateway_send_async`.
+    """
+    import asyncio
+
+    def send(action: str, payload: dict) -> str:
+        content = _encode_payload_for_channel(action, payload)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            raise RuntimeError(
+                "discord_gateway_send_factory cannot block inside a running event loop; "
+                "use discord_gateway_send_async instead")
+        result = asyncio.run(_discord_send_chunks(discord_adapter, channel_id, content))
+        return result
+
+    return send
+
+
+async def discord_gateway_send_async(discord_adapter, channel_id: str,
+                                     action: str, payload: dict) -> str:
+    content = _encode_payload_for_channel(action, payload)
+    return await _discord_send_chunks(discord_adapter, channel_id, content)
+
+
+def _encode_payload_for_channel(action: str, payload: dict) -> str:
+    """Compact JSON on one line; manifests/notices only - never repo bytes."""
+    return f"[{action}] " + json.dumps(payload, ensure_ascii=False)
+
+
+async def _discord_send_chunks(discord_adapter, channel_id: str, content: str) -> str:
+    chunks = [content[i:i + 1800] for i in range(0, len(content), 1800)] or [content]
+    ref = ""
+    for chunk in chunks:
+        result = await discord_adapter.send(channel_id, chunk)
+        if hasattr(result, "success") and not result.success:
+            raise RuntimeError(f"gateway send failed: {getattr(result, 'error', result)}")
+        ref = getattr(result, "message_id", None) or getattr(result, "thread_id", None) or getattr(result, "ref", None) or ""
+    return str(ref or "discord:unknown")
