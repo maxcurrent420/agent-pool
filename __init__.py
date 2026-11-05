@@ -10,6 +10,7 @@ string Hermes posts; the plugin never posts to Discord itself.
 """
 import json
 import logging
+import os
 import shlex
 from pathlib import Path
 
@@ -23,18 +24,60 @@ def _cfg(ctx, key, default):
         return default
 
 
+def _transport_config(ctx):
+    """Resolve (mode, relay_url, per_pool) from plugin config.
+
+    Precedence (documented in plugin.yaml):
+    1. per-pool ``pools.<pool_id>.transport_mode`` / ``relay_url``
+    2. top-level ``transport_mode`` (default ``relay``) / ``relay_url``
+    3. ``HERMES_IROH_RELAY`` env var (inside the transport; an empty
+       config relay_url means "unset" so the env still applies)
+    In ``relay`` mode an env ``off`` is ignored by the transport (privacy
+    cannot be silently stripped); ``_pool_status`` warns about it.
+    """
+    base_mode = _cfg(ctx, "transport_mode", "relay") if ctx else "relay"
+    base_relay = _cfg(ctx, "relay_url", "") if ctx else ""
+    pools_cfg = _cfg(ctx, "pools", {}) if ctx else {}
+    per_pool: dict = {}
+    if isinstance(pools_cfg, dict):
+        for pid, cfg in pools_cfg.items():
+            if not isinstance(cfg, dict):
+                continue
+            mode = cfg.get("transport_mode", base_mode)
+            relay = cfg.get("relay_url", base_relay)
+            if mode != base_mode or relay != base_relay:
+                per_pool[pid] = {"transport_mode": mode, "relay_url": relay}
+    return base_mode, base_relay, per_pool
+
+
 def _pool_status(args=None, **kwargs):
     """Report plugin config + ledger/identity readiness. Always returns JSON."""
     ctx = kwargs.get("ctx")
     try:
         relay_url = _cfg(ctx, "relay_url", "") if ctx else ""
+        mode, _mode_relay, per_pool = _transport_config(ctx)
+        env_relay = os.environ.get("HERMES_IROH_RELAY", "").strip()
         budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
             ("max_turns", 25), ("max_tasks_per_day", 5),
             ("token_cap", 50000), ("wall_clock_seconds", 1800))}
         status = {"ok": True, "plugin": "agent-pool", "phase": 3,
-                  "relay_url": relay_url, "budgets": budgets,
+                  "relay_url": relay_url, "transport_mode": mode,
+                  "pool_transports": per_pool,
+                  "budgets": budgets,
                   "ledger": "ready", "identity": "ready",
                   "queued_notices": []}
+        if env_relay.lower() in {"off", "disabled", "none"}:
+            if mode == "relay":
+                status["transport_warning"] = (
+                    "HERMES_IROH_RELAY=off is set but transport_mode=relay: "
+                    "the env var is ignored in relay mode (relay-only "
+                    "ticket, peer learns no IP). Unset it, or set "
+                    "transport_mode=direct for direct/LAN transfers.")
+            else:
+                status["transport_warning"] = (
+                    f"HERMES_IROH_RELAY={env_relay} overrides the relay "
+                    f"config for transport_mode={mode}: in direct mode "
+                    "this disables the relay (peer IP exposed).")
         try:
             svc = _service_for(ctx)
             status["queued_notices"] = svc.drain_notices()
@@ -65,7 +108,20 @@ def _service_for(ctx, source=None):
     data_dir = L.default_db_path().parent
     identity = ensure_identity(data_dir)
     transport_name = _cfg(ctx, "transport", "fake") if ctx else "fake"
-    transport = FakeTransport() if transport_name == "fake" else RealSendHermesTransport()
+    mode, relay_url, per_pool = _transport_config(ctx)
+    # An empty relay_url in config means "unset" (env/CLI default apply);
+    # a non-empty one (incl. "off" in direct mode) beats the env var.
+    relay_arg = str(relay_url).strip() or None
+
+    def _make(m, r):
+        if transport_name == "fake":
+            return FakeTransport(transport_mode=m)
+        return RealSendHermesTransport(transport_mode=m, relay_url=r)
+
+    transport = _make(mode, relay_arg)
+    overrides = {pid: _make(cfg["transport_mode"],
+                             str(cfg["relay_url"]).strip() or None)
+                 for pid, cfg in per_pool.items()}
     budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
         ("max_turns", 25), ("max_tasks_per_day", 5),
         ("token_cap", 50000), ("wall_clock_seconds", 1800))}
@@ -73,7 +129,8 @@ def _service_for(ctx, source=None):
     return PoolService(conn, transport, caller_key_id=identity.key_id,
                        caller_signing_key=identity.signing_key,
                        caller_box_sk=identity.box_sk, budget_defaults=budgets,
-                       pool_resolver=pool_resolver)
+                       pool_resolver=pool_resolver,
+                       transport_overrides=overrides)
 
 
 # ---------------------------------------------------------------------------

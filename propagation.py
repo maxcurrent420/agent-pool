@@ -43,13 +43,13 @@ try:  # package import (Hermes loads plugins as a package)
                          sign_manifest, verify_chain, verify_manifest,
                          wrap_dek, unwrap_dek)
     from .ledger import append_manifest, queue_notice, record_event
-    from .transport import TransportBackend, fetch_with_retry
+    from .transport import TransportBackend, fetch_with_retry, mode_note
 except ImportError:  # flat import (pytest from repo root)
     from crypto import (blake3_hash, build_manifest, manifest_hash,
                         sign_manifest, verify_chain, verify_manifest,
                         wrap_dek, unwrap_dek)
     from ledger import append_manifest, queue_notice, record_event
-    from transport import TransportBackend, fetch_with_retry
+    from transport import TransportBackend, fetch_with_retry, mode_note
 
 # --------------------------------------------------------------------------
 # Static audit (network-off sandbox).
@@ -227,6 +227,16 @@ class RepoPropagator:
     def _is_member(self, key_id: str) -> bool:
         return key_id in self._members
 
+    def _transport_info(self) -> dict:
+        """Effective transport mode + relay + privacy note for replies."""
+        mode = getattr(self._transport, "transport_mode", "unknown")
+        relay = getattr(self._transport, "relay_url", "")
+        if callable(relay):
+            relay = relay()
+        return {"transport_mode": mode,
+                "relay_url": relay or "",
+                "transport_note": mode_note(mode)}
+
     def _last_chain_hash(self, repo_id: str) -> str | None:
         row = self._conn.execute(
             "SELECT manifest_hash FROM manifest_chain WHERE repo_id=? ORDER BY seq DESC LIMIT 1",
@@ -336,7 +346,8 @@ class RepoPropagator:
             record_event(self._conn, self._pool_id, "submitted_pending",
                          {"repo_id": repo_id, "version": version, "hash": m_hash})
 
-        return {"manifest": signed, "manifest_hash": m_hash,
+        return {**self._transport_info(),
+                "manifest": signed, "manifest_hash": m_hash,
                 "transfer_id": transfer_id, "content_hash": content_hash,
                 "state": state, "notice": _notice_emit.get("notice", "")}
 
@@ -450,7 +461,8 @@ class RepoPropagator:
                      {"repo_id": manifest["repo_id"], "version": manifest["version"],
                       "hash": a_hash, "dek_rotated": True,
                       "pending_ticket": manifest.get("transfer_ticket", "")})
-        return {"manifest": accepted, "manifest_hash": a_hash,
+        return {**self._transport_info(),
+                "manifest": accepted, "manifest_hash": a_hash,
                 "transfer_id": sent["transfer_id"], "dek_rotated": True,
                 "notice": _n.get("notice", "")}
 
@@ -621,7 +633,8 @@ class RepoPropagator:
         record_event(self._conn, self._pool_id, "merged_published",
                      {"repo_id": repo_id, "version": version, "hash": m_hash,
                       "content_hash": content_hash})
-        return {"manifest": signed, "manifest_hash": m_hash,
+        return {**self._transport_info(),
+                "manifest": signed, "manifest_hash": m_hash,
                 "transfer_id": sent["transfer_id"],
                 "content_hash": content_hash, "state": "accepted",
                 "notice": _n.get("notice", "")}

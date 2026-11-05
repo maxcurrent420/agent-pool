@@ -102,8 +102,8 @@ the short version:
    (NaCl SecretBox) — DEKs are never reused across versions.
 3. The DEK is wrapped (sealed box) per *current* member's box pubkey.
 4. The ciphertext goes to a `send_hermes` provider (`transport.py:152`).
-5. QUIC: direct hole-punched path where possible, n0 public relay
-   fallback. The relay sees ciphertext + routing metadata only.
+5. QUIC paths depend on `transport_mode` (default `relay` — see
+   "Transport privacy" below).
 6. The receiver's `fetch` (`propagation.py:471`) re-verifies the manifest
    chain and maintainer signatures, checks the wrapped-DEK ACL, fetches
    over Iroh, verifies BLAKE3 against the manifest `content_hash`,
@@ -117,6 +117,48 @@ verified, `.hermes/reports/phase6-ship.md:53`). Gateway payloads stay
 `send_hermes` provider must stay online during the transfer; fetches retry
 with bounded backoff and then fail with a structured
 `TransportUnavailable`. Repos well above ~1 GB are out of scope for v1.
+
+## Transport privacy — who learns your IP
+
+**Discord doesn't tell your buddy your IP address; a direct Iroh transfer
+would.** The default `send_hermes` ticket embeds the sender's IP and
+hole-punches a direct QUIC path — the peer learns your public IP from
+both. `transport_mode` (default `relay`) selects the carrier:
+
+| Mode | What the peer learns | What the relay learns | When to use it |
+|---|---|---|---|
+| `relay` (default) | **Nothing** network-identifying — the `--ticket-type relay` ticket carries only the relay URL + EndpointId; Iroh must use the relay | Both IPs, EndpointIds, timing/size metadata (never plaintext — QUIC/TLS + NaCl SecretBox) | Default for off-LAN pools; the anti-doxx mode |
+| `direct` (opt-in) | Your public IP:port (ticket embeds addresses; direct hole-punched QUIC) | Only if the relay fallback engages | LAN / trusted peers — fast (~97 MB/s vs ~2 MB/s relay) |
+| `tor` | — | — | **Unsupported: fails closed.** No Tor daemon on this host, and Iroh's `proxy_url` carries HTTP(S) only, so it cannot carry QUIC/UDP — a SOCKS knob would be false confidence. Tor would need the experimental onion custom transport (separate Rust milestone), not a config flag. |
+
+Operational rules:
+
+- **Precedence:** per-pool `pools.<pool_id>.transport_mode/_relay_url`
+  overrides top-level `transport_mode`/`relay_url`; an empty config
+  `relay_url` means "unset" (the `HERMES_IROH_RELAY` env var still
+  applies); a non-empty config value beats the env var.
+- **`HERMES_IROH_RELAY=off` is ignored in `relay` mode** — this is
+  deliberate, not a bug. Historically `off` silently forced
+  `--ticket-type addresses`, i.e. the *most* exposing mode.
+  `/pool status` (and the `pool_status` tool) always shows the
+  effective `transport_mode`, the per-pool overrides, and a warning
+  when the env var is set. In `direct` mode `off` still means direct.
+- In `relay` mode an explicit `relay_url: off` is a contradictory
+  config and is **rejected at setup** (relay-only ticket + relay
+  disabled = no transport at all).
+- Every `submit`/`accept`/`publish_merged` result and its Discord reply
+  echoes `transport_mode`, `relay_url`, and a `transport_note` so the
+  operator always sees which carrier moved the bytes.
+- **Relay-only ticket ≠ endpoint relay-only.** The ticket forbids the
+  receiver from dialing your IP, but the sender's `send_hermes` endpoint
+  may still publish its IP elsewhere (see Remaining gaps in
+  `.hermes/reports/transport-privacy-implementation.md`). That hardening
+  lives in hermes-iroh-interconnect's Rust sidecar
+  (`clear_ip_transports()` + `AddrFilter::relay_only()`); it needs the
+  sidecar rebuild and is a separate deployment step.
+- Relay mode costs ~50× on bulk: expect seconds-to-minutes fetches for
+  typical bundles vs milliseconds direct. Self-hosting the relay removes
+  the metadata trust in the operator (n0) at the same throughput class.
 
 ## Quick start
 
@@ -250,7 +292,8 @@ Full model: [docs/architecture.md](docs/architecture.md#isolation-model).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `relay_url` | `""` | Iroh relay URL; `off` = direct/LAN (fast path on one LAN) |
+| `relay_url` | `""` | Iroh relay URL; `off` = direct/LAN (fast path on one LAN). Empty = unset (env `HERMES_IROH_RELAY` applies); a non-empty value beats the env var |
+| `transport_mode` | `relay` | `relay` (relay-only ticket — peer learns no IP, default), `direct` (hole-punched QUIC — peer learns your IP, LAN/trusted), `tor` (unsupported: fails closed, use `relay`) |
 | `max_turns` | 25 | Per-claim budget: max agent turns |
 | `max_tasks_per_day` | 5 | Per-claim budget: max tasks/day |
 | `token_cap` | 50000 | Per-claim budget: token cap |

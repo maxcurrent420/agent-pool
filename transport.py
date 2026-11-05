@@ -12,6 +12,16 @@ Two backends:
   an explicit destination directory. The sender provider stays alive until
   ``stop()`` is called (the real flow needs this: unlinking early kills
   the transfer).
+
+Privacy modes (``transport_mode`` config, default ``relay``):
+- ``direct`` — today's behaviour: default ``RelayAndAddresses`` ticket
+  embeds the sender's IPs; the peer learns them (hole-punched QUIC).
+- ``relay`` — default: send uses ``--ticket-type relay`` so the ticket
+  carries only the relay URL; the peer learns no IP. The relay still sees
+  both IPs + metadata (never plaintext — QUIC/TLS + NaCl SecretBox).
+- ``tor`` — accepted as a config value but fails closed: no Tor daemon on
+  this host and Iroh's ``proxy_url`` carries HTTP(S) only, so it cannot
+  carry QUIC/UDP. Never a half-working path.
 """
 from __future__ import annotations
 
@@ -29,6 +39,71 @@ _TICKET_RE = re.compile(r"(?:sendme receive )([a-z0-9]{20,})|\b(blob[a-z0-9]{40,
                         re.IGNORECASE)
 _HASH_RE = re.compile(r"hash ([0-9a-f]{16,})")
 _EXPORT_RE = re.compile(r"exporting to (.+)", re.IGNORECASE)
+
+
+class TransportConfigError(ValueError):
+    """Invalid transport configuration (unknown mode, relay+disabled combo).
+
+    Structured: carries ``detail`` for the handler to surface as-is.
+    """
+
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(detail)
+
+
+class TorTransportUnavailable(RuntimeError):
+    """``tor`` mode selected but Tor transport is not available — fail closed.
+
+    Tor is not installed on this host and Iroh's ``proxy_url`` carries
+    HTTP(S) only (never QUIC/UDP), so a Tor transfer cannot be honoured
+    honestly. The error tells the operator to use ``relay`` instead.
+    """
+
+    MESSAGE = (
+        "tor transport unavailable: no Tor daemon is installed on this host "
+        "and Iroh's proxy_url carries HTTP(S) only, so it cannot carry "
+        "QUIC/UDP Iroh transfers. Configure transport_mode=relay (the "
+        "supported privacy mode: relay-only ticket, peer learns no IP) "
+        "instead — tor mode fails closed rather than giving false confidence."
+    )
+
+    def __init__(self):
+        self.detail = self.MESSAGE
+        super().__init__(self.MESSAGE)
+
+
+MODE_DIRECT = "direct"
+MODE_RELAY = "relay"
+MODE_TOR = "tor"
+VALID_MODES = (MODE_DIRECT, MODE_RELAY, MODE_TOR)
+
+_OFF_VALUES = {"off", "disabled", "none"}
+_DEFAULT_RELAY_VALUES = {"", "default", "n0"}
+
+
+def normalize_mode(value, default: str = MODE_RELAY) -> str:
+    """Normalize/validate a transport_mode config value."""
+    mode = str(value or "").strip().lower() or default
+    if mode not in VALID_MODES:
+        raise TransportConfigError(
+            f"invalid transport_mode {value!r}: expected one of "
+            f"{' | '.join(VALID_MODES)}; got {mode!r}")
+    return mode
+
+
+def mode_note(mode: str) -> str:
+    """User-visible privacy note for a mode (echoed in command replies)."""
+    if mode == MODE_RELAY:
+        return ("relay-only: peer IP not disclosed; "
+                "relay sees connection metadata (not plaintext)")
+    if mode == MODE_DIRECT:
+        return ("direct: peer IP exposed via ticket "
+                "(hole-punched QUIC — the peer learns your public IP)")
+    if mode == MODE_TOR:
+        return ("tor: unavailable on this host (fails closed); "
+                "use relay for peer-IP privacy")
+    return f"transport_mode={mode}"
 
 
 class TransportUnavailable(Exception):
@@ -75,11 +150,27 @@ def fetch_with_retry(transport, ticket: str, dest: Path, *,
     raise TransportUnavailable(ticket, max_attempts, last_error)
 
 
-def _relay_flag() -> list[str]:
-    relay = os.environ.get("HERMES_IROH_RELAY", "").strip()
-    if relay in ("", "default", "n0"):
+def _relay_flag(mode: str = MODE_DIRECT, relay_url: str | None = None) -> list[str]:
+    """Mode-aware ``--relay`` argv.
+
+    ``relay`` mode never emits ``--relay disabled`` (that would leave no
+    transport at all). ``direct`` preserves the historic behaviour:
+    env/config ``off`` → ``--relay disabled``; empty/default/n0 → no flag
+    (CLI default applies). An explicit *relay_url* beats the env var.
+    """
+    relay = (str(relay_url).strip() if relay_url is not None
+             else os.environ.get("HERMES_IROH_RELAY", "").strip())
+    if mode == MODE_RELAY:
+        if relay.lower() in _DEFAULT_RELAY_VALUES | _OFF_VALUES:
+            # off/none/disabled from the ENV is a no-op here: relay mode
+            # never disables the relay (nor emits "--relay off"). An
+            # EXPLICIT config relay of off is rejected in the constructor.
+            return []
+        return ["--relay", relay]
+    # direct (historic): off/disabled/none -> --relay disabled
+    if relay in _DEFAULT_RELAY_VALUES:
         return []
-    return ["--relay", "disabled" if relay == "off" else relay]
+    return ["--relay", "disabled" if relay.lower() in _OFF_VALUES else relay]
 
 
 class TransportBackend(ABC):
@@ -102,7 +193,9 @@ class FakeTransport(TransportBackend):
     """In-memory transport for tests. Provider lifetime is tracked so tests
     can assert the sender stayed alive until the fetch completed."""
 
-    def __init__(self):
+    def __init__(self, transport_mode: str = MODE_RELAY):
+        self.transport_mode = normalize_mode(transport_mode)
+        self.relay_url = ""
         self._store: dict[str, bytes] = {}
         self._providers: dict[str, dict] = {}
         self._seq = 0
@@ -136,20 +229,71 @@ class FakeTransport(TransportBackend):
 
 class RealSendHermesTransport(TransportBackend):
     """Real ``send_hermes`` CLI backend (same mechanics as the iroh plugin's
-    ``iroh_send_file``/``iroh_fetch_file``)."""
+    ``iroh_send_file``/``iroh_fetch_file``).
 
-    def __init__(self, state_dir: str | Path | None = None):
+    ``transport_mode`` defaults to ``relay`` (relay-only ticket: the peer
+    learns no IP). ``relay_url`` (explicit, from plugin/per-pool config)
+    wins over the ``HERMES_IROH_RELAY`` env var; unset → env applies.
+    In ``relay`` mode an explicit relay of ``off``/``disabled``/``none``
+    is a contradictory config and is rejected; an env ``off`` is ignored
+    (privacy cannot be silently stripped — see ``_pool_status`` warning).
+    """
+
+    def __init__(self, state_dir: str | Path | None = None, *,
+                 transport_mode: str = MODE_RELAY,
+                 relay_url: str | None = None):
+        self.transport_mode = normalize_mode(transport_mode)
+        self._explicit_relay = (None if relay_url is None
+                                else str(relay_url).strip())
+        if (self.transport_mode == MODE_RELAY
+                and self._explicit_relay is not None
+                and self._explicit_relay.lower() in _OFF_VALUES):
+            raise TransportConfigError(
+                "transport_mode=relay (relay-only ticket) cannot be "
+                f"combined with relay_url={self._explicit_relay!r}: "
+                "relay disabled means no transport at all. "
+                "Unset relay_url, use a relay URL, or set "
+                "transport_mode=direct for LAN/direct transfers.")
         env_dir = os.environ.get("HERMES_IROH_STATE_DIR")
         base = Path(state_dir or env_dir or Path.home() / ".hermes" / "iroh-interconnect")
         self._state_dir = base
         self._state_dir.mkdir(parents=True, exist_ok=True)
         self._providers: dict[str, dict] = {}
 
+    @property
+    def relay_url(self) -> str:
+        """Effective relay value: explicit config > env > '' (CLI default)."""
+        if self._explicit_relay is not None:
+            return self._explicit_relay
+        return os.environ.get("HERMES_IROH_RELAY", "").strip()
+
+    def _send_cmd(self, binary: str, path: Path) -> list[str]:
+        """Build the send argv (pure — unit-testable without spawning)."""
+        if self.transport_mode == MODE_TOR:
+            raise TorTransportUnavailable()
+        cmd = [binary, "send", "--no-progress", str(path)]
+        cmd += _relay_flag(self.transport_mode, self.relay_url)
+        if self.transport_mode == MODE_RELAY:
+            cmd += ["--ticket-type", "relay"]
+        elif self.relay_url.lower() in _OFF_VALUES:
+            cmd += ["--ticket-type", "addresses"]
+        return cmd
+
+    def _fetch_cmd(self, binary: str, ticket: str) -> list[str]:
+        """Build the receive argv (pure — unit-testable without spawning)."""
+        if self.transport_mode == MODE_TOR:
+            raise TorTransportUnavailable()
+        cmd = [binary, "receive", ticket, "--no-progress"]
+        cmd += _relay_flag(self.transport_mode, self.relay_url)
+        return cmd
+
     @staticmethod
     def binary() -> str | None:
         return shutil.which("send_hermes")
 
     def send(self, path: Path) -> dict:
+        if self.transport_mode == MODE_TOR:
+            raise TorTransportUnavailable()
         binary = self.binary()
         if binary is None:
             raise RuntimeError("send_hermes binary not found on PATH")
@@ -158,9 +302,7 @@ class RealSendHermesTransport(TransportBackend):
             raise ValueError(f"path is not a regular file: {path}")
         if shutil.which("script") is None:
             raise RuntimeError("sendme requires the 'script' utility to keep its provider TTY alive")
-        cmd = [binary, "send", "--no-progress", str(path)] + _relay_flag()
-        if os.environ.get("HERMES_IROH_RELAY", "").strip().lower() in {"off", "disabled", "none"}:
-            cmd += ["--ticket-type", "addresses"]
+        cmd = self._send_cmd(binary, path)
         nonce = secrets.token_hex(8)
         log_path = self._state_dir / f"sendme-agentpool-{nonce}.log"
         log_path.touch(mode=0o600)
@@ -202,6 +344,8 @@ class RealSendHermesTransport(TransportBackend):
         return {"ticket": ticket, "transfer_id": transfer_id, "hash": content_hash}
 
     def fetch(self, ticket: str, dest: Path) -> Path:
+        if self.transport_mode == MODE_TOR:
+            raise TorTransportUnavailable()
         binary = self.binary()
         if binary is None:
             raise RuntimeError("send_hermes binary not found on PATH")
@@ -209,7 +353,7 @@ class RealSendHermesTransport(TransportBackend):
         if not dest.is_dir():
             raise ValueError(f"destination is not an existing directory: {dest}")
         before = set(dest.iterdir())
-        cmd = [binary, "receive", ticket, "--no-progress"] + _relay_flag()
+        cmd = self._fetch_cmd(binary, ticket)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True, cwd=str(dest),

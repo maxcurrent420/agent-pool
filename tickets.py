@@ -66,7 +66,7 @@ class PoolService:
     def __init__(self, conn, *args,
                  transport=None, caller_key_id: str = "", caller_signing_key=None,
                  caller_box_sk=None, budget_defaults=None, pool_resolver=None,
-                 gateway=None):
+                 gateway=None, transport_overrides=None):
         # Backwards-compat: old call sites passed (conn, gateway, transport).
         # Duck-type: anything with post_notice is a legacy gateway (ignored).
         if args:
@@ -83,6 +83,10 @@ class PoolService:
             raise TypeError("PoolService no longer takes a gateway adapter")
         self._conn = conn
         self._transport = transport
+        # Per-pool transport overrides (transport_mode/relay_url from the
+        # plugin ``pools`` config); pools absent here use the top-level
+        # transport. Built once by _service_for, never mutated.
+        self._transport_overrides: dict = dict(transport_overrides or {})
         self._caller_key_id = caller_key_id
         self._caller_sk = caller_signing_key
         self._caller_box_sk = caller_box_sk
@@ -737,7 +741,8 @@ class PoolService:
         # submit/audit run as the caller. The caller's key is a safe stand-in
         # until the maintainer gate lands.
         return RepoPropagator(
-            self._conn, self._transport, pool_id=pool_id,
+            self._conn, self._transport_overrides.get(pool_id, self._transport),
+            pool_id=pool_id,
             maintainer_key_id=maintainer_id, maintainer_signing_key=maintainer_sk,
             members=members)
 
