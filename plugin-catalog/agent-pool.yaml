@@ -2,16 +2,20 @@
 # This file does NOT belong to the agent-pool plugin repo's source tree —
 # it must be added as plugin-catalog/agent-pool.yaml in the hermes-agent
 # repository via PR (human-merged gate). It is kept here so the owner can
-# copy it verbatim. The sha pins the plugin code commit (c1367b5); bump it
+# copy it verbatim. The sha pins the docs commit (03bf367); bump it
 # in the hermes-agent PR whenever the plugin advances.
 name: agent-pool
 repo: https://github.com/maxcurrent420/agent-pool
-sha: c1367b54ef48df845b99bb5823740e930b2e4df3
+sha: 03bf367602e2ffced32220b73d585423ca146a51
 description: >-
   Agent Pool — friends form an agent team: repos propagate via Iroh (QUIC,
-  BLAKE3-verified bearer tickets), coordination only via the Hermes gateway
-  (signed manifests, tickets, approve/edit/discard gate). Per-version DEK
-  wrapping per member, sandbox audit gate, global freeze kill-switch.
+  BLAKE3-verified bearer tickets via send_hermes), coordination only via
+  the Hermes gateway. Gateway-native: the plugin does NOT post to Discord —
+  it returns content that Hermes posts; it registers a Discord platform
+  handler (the gateway's own bot) for the approve/edit/discard button
+  gate, with ctx.ask_choice as fallback. Per-version DEK wrapping per
+  member, sandbox audit gate, global freeze kill-switch, per-profile
+  pool isolation (pool_not_local refusal for foreign pools).
   Disclosure — spawns git/bubblewrap/send_hermes child processes; network
   calls go to Iroh peers/relay (HERMES_IROH_RELAY=off for direct/LAN);
   reads profile plugin-data dir for ledger, identities, worktrees; stores
@@ -21,7 +25,7 @@ maintainer: maxcurrent420
 tier: community
 category: tools
 requires_hermes: ">=0.22.0"
-version: "1.0.0"
+version: "2.0.0"
 readme: true
 platforms: []
 capabilities:
