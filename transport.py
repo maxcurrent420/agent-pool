@@ -370,6 +370,8 @@ class RealSendHermesTransport(TransportBackend):
         """
         if self.transport_mode == MODE_TOR:
             return [binary, "send", "--no-progress", "--transport", "tor",
+                    "--tor-socks-port", str(self.tor_socks_port),
+                    "--tor-control-port", str(self.tor_control_port),
                     str(path)]
         cmd = [binary, "send", "--no-progress", str(path)]
         cmd += _relay_flag(self.relay_url)
@@ -382,7 +384,9 @@ class RealSendHermesTransport(TransportBackend):
         """Build the receive argv (pure — unit-testable without spawning)."""
         if self.transport_mode == MODE_TOR:
             return [binary, "receive", ticket, "--no-progress",
-                    "--transport", "tor"]
+                    "--transport", "tor",
+                    "--tor-socks-port", str(self.tor_socks_port),
+                    "--tor-control-port", str(self.tor_control_port)]
         cmd = [binary, "receive", ticket, "--no-progress"]
         cmd += _relay_flag(self.relay_url)
         return cmd

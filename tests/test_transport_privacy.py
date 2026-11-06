@@ -142,10 +142,15 @@ def test_tor_mode_send_argv(monkeypatch):
 
 def test_tor_mode_fetch_argv(monkeypatch):
     monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
-    t = RealSendHermesTransport(transport_mode="tor")
+    t = RealSendHermesTransport(transport_mode="tor",
+                                tor_socks_port=9055, tor_control_port=9051)
     cmd = t._fetch_cmd("/bin/true", "blobticket")
     assert cmd[:3] == ["/bin/true", "receive", "blobticket"]
     assert cmd[cmd.index("--transport") + 1] == "tor"
+    # Tor ports are forwarded so the sidecar matches ops/torrc (the
+    # iroh-tor-transport defaults are 9050 socks / 9051 control).
+    assert cmd[cmd.index("--tor-socks-port") + 1] == "9055"
+    assert cmd[cmd.index("--tor-control-port") + 1] == "9051"
     assert "--relay" not in cmd
     assert "addresses" not in cmd and "disabled" not in cmd
 

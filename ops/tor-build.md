@@ -26,6 +26,49 @@ adds `--transport tor` to both argv forms and emits **no relay flags**.
   (Local registry on this host: iroh 1.0.0 / 1.1.0 / 1.4.1 are cached;
   the hermes-iroh sidecar pins iroh `=1.0.0`.)
 
+## Build status (2026-11-06, this host)
+
+**BUILT and verified live.** The tor-enabled binary is installed at
+`~/.local/bin/send_hermes-tor` (the stock `send_hermes` is untouched,
+so the interconnect plugin's relay transfers are unaffected). The
+build tree is a patched clone of the pinned upstream
+(`github.com/rahlquist/sendme` @ `c700cbc…`):
+
+- `Cargo.toml`: + `iroh-tor-transport = "=0.1.0"` (which enables iroh's
+  `unstable-custom-transports` feature against iroh 1.0.0 — the same
+  line as the hermes-iroh sidecar pin).
+- `src/main.rs`: `TransportMode` enum (`relay` default / `tor`;
+  `direct` rejected at parse), `--transport`, `--tor-socks-port`
+  (9055), `--tor-control-port` (9051) on `CommonArgs`. In tor mode
+  both `send()` and `receive()` build the endpoint from
+  `TorCustomTransport::builder().socks_port().control_port()
+  .build(secret_key)` + its preset (clears IP + relay transports,
+  installs `TorAddressLookup`); the DNS lookup branch and the relay
+  `online()` wait are skipped. Relay mode is the unmodified path.
+- `cargo build --release`: clean (two pre-existing-style warnings
+  only: unused `mut`, a clone suggestion).
+
+Verified on this host: `send --help` advertises `--transport`,
+`--transport direct` is rejected, `--transport tor` with no daemon
+fails closed naming `systemctl start agent-pool-tor`, and — with the
+tor daemon installed and `agent-pool-tor` running — a real
+`RealSendHermesTransport(transport_mode="tor")` send→fetch round trip
+completed over the Tor-routed path (`tor_ready()` ok, ticket issued,
+bytes verified).
+
+**Operator config for this host** (agent-pool plugin config):
+
+```yaml
+transport_mode: tor
+tor_control_port: 9051
+tor_socks_port: 9055
+tor_binary: /home/maxcurrent/.local/bin/send_hermes-tor   # or install as send_hermes on PATH
+```
+
+(The `scripts/install-tor.sh` route installs the same binary as
+`/usr/local/bin/send_hermes`; the separate `send_hermes-tor` name
+here is deliberate so relay-mode hosts keep working unchanged.)
+
 ## Build steps (option (A), operator-executed)
 
 Nothing in this phase installs anything — the operator runs these on
