@@ -6,14 +6,31 @@ tickets. Known ceilings (measured on the build host): ~2 MB/s effective
 throughput; the sender must stay alive during transfer; repos well above
 ~1 GB are out of scope for v1.
 
+`transport_mode=relay` remains the documented fallback mode (relay-only on
+both ends; the peer learns no IP, the relay sees both peers' IPs +
+metadata, never plaintext). `transport_mode=tor` (Iroh + Tor custom
+transport via our sidecar) is the anonymity-upgraded mode; it is opt-in
+and fails closed if Tor is not ready. The mode is explicit config — never
+an automatic downgrade.
+
+Tor ceilings (stated honestly):
+- Throughput: Tor adds latency and hops; expect lower throughput than the
+  relay path (~2 MB/s) and far below the removed direct path (~97 MB/s).
+- Bootstrap latency: building a Tor endpoint (onion service) per transfer
+  is slow; Phase 3 ships per-transfer spawning (minimal change); a
+  long-lived sidecar is the follow-up if latency is unacceptable.
+- Experimental-transport status: iroh's custom transport API and the
+  `iroh-tor-transport` crate are experimental ("Expect breaking
+  changes"). The sidecar build pins exact iroh + crate versions; the
+  README documents the upgrade procedure. `transport_mode=tor` is opt-in
+  config until proven on this host.
+
 If the Iroh spike had failed (or on a network where QUIC/UDP is blocked),
 the plan's fallbacks were, in order. Migration note: the gateway-native
 rewrite changed only who posts to Discord (Hermes now posts; the plugin
-returns content) — it did not change the transport below. The measured
-throughput figures here (~2 MB/s relay path, ~97 MB/s direct/LAN) and the
-decision rule remain accurate.
+returns content) — it did not change the transport below.
 
-## 1. Radicle self-hosted seed
+## 1. Radicle self-hosted seed (deployment alternative)
 
 - **What:** run a Radicle seed node (`radicle-seed` / `radicle-node`)
   you control; repos are Radicle "RIDs" replicated to the seed.
@@ -46,10 +63,18 @@ decision rule remain accurate.
 ## Decision rule
 
 - Iroh works (sender online windows are acceptable, repos < ~1 GB) →
-  **stay on Iroh**.
+  **stay on Iroh** (relay mode is the out-of-the-box fallback; Tor mode
+  upgrades anonymity).
 - Need store-and-forward / TCP-only / bigger repos → **Radicle seed**.
 - No server, QUIC blocked, i2pd already present → **git-over-I2P**.
 
 The `TransportBackend` interface (`send`/`fetch`/`stop`) is the seam: a
 fallback is a new backend implementation, not a redesign — manifests,
 DEK wrapping, chain verification, and the audit gate are unchanged.
+
+## Radicle-seed note (deployment alternative)
+
+The Radicle seed option above survives as a deployment alternative for
+operators who need store-and-forward or TCP-only networks; it is not the
+default because v1 needs direct maintainer↔contributor transfer with
+per-version DEK rotation.

@@ -21,154 +21,150 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
 
 1. Link the plugin into the Hermes plugins dir. The plugin uses relative
    imports (flat layout at repo root), so a **symlink** is the right
-   approach — the same layout Hermes uses for directory plugins:
+   approach:
    ```bash
    ln -s /home/maxcurrent/Documents/AntiGravityProjects/agent-pool \
          ~/.hermes/plugins/agent-pool
    ```
-   (Note: `~/.hermes/plugins/hermes-iroh-interconnect` is a real
-   directory on this host, not a symlink — the symlink is for
-   agent-pool itself, whose package-relative imports resolve through the
-   link.)
-2. Enable it (this installs the declared Python deps pynacl + blake3 at
-   enable time; expect a WARN that blake3 is missing from the Hermes
-   runtime venv — tests and the plugin run under the system
-   interpreter's deps, see README "Tests"):
+2. Enable it (installs declared Python deps pynacl + blake3 at enable
+   time; expect a WARN that blake3 is missing from the Hermes runtime
+   venv — tests and the plugin run under the system interpreter's deps):
    ```bash
    hermes plugins enable agent-pool
    ```
-3. **Restart the gateway.** REQUIRED — both wirings run at Discord
-   `connect()`:
-   - slash-command tree sync: `H/plugins/platforms/discord/adapter.py:1556-1558`
-     (`_register_slash_commands()` at connect),
-   - plugin platform-handler wiring:
-     `H/plugins/platforms/discord/adapter.py:1573`
-     (`_wire_plugin_handlers`, `H/gateway/platforms/base.py:2211-2241`).
-   New commands do not appear in the Discord picker and button clicks do
-   not route until this restart. There is no hot-reload for either.
+3. **Restart the gateway.** REQUIRED — slash-command tree sync runs at
+   Discord `connect()`:
+   - `H/plugins/platforms/discord/adapter.py:1556-1558`
+     (`_register_slash_commands()` at connect).
+   New commands do not appear in the Discord picker until this restart.
+   There is no hot-reload.
+
+## Tor (optional, for `transport_mode=tor`)
+
+4. Install Tor + sidecar on EVERY gateway in the pool (both endpoints
+   must enable Tor; mixed pools fail closed):
+   ```bash
+   apt install tor
+   scripts/install-tor.sh   # writes ops/torrc, builds sidecar, enables agent-pool-tor.service
+   systemctl start agent-pool-tor
+   ```
+   `transport_mode=tor` is opt-in; `relay` mode needs none of this and
+   stays the out-of-the-box mode.
 
 ## Config
 
-4. Set in the profile's plugin config (no `gateway_channel_id` exists
-   anymore — gateway routing is Hermes's):
-   - `relay_url`: `""` (default n0 relay) or `"off"` (direct/LAN)
+5. Set in the profile's plugin config (no `gateway_channel_id` exists —
+   gateway routing is Hermes's):
    - `transport`: `real` (send_hermes/Iroh; `fake` is tests/CLI only)
+   - `transport_mode`: `relay` (default) or `tor`
+   - `relay_url`: `""` (default n0 relay) or a self-hosted relay URL
    - budgets: `max_turns` 25, `max_tasks_per_day` 5, `token_cap` 50000,
      `wall_clock_seconds` 1800 (or per-pool overrides under `pools`)
-   - confirm `send_hermes` is on PATH (`~/.cargo/bin/send_hermes` on
-     this host) and `bubblewrap` is installed (without it the scanner
-     runs unsandboxed and says so — see threat model).
+   - confirm `send_hermes` is on PATH and `bubblewrap` is installed
+     (without bwrap the scanner runs unsandboxed and says so).
 
 ## Discord-side setup
 
-5. Pick a guild channel for the run. The bot's `DISCORD_ALLOWED_USERS`
+6. Pick a guild channel for the run. The bot's `DISCORD_ALLOWED_USERS`
    must contain the tester's Discord user id — that allowlist
    (`adapter.py:4159-4167`) is the only ingress gate; there is no
    plugin-side Discord client.
-6. After the restart, verify all **ten** commands in the picker:
-   `pool`, `task`, `add-repo`, `task_add`, `task_list`, `claim`, `release`,
-   `work`, `integrate`, `audit` (each with one optional `args` string option
-   from its `args_hint`).
+7. After the restart, verify all **ten** commands in the picker:
+   `pool`, `fetch`, `task`, `add-repo`, `task_add`, `task_list`, `claim`,
+   `release`, `push`, `audit` (each with one optional `args` string
+   option from its `args_hint`).
 
 ## The command sequence (in Discord)
 
-7. Register a pool and bind yourself as owner — **the `--discord-user`
-   you pass here becomes the whitelist owner** and is the authorization
-   for every owner-only verb; get it right (a mis-bound id is the residual
-   auth risk). Register without `--discord-user` is refused:
-   ```
+8. Register a pool and bind yourself as owner — the `--discord-user`
+   you pass here becomes the whitelist owner and is the authorization for
+   every owner-only verb:
+   ```text
    /pool register demo-pool --name Demo --discord-user <your Discord user id>
    ```
-8. Invite a second member (or skip — single-agent run is fine). The
-   invitee's Discord id becomes an **authorized** user (may claim/submit/
-   list/fetch, but NOT mint, approve, invite, remove, freeze or
-   integrate). The invite also records their agent key — attribution only:
-   ```
+9. Invite a second member (optional; single-agent run is fine):
+   ```text
    /pool invite demo-pool <member key_id> --box-pubkey <hex> --discord-user <their Discord user id>
    ```
-9. Create a ticket (owner-only; an authorized non-owner is refused):
-   ```
-   /task add --pool-id demo-pool --repo demo --title "Live test" --brief "first live run"
-   ```
-   (Note the returned `ticket_id` and `thread_ref` — the invoking chat
-   was recorded as the ticket's thread.)
-10. A non-invitee (an id with no whitelist row) must be refused on every
-    verb — try it with a third account before continuing (expect a
-    permission refusal, never a dispatch).
-11. Claim it (any authorized user may):
+10. Add a repo (owner-only):
+    ```text
+    /add-repo demo --path /srv/repos/demo --pool demo-pool --name "Demo"
     ```
-    /claim <ticket_id> --paths hello.txt
+11. Create a ticket (owner-only):
+    ```text
+    /task add --pool-id demo-pool --repo demo --title "Live test" --brief "first live run"
     ```
-12. Submit work (bytes go over Iroh from this machine):
+    (Note the returned `ticket_id`.)
+12. A non-invitee must be refused on every verb — try with a third
+    account before continuing (expect a permission refusal, never a
+    dispatch).
+13. Claim it (any authorized user may):
+    ```text
+    /claim <ticket_id>
     ```
-    /work submit <ticket_id> --repo-path <path to a git repo with >=1 commit> --version 1
+14. Fetch the repo list (read surface):
+    ```text
+    /fetch repo list --pool demo-pool
     ```
-    Expect a pending-manifest summary (manifest hash, BLAKE3
-    `content_hash`, transfer id) — **not** repo bytes in the reply.
-13. The invited friend must NOT be able to freeze the pool — have them
-    try `/pool freeze demo-pool` and confirm the owner-only refusal
-    (`pool frozen — contact the maintainer` never appears here; the
-    refusal is an unauthorized-verb one).
-14. Run the integration gate, then click **Approve** on the buttons in
-    the reply (or run `/integrate approve <ticket_id>` — same code path,
-    same owner check):
+15. Fetch the repo manifest:
+    ```text
+    /fetch repo demo --pool demo-pool
     ```
-    /integrate <ticket_id>
+16. Push (grant on the pool's gateway; claimant-only):
+    ```text
+    /push repo demo --ticket <ticket_id>
     ```
-15. Verify the audit:
+    (Returns a one-time grant token + gateway addressing.)
+17. Build + send the bundle on the contributor's own gateway
+    (`PoolService.push_build_bundle` — service-level, no slash command),
+    then deliver on the pool's gateway:
+    ```text
+    /push repo --deliver <transfer_ticket> --token <grant> --manifest '<contributor-signed manifest json>'
     ```
+    Expect the sandbox-scan report; on a clean scan the task completes.
+18. Verify the audit:
+    ```text
     /audit show <ticket_id>
     ```
-    Expect the sandbox-scan report and, after approve, the merged state.
-16. Read the project back through fetch (the read path — no import):
+19. Confirm the task is now completed (not available):
+    ```text
+    /fetch task list --pool demo-pool
     ```
-    /pool fetch demo --pool demo-pool          (returns the latest accepted manifest)
-    /work fetch --manifest '<manifest json>' --dest <workdir>
-    ```
-    Confirm the clone decrypts with the fetching agent's own box key and
-    matches the manifest's BLAKE3 `content_hash`.
+    (The claimed/completed ticket must not appear as available.)
 
 ## Verify repo bytes never hit Discord
 
-14. **Gateway payload size check.** The plugin's content guard caps
-    coordination payloads at 4 KB (`P/replies.py:check_content_size`), and
-    measured gateway payloads were ≤ ~1.6 KB with
-    `gateway_calls_over_4KB=0` (`.hermes/reports/phase2-propagation.md:20`).
-    Check the gateway log for this run: every Discord send from the
-    plugin's replies must be a short manifest/notice (a few hundred
-    bytes to ~1.6 KB) — grep the gateway's Discord adapter send log for
-    the ticket id and confirm no send body contains repo content or
-    anything near attachment size.
-15. **Iroh-side evidence.** The `/work submit` reply (and the ledger
+20. **Gateway payload size check.** The plugin's content guard caps
+    coordination payloads at 4 KB (`P/replies.py:check_content_size`),
+    and measured gateway payloads were ≤ ~1.6 KB with
+    `gateway_calls_over_4KB=0`
+    (`.hermes/reports/phase2-propagation.md:20`). Check the gateway log
+    for this run: every Discord send from the plugin's replies must be a
+    short manifest/notice — grep the gateway's Discord adapter send log
+    for the ticket id and confirm no send body contains repo content.
+21. **Iroh-side evidence.** The push reply (and the ledger
     `manifest_chain` row) carries the `transfer_ticket` / `content_hash`
-    (BLAKE3). Fetch the accepted version on the consumer side and
-    confirm the fetched bundle's BLAKE3 equals the manifest
-    `content_hash` — that match is the proof the bytes travelled the
-    Iroh path (`propagation.py:471` `fetch` verifies it). On this host
-    the direct/LAN path measured ~97 MB/s and the n0 relay path ~2 MB/s
-    (phase 6 report); either is fine, the BLAKE3 match is what matters.
-    Also confirm the sender's `send_hermes` provider was online during
-    the transfer (Phase 0 requirement).
+    (BLAKE3). Fetch the accepted version on the consumer side and confirm
+    the fetched bundle's BLAKE3 equals the manifest `content_hash` — that
+    match is the proof the bytes travelled the Iroh path.
 
 ## Roll back
 
-16. Disable and restart:
+22. Disable and restart:
     ```bash
     hermes plugins disable agent-pool
-    # restart the gateway (same step 3)
+    # restart the gateway
     rm ~/.hermes/plugins/agent-pool   # remove the symlink (optional)
     ```
     The pool ledger and keys stay under the profile's plugin-data dir;
-    nothing else on the host changes. The pre-migration tree remains
-    available as the fallback (commit `ff0e63b`).
+    nothing else on the host changes.
 
 ## What this does NOT cover
 
-- A real Discord button click on a real guild (permissions, component
-  rendering, persistent views across a gateway restart, ephemeral
-  refusals) — the plugin-repo harness (`tests/test_discord_e2e.py`)
-  covers the listener/dispatch/maintainer-gate logic with a simulated
-  interaction; only this live run proves the real-client rendering and
-  the 3 s interaction timing.
-- Multi-machine pools: single-host run first; cross-machine uses the
-  same flow with `relay_url` left at the default.
+- A real Discord button click (there are no buttons in 2.6.0 — the audit
+  gate is automatic on push-deliver).
+- Multi-machine pools: single-host run first; cross-machine uses the same
+  flow with `relay_url` left at the default.
+- `transport_mode=tor`: requires Tor installed and running on both
+  endpoints; verify `tor_ready()` passes before attempting a tor-mode
+  transfer.

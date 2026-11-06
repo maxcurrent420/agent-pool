@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Agent Pool 90-second demo — full loop, measurable wall-clock.
+"""Agent Pool demo — full loop over the current (2.6.0) model, measurable
+wall-clock.
 
-register pool → bundle+publish+manifest pin → add task (brief+criteria+
-budget) → claim (declared paths, no overlap) → fetch over transport →
-work in worktree → progress → tests pass → branch bundle published →
-integrate → scan report → approve → merged + re-pinned → audit show +
-chain view.
+register pool -> add repo (v1 accepted) -> add task (open) -> claim ->
+fetch repo list / repo manifest -> edit in worktree -> push (grant + build
++ deliver) -> task completed -> verify chain + audit.
 
-Default transport is FakeTransport (in-memory) for a
-hermetic, fast run. Pass --real to use RealSendHermesTransport (send_hermes
-must be on PATH; transfers are relay-only — HERMES_IROH_RELAY=off is a no-op).
+Default transport is FakeTransport (in-memory) for a hermetic, fast run.
+Pass --real to use RealSendHermesTransport (send_hermes must be on PATH).
 
 Usage:
   env -u PYTHONNOUSERSITE HOME=/home/maxcurrent PATH=/usr/bin:/bin \
@@ -41,25 +39,6 @@ def _git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True)
 
 
-class DemoRunner:
-    """Local worker: applies the task edit in the worktree, reports usage."""
-
-    def __init__(self):
-        self.cancelled = []
-
-    def launch(self, mandate, *, worktree):
-        (Path(worktree) / "hello.txt").write_text("v2\n")
-        return {"worktree": worktree}
-
-    def poll(self, handle):
-        return {"state": "done", "ready": True, "summary": "edited hello.txt",
-                "usage": {"turns": 2, "tokens": 120}}
-
-    def cancel(self, handle, reason):
-        self.cancelled.append(reason)
-        return True
-
-
 def main():
     real = "--real" in sys.argv
     t0 = time.time()
@@ -74,19 +53,17 @@ def main():
         print(f"[{time.time()-t0:5.1f}s] identities: {maint.key_id} (maintainer), "
               f"{worker.key_id} (worker)")
 
-        # 1. register pool + publish v1 (bundle, encrypt, pin manifest)
+        # 1. register pool + members
         create_pool(conn, "demo-pool", "Demo Team", maint.key_id, relay_url="off")
-        conn.execute(
-            "INSERT INTO repos (repo_id, pool_id, name, created_at)"
-            " VALUES ('demo','demo-pool','Demo',0)")
         for ident, role in ((maint, "maintainer"), (worker, "member")):
             conn.execute(
-                "INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex,"
-                " created_at) VALUES (?,?,?,0)",
+                "INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, "
+                "created_at) VALUES (?,?,?,0)",
                 (ident.key_id, ident.verify_key.encode(RawEncoder).hex(),
                  ident.box_pk.encode(RawEncoder).hex()))
             add_member(conn, "demo-pool", ident.key_id, role=role,
-                       box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex())
+                       box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex(),
+                       verify_pubkey_hex=ident.verify_key.encode(RawEncoder).hex())
         conn.commit()
         maint_svc = PoolService(conn, transport, caller_key_id=maint.key_id,
                                 caller_signing_key=maint.signing_key,
@@ -94,6 +71,9 @@ def main():
         worker_svc = PoolService(conn, transport, caller_key_id=worker.key_id,
                                  caller_signing_key=worker.signing_key,
                                  caller_box_sk=worker.box_sk)
+        print(f"[{time.time()-t0:5.1f}s] pool registered")
+
+        # 2. add repo (maintainer self-accept -> v1 accepted)
         src = tmp / "src"
         src.mkdir()
         assert _git("-C", str(src), "init", "-q").returncode == 0
@@ -102,63 +82,72 @@ def main():
         (src / "hello.txt").write_text("v1\n")
         _git("-C", str(src), "add", ".")
         assert _git("-C", str(src), "commit", "-q", "-m", "v1").returncode == 0
-        prop = maint_svc._propagator({"pool_id": "demo-pool", "repo_id": "demo"})
-        sent = prop.submit(repo_path=src, repo_id="demo", version=1,
-                           submitter=prop._members[maint.key_id],
-                           submitter_signing_key=maint.signing_key)
-        assert sent["state"] == "accepted"
-        print(f"[{time.time()-t0:5.1f}s] published demo v{sent['manifest']['version']} "
-              f"(manifest {sent['manifest_hash'][:12]}, pinned to gateway)")
+        added = maint_svc.add_repo("demo-pool", "demo", str(src), display_name="Demo")
+        assert added["state"] == "accepted", added
+        print(f"[{time.time()-t0:5.1f}s] published demo v{added['version']} "
+              f"(manifest {added['manifest_hash'][:12]}, pinned to gateway)")
 
-        # 2. add task (brief + criteria + budget) -> forum post appears
+        # 3. add task (open)
         ticket = maint_svc.add_ticket(
             "demo-pool", "demo", "Update greeting to v2",
             brief="Scope: hello.txt. Accept: hello.txt == 'v2'.",
             budget={"max_turns": 5})
         tid = ticket["ticket_id"]
-        print(f"[{time.time()-t0:5.1f}s] task {tid} created, thread "
-              f"{ticket['thread_ref']} (forum post)")
+        print(f"[{time.time()-t0:5.1f}s] task {tid} created")
 
-        # 3. claim (declared paths, no overlap) -> fetch over transport -> worktree
-        worker_svc.claim(tid, declared_paths=["hello.txt"])
-        acceptance = [sys.executable, "-c",
-                      "assert open('hello.txt').read() == 'v2\\n', 'not v2'"]
-        started = worker_svc.start_work(tid, work_root=tmp / "work",
-                                        runner=DemoRunner(),
-                                        acceptance_cmd=acceptance)
-        print(f"[{time.time()-t0:5.1f}s] claimed + fetched v1 over transport, "
-              f"worktree on {started['branch']}")
+        # 4. claim (whole-ticket)
+        worker_svc.claim(tid)
+        print(f"[{time.time()-t0:5.1f}s] claimed")
 
-        # 4. progress + acceptance tests + branch bundle published
-        worker_svc.report_progress(tid, "editing hello.txt")
-        done = worker_svc.complete_work(tid, timeout_seconds=30)
-        assert done["ok"] and done["state"] == "review", done
-        print(f"[{time.time()-t0:5.1f}s] worker done, acceptance passed, "
-              f"branch bundle v{done['version']} published (pending)")
+        # 5. fetch read surface
+        rlist = worker_svc.fetch_repo_list("demo-pool")
+        assert any(r["repo_id"] == "demo" for r in rlist["repos"]), rlist
+        manifest = worker_svc.fetch_repo("demo", pool_id="demo-pool")
+        print(f"[{time.time()-t0:5.1f}s] fetched repo list + manifest")
 
-        # 5. integrate -> scan report -> approve -> merged + re-pinned
-        gate = maint_svc.integrate(tid, work_dir=tmp / "gate")
-        assert gate["verdict"] == "clean" and gate["buttons_posted"], gate
-        print(f"[{time.time()-t0:5.1f}s] integrate: scan verdict={gate['verdict']} "
-              f"report {gate['report_hash'][:12]}, buttons posted")
-        resolved = maint_svc.resolve_integration(tid, "approve", work_dir=tmp / "gate")
-        assert resolved["merged"], resolved
-        print(f"[{time.time()-t0:5.1f}s] approved -> merged {resolved['merge_commit'][:12]}, "
-              f"v{resolved['version']} re-pinned")
+        # 6. edit in worktree
+        work = tmp / "work"
+        work.mkdir()
+        (work / "hello.txt").write_text("v2\n")
+        assert _git("-C", str(work), "init", "-q").returncode == 0
+        _git("-C", str(work), "config", "user.email", "demo@local")
+        _git("-C", str(work), "config", "user.name", "Demo")
+        _git("-C", str(work), "add", ".")
+        assert _git("-C", str(work), "commit", "-q", "-m", "v2").returncode == 0
 
-        # 6. audit show + chain view
+        # 7. push: grant (claimant-only, on pool gateway) + build bundle
+        grant = worker_svc.push_repo("demo", tid, pool_id="demo-pool")
+        token = grant["token"]
+        bundle = worker_svc.push_build_bundle(str(work), "demo", pool_id="demo-pool")
+        pushed_manifest = bundle["manifest"]
+        transfer_ticket = pushed_manifest["transfer_ticket"]
+        print(f"[{time.time()-t0:5.1f}s] push granted + bundle built "
+              f"(transfer {transfer_ticket[:12]}...)")
+
+        # 8. deliver on pool gateway (audit gate + accept + complete)
+        delivered = maint_svc.push_deliver(
+            transfer_ticket, token, pushed_manifest, pool_id="demo-pool")
+        assert delivered.get("merged") or delivered.get("ok"), delivered
+        print(f"[{time.time()-t0:5.1f}s] delivered: "
+              f"{'merged' if delivered.get('merged') else 'ok'}")
+
+        # 9. verify
         shown = maint_svc.audit_show(ticket_id=tid)
         chain = [json.loads(r[0]) for r in conn.execute(
-            "SELECT manifest_json FROM repo_versions WHERE state='accepted'"
-            " ORDER BY version")]
+            "SELECT manifest_json FROM repo_versions WHERE state='accepted' "
+            "ORDER BY version")]
         vk = {k: _verify_key(v) for k, v in
               maint_svc._members_for_propagator("demo-pool").items()}
         ok, reason = verify_chain(chain, vk)
         assert ok, reason
-        print(f"[{time.time()-t0:5.1f}s] audit {shown['audit_id']}: "
-              f"verdict={shown['verdict']}; chain {len(chain)} manifests, "
+        tlist = worker_svc.fetch_task_list("demo-pool")
+        available_ids = [t["ticket_id"] for t in tlist.get("tickets", [])
+                         if t.get("state") == "open"]
+        assert tid not in available_ids, "completed task still listed as available"
+        print(f"[{time.time()-t0:5.1f}s] audit {shown.get('audit_id')}: "
+              f"verdict={shown.get('verdict')}; chain {len(chain)} manifests, "
               f"verify_chain={ok}; tip {manifest_hash(chain[-1])[:12]}")
-        print(f"content returned via results (no repo bytes on gateway)")
+        print("content returned via results (no repo bytes on gateway)")
 
     elapsed = time.time() - t0
     print(f"DEMO_OK elapsed={elapsed:.1f}s "

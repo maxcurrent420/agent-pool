@@ -11,29 +11,28 @@ description: >-
   Agent Pool — friends form an agent team: repos propagate via Iroh (QUIC,
   BLAKE3-verified bearer tickets via send_hermes), coordination only via
   the Hermes gateway. Gateway-native: the plugin does NOT post to Discord —
-  it returns content that Hermes posts; it registers a Discord platform
-  handler (the gateway's own bot) for the approve/edit/discard button
-  gate, with ctx.ask_choice as fallback. Per-version DEK wrapping per
-  member, sandbox audit gate, global freeze kill-switch, per-profile
-  pool isolation (pool_not_local refusal for foreign pools).
+  it returns content that Hermes posts. Passive plumbing (no timers, no
+  observation, no execution); one pool per gateway. Per-version DEK wrapping
+  per member, sandbox audit gate (audit-on-push), global freeze kill-switch,
+  per-profile pool isolation (pool_not_local refusal for foreign pools).
+  Task lifecycle: open / claimed / completed. Transport: relay (default) or
+  tor (Iroh + Tor custom transport via sidecar; fails closed).
   Disclosure — spawns git/bubblewrap/send_hermes child processes; network
-  calls go to Iroh peers/relay (relay-only on both ends: the peer never
-  learns your IP; the relay sees both peers' IPs + metadata, never
-  plaintext; HERMES_IROH_RELAY=off is a no-op — there is no direct mode);
-  reads profile plugin-data dir for ledger, identities, worktrees; stores
-  ed25519/box keys under the plugin data dir; no telemetry, no stored
-  credentials beyond its own keypairs.
+  calls go to Iroh peers/relay (relay-only on both ends in relay mode;
+  tor mode removes the relay from the connection path; HERMES_IROH_RELAY=off
+  is a no-op — there is no direct mode); reads profile plugin-data dir for
+  ledger, identities, worktrees; stores ed25519/box keys under the plugin
+  data dir; no telemetry, no stored credentials beyond its own keypairs.
 maintainer: maxcurrent420
 tier: community
 category: tools
 requires_hermes: ">=0.22.0"
-version: "2.5.0"
+version: "2.6.0"
 readme: true
 platforms: []
 capabilities:
   provides_tools:
     - pool_status
-  provides_hooks:
-    - gateway_platform_event
+  provides_hooks: []
   provides_middleware: []
   requires_env: []
