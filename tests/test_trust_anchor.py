@@ -21,18 +21,21 @@ def test_import_needs_verify_key():
     svc=PoolService(c, caller_key_id="agent:alice", caller_signing_key=SigningKey.generate())
     with pytest.raises(ValueError, match="verify-key"):
         svc.import_canonical("pool-remote",[m],{})
+    # F3: key without --maintainer refused (no TOFU via self-declared signer)
+    with pytest.raises(ValueError, match="--maintainer"):
+        svc.import_canonical("pool-remote",[m],{"agent:maint": sk.verify_key}, maintainer_key_id=None)
     # wrong key refused
     wrong=SigningKey.generate()
     with pytest.raises(ValueError, match="import rejected"):
-        svc.import_canonical("pool-remote",[m],{"agent:maint": wrong.verify_key})
+        svc.import_canonical("pool-remote",[m],{"agent:maint": wrong.verify_key}, maintainer_key_id="agent:maint")
 
 def test_two_pools_same_repo_isolated():
     c=memdb(); create_pool(c,"pool-1","Team","agent:maint")
     sk1=SigningKey.generate(); sk2=SigningKey.generate()
     m1=_manifest(sk1,"agent:m1",repo="r1"); m2=_manifest(sk2,"agent:m2",repo="r1")
     svc=PoolService(c, caller_key_id="agent:alice", caller_signing_key=SigningKey.generate())
-    svc.import_canonical("pool-a",[m1],{"agent:m1": sk1.verify_key})
-    svc.import_canonical("pool-b",[m2],{"agent:m2": sk2.verify_key})
+    svc.import_canonical("pool-a",[m1],{"agent:m1": sk1.verify_key}, maintainer_key_id="agent:m1")
+    svc.import_canonical("pool-b",[m2],{"agent:m2": sk2.verify_key}, maintainer_key_id="agent:m2")
     rows=c.execute("SELECT pool_id, repo_id FROM imported_versions ORDER BY pool_id").fetchall()
     assert [(r[0],r[1]) for r in rows]==[("pool-a","r1"),("pool-b","r1")]
     assert get_trust_anchor(c,"pool-a")["trust_state"]=="pinned"
@@ -58,7 +61,7 @@ def test_remote_chain_verifies_against_pinned():
     # Need pool-remote pinned + imported manifest with wrapped keys for fetch path
     m=_manifest(maint_sk,maint_kid,repo="r1")
     svc=PoolService(c, FakeTransport(), caller_key_id="agent:alice", caller_signing_key=SigningKey.generate())
-    svc.import_canonical("pool-remote",[m],{maint_kid: maint_sk.verify_key})
+    svc.import_canonical("pool-remote",[m],{maint_kid: maint_sk.verify_key}, maintainer_key_id=maint_kid)
     # Propagator built via service carries pinned verify key
     prop=svc._propagator("pool-remote")
     assert maint_kid in prop._members

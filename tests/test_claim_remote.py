@@ -16,7 +16,7 @@ def test_claim_imported_ticket_and_double_claim_refused():
     body=build_manifest(repo_id="r1",version=1,content_hash="ab"*32,size_bytes=1,signer_key_id=maint_kid,submitter_key_id=maint_kid,state="accepted")
     m=sign_manifest(maint_sk,body)
     svc=PoolService(c, caller_key_id="agent:alice", caller_signing_key=SigningKey.generate())
-    svc.import_canonical("pool-remote",[m],{maint_kid:maint_sk.verify_key},tickets=[{"ticket_id":"t-9","pool_id":"pool-remote","repo_id":"r1","title":"hi","state":"open"}])
+    svc.import_canonical("pool-remote",[m],{maint_kid:maint_sk.verify_key},tickets=[{"ticket_id":"t-9","pool_id":"pool-remote","repo_id":"r1","title":"hi","state":"open"}], maintainer_key_id=maint_kid)
     claim=svc.claim("t-9",key_id="agent:alice")
     assert claim["state"]=="active" and claim.get("remote") is True
     svc2=PoolService(c, caller_key_id="agent:bob", caller_signing_key=SigningKey.generate())

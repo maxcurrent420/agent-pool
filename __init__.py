@@ -294,7 +294,7 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
             if vk_hex:
                 from nacl.signing import VerifyKey
                 from nacl.encoding import RawEncoder
-                signer = maintainer or (manifests[0].get("signer_key_id", "") if manifests else "")
+                signer = maintainer
                 if signer:
                     verify_keys = {signer: VerifyKey(bytes.fromhex(vk_hex), encoder=RawEncoder)}
             out = svc.import_canonical(pool_id, manifests, verify_keys,
@@ -714,15 +714,27 @@ def _wrap_command(handler, ctx):
                         if key is None:
                             return _result({"ok": False, "error_code": "unauthorized",
                                             "error": f"not authorized for pool {resolved or ''} — ask the maintainer"})
-                        # Canonical writes require the maintainer binding.
+                        # Canonical writes require the maintainer binding (F1):
+                        # the gateway agent key alone must never satisfy
+                        # maintainer checks — compare Discord binding to
+                        # pools.maintainer_key_id for every mutating handler.
                         _canonical = {"_handle_pool": ("register", "invite", "remove", "freeze", "auto-approve", "trust", "import"),
-                                      "_handle_task": ("add",), "_handle_add_repo": (), "_handle_task_add": ("",)}
+                                      "_handle_task": ("add", "approve", "deny", "modify"), "_handle_add_repo": ("",), "_handle_task_add": ("",)}
                         verb = sub
-                        if handler.__name__ == "_handle_pool" and verb in ("register", "invite", "remove", "trust", "import", "auto-approve"):
-                            row = svc._conn.execute("SELECT maintainer_key_id FROM pools WHERE pool_id=?", (resolved or "",)).fetchone()
+                        if ((handler.__name__ == "_handle_pool" and verb in ("register", "invite", "remove", "trust", "import", "auto-approve"))
+                                or (handler.__name__ == "_handle_task" and verb in ("add", "approve", "deny", "modify"))
+                                or handler.__name__ in ("_handle_add_repo", "_handle_task_add")):
+                            # Resolve pool for maintainer comparison.
+                            _mp = resolved
+                            if _mp is None and handler.__name__ in ("_handle_add_repo", "_handle_task_add"):
+                                try:
+                                    _mp = svc._resolve_pool(opts.get("pool") or opts.get("pool_id") or "", source=source)
+                                except Exception:
+                                    _mp = None
+                            row = svc._conn.execute("SELECT maintainer_key_id FROM pools WHERE pool_id=?", (_mp or "",)).fetchone()
                             if row is not None and row[0] != key:
                                 return _result({"ok": False, "error_code": "unauthorized",
-                                                "error": f"not authorized for pool {resolved or ''} — ask the maintainer"})
+                                                "error": f"not authorized for pool {_mp or ''} — ask the maintainer"})
             except Exception:
                 pass  # Freeze guard is best-effort; handler still runs.
         return handler(ctx, raw, source=source, session_id=session_id,

@@ -22,7 +22,7 @@ def test_remote_add_ticket_returns_packet_and_maintainer_mints():
     c=memdb(); create_pool(c,"pool-1","Team","agent:maint")
     proposer_sk=SigningKey.generate()
     svc=PoolService(c, caller_key_id="agent:alice", caller_signing_key=proposer_sk)
-    svc.register_remote_peer("pool-remote","agent:maint",agent_key_id="agent:alice",trust_state="verified")
+    svc.pool_trust("pool-remote","agent:maint", proposer_sk.verify_key.encode().hex())
     out=svc.add_ticket("pool-remote","r1","Remote task")
     assert out["kind"]=="ticket_proposal" and out["proposal"]["payload"]["title"]=="Remote task"
     assert verify_proposal(proposer_sk.verify_key, out["proposal"]) is True

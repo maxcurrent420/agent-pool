@@ -244,13 +244,6 @@ class PoolService:
             return False
         return key in wrapped
 
-    def register_remote_peer(self, pool_id, maintainer_key_id, agent_key_id=None, trust_state="verified"):
-        agent = agent_key_id or self._caller_key_id or "agent:unknown"
-        return L.upsert_peer(self._conn, pool_id, agent, maintainer_key_id, trust_state=trust_state)
-
-    def confirm_peer(self, pool_id, agent_key_id):
-        raise ValueError("peer confirm removed: use /pool trust to pin a trust anchor")
-
     def pool_trust(self, pool_id, maintainer_key_id, verify_key_hex, agent_key_id="anchor"):
         if not pool_id or not maintainer_key_id or not verify_key_hex:
             raise ValueError("/pool trust needs <pool_id> <maintainer_key_id> --verify-key <hex>")
@@ -282,11 +275,14 @@ class PoolService:
             raise ValueError(
                 "import requires --verify-key <hex> (maintainer verification key) "
                 "or an existing pinned anchor (/pool trust)")
+        if verify_keys and existing is None and not maintainer_key_id:
+            raise ValueError(
+                "import requires --maintainer <key_id> (no pinned anchor: "
+                "the verify key must bind to an operator-named maintainer, not the manifest's self-declared signer)")
         ok, reason = C.verify_chain(list(manifests or []), verify_keys)
         if not ok:
             raise ValueError(f"import rejected: {reason}")
-        maintainer = maintainer_key_id or (manifests[0].get("signer_key_id") if manifests else "")
-        agent = self._caller_key_id or "agent:unknown"
+        maintainer = maintainer_key_id or existing["maintainer_key_id"]
         # Determine the verify key hex from verify_keys (first value).
         vk_hex = ""
         for vk in verify_keys.values():
@@ -295,7 +291,7 @@ class PoolService:
                 break
             except Exception:
                 continue
-        L.upsert_peer(self._conn, pool_id, agent, maintainer, trust_state="pinned", verify_pubkey_hex=vk_hex)
+        L.upsert_peer(self._conn, pool_id, "anchor", maintainer, trust_state="pinned", verify_pubkey_hex=vk_hex)
         for m in manifests or []:
             L.upsert_remote_repo(self._conn, m["repo_id"], pool_id, remote_repo_id=m["repo_id"])
             L.import_version(self._conn, m, C.manifest_hash(m), pool_id=pool_id)
@@ -435,7 +431,19 @@ class PoolService:
         if not maintainer:
             raise ValueError("register needs a maintainer key_id")
         L.create_pool(self._conn, pool_id, name, maintainer, relay_url=relay_url)
-        L.add_member(self._conn, pool_id, maintainer, role="maintainer")
+        # Record the maintainer's box pubkey so submit wraps the DEK for the
+        # maintainer too (fixes "maintainer has no wrapped DEK" at audit).
+        _irow = self._conn.execute(
+            "SELECT box_pubkey_hex, verify_key_hex FROM identities WHERE key_id=?", (maintainer,)).fetchone()
+        _box = _irow[0] if _irow else ""
+        _vhex = _irow[1] if _irow else ""
+        if not _box and self._caller_box_sk is not None and maintainer == self._caller_key_id:
+            try:
+                _box = self._caller_box_sk.public_key.encode().hex()
+            except Exception:
+                _box = ""
+        L.add_member(self._conn, pool_id, maintainer, role="maintainer", box_pubkey_hex=_box or "",
+                     verify_pubkey_hex=_vhex or "")
         L.record_event(self._conn, pool_id, "pool_registered",
                        {"pool_id": pool_id, "maintainer": maintainer})
         # Record chat binding from source (D2/D4).
@@ -1148,13 +1156,14 @@ class PoolService:
         for the local caller (never persisted here)."""
         members = {}
         for row in self._conn.execute(
-                "SELECT m.key_id, m.role, i.verify_key_hex, m.box_pubkey_hex"
+                "SELECT m.key_id, m.role, i.verify_key_hex, m.box_pubkey_hex,"
+                " i.box_pubkey_hex, m.verify_pubkey_hex"
                 " FROM members m LEFT JOIN identities i ON i.key_id = m.key_id"
                 " WHERE m.pool_id=?", (pool_id,)):
             box_sk = self._caller_box_sk if row[0] == self._caller_key_id else None
             members[row[0]] = Member(key_id=row[0], role=row[1] or "member",
-                                     verify_key_hex=row[2] or "",
-                                     box_pubkey_hex=row[3] or "", box_sk=box_sk)
+                                     verify_key_hex=row[5] or row[2] or "",
+                                     box_pubkey_hex=row[3] or row[4] or "", box_sk=box_sk)
         if self._caller_key_id and self._caller_key_id not in members:
             members[self._caller_key_id] = Member(
                 key_id=self._caller_key_id, role="member",

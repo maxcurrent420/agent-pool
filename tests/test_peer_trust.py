@@ -14,7 +14,7 @@ def test_can_access_remote_but_not_local_owned():
     c=memdb(); create_pool(c,"pool-1","Team","agent:maint")
     sk=SigningKey.generate()
     svc=PoolService(c, caller_key_id="agent:alice", caller_signing_key=sk)
-    svc.register_remote_peer("pool-remote","agent:maint",agent_key_id="agent:alice",trust_state="verified")
+    svc.pool_trust("pool-remote","agent:maint", sk.verify_key.encode().hex())
     assert svc._can_access("pool-remote") is True
     with pytest.raises(PoolNotLocalError):
         svc._assert_local_owned("pool-remote")
@@ -24,7 +24,7 @@ def test_can_access_remote_but_not_local_owned():
     # Use sk as maint signer
     svc2=PoolService(c, caller_key_id="agent:alice", caller_signing_key=SigningKey.generate())
     # Rebuild with correct signer mapping: verify_keys keyed by signer_key_id
-    svc.register_remote_peer("pool-remote","agent:maint",agent_key_id="agent:alice",trust_state="verified")
+    svc.pool_trust("pool-remote","agent:maint", sk.verify_key.encode().hex())
     assert svc._can_access("pool-remote") is True
     # list_tickets on remote returns imported (empty) without raising
     assert svc.list_tickets(pool_id="pool-remote")==[]
