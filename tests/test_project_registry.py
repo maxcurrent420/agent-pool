@@ -18,8 +18,8 @@ from nacl.encoding import RawEncoder
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ledger import (set_auto_approve,ClaimRefused, add_member, create_pool, create_ticket,
-                    get_repo, init_ledger, list_repos, set_global_frozen)
+from ledger import (ClaimRefused, add_member, create_pool, create_ticket,
+                    get_repo, init_ledger, set_global_frozen)
 from tickets import PoolService, PoolNotLocalError
 from transport import FakeTransport
 from identity import ensure_identity
@@ -49,7 +49,6 @@ def _world(tmp_path):
     maint = ensure_identity(tmp_path / "m")
     member = ensure_identity(tmp_path / "a")
     create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
-    set_auto_approve(conn, "pool-1", True)
     for ident, role in ((maint, "maintainer"), (member, "member")):
         conn.execute(
             "INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, created_at)"
@@ -115,12 +114,17 @@ def test_add_repo_requires_path(tmp_path):
         svc.add_repo("pool-1", "demo", "")
 
 
-def test_add_repo_contributor_lands_pending(tmp_path):
-    _conn, _maint, _member, _svc1, member_svc = _world(tmp_path)
+def test_add_repo_contributor_refused(tmp_path):
+    """Phase 2: submit is maintainer-only — a member's add_repo is refused
+    (PermissionError) and writes no repo_versions / manifest_chain rows."""
+    conn, _maint, _member, _svc1, member_svc = _world(tmp_path)
     src = _git_repo(tmp_path / "src")
-    out = member_svc.add_repo("pool-1", "demo", str(src))
-    assert out["state"] == "pending" and out["version"] == 1
-    assert "awaiting maintainer accept" in out["notice"]
+    with pytest.raises(PermissionError):
+        member_svc.add_repo("pool-1", "demo", str(src))
+    assert conn.execute(
+        "SELECT COUNT(*) FROM repo_versions WHERE repo_id='demo'").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM manifest_chain WHERE repo_id='demo'").fetchone()[0] == 0
 
 
 def test_add_repo_accepted_version_in_chain(tmp_path):
@@ -163,29 +167,15 @@ def test_pool_list_marks_repo_without_bytes(tmp_path):
 
 
 def test_pool_list_excludes_pools_the_caller_is_not_authorized_for(tmp_path):
-    """2109 model: a gateway lists the HOSTED pools the caller is
-    authorized for. A hosted pool the caller has no whitelist row for is
-    not listed and is refused when named explicitly."""
+    """Phase 1 one-pool model: a second hosted pool is refused, and a
+    foreign pool id is refused naming the hosted pool."""
     conn, _maint, _member, svc, _svc2 = _world(tmp_path)
-    # A second hosted pool owned by somebody else (it has a whitelist).
     other = ensure_identity(tmp_path / "o")
-    create_pool(conn, "pool-2", "Other", other.key_id, relay_url="off",
-                owner_discord_user_id="other-owner")
-    set_auto_approve(conn, "pool-2", True)
-    conn.execute("INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex,"
-                 " created_at) VALUES (?,?,?,0)",
-                 (other.key_id, other.verify_key.encode(RawEncoder).hex(),
-                  other.box_pk.encode(RawEncoder).hex()))
-    add_member(conn, "pool-2", other.key_id, role="maintainer",
-               box_pubkey_hex=other.box_pk.encode(RawEncoder).hex())
-    conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
-                 " VALUES ('secret','pool-2','Secret',0)")
-    conn.commit()
-    # The caller is not authorized for pool-2 -> not listed.
-    projects = svc.list_projects()
-    assert [p["repo_id"] for p in projects] == []
-    # Naming it explicitly is refused (authorized-only read verb).
-    with pytest.raises(PermissionError):
+    with pytest.raises(ValueError, match="one pool per gateway"):
+        create_pool(conn, "pool-2", "Other", other.key_id, relay_url="off",
+                    owner_discord_user_id="other-owner")
+    # Naming a foreign pool explicitly is refused (pool_not_local).
+    with pytest.raises(PoolNotLocalError):
         svc.list_projects("pool-2", source={"user_id": "somebody-else"})
 
 
@@ -202,15 +192,10 @@ def test_task_list_repo_filter_and_cross_pool_refusal(tmp_path):
     svc.add_ticket("pool-1", "other", "Other task")
     rows = svc.list_tickets(repo_id="demo")
     assert [t["title"] for t in rows] == ["Demo task"]
-    other = ensure_identity(tmp_path / "o")
-    create_pool(conn, "pool-2", "Other", other.key_id, relay_url="off")
-    set_auto_approve(conn, "pool-2", True)
-    conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
-                 " VALUES ('far','pool-2','Far',0)")
-    conn.commit()
-    create_ticket(conn, "t-far", "pool-2", "far", "Far task")
+    # Phase 1: a foreign pool id is refused (pool_not_local), even with a
+    # repo filter; an unknown repo is a clean error.
     with pytest.raises(PoolNotLocalError):
-        svc.list_tickets(pool_id="pool-1", repo_id="far")
+        svc.list_tickets(pool_id="pool-foreign", repo_id="demo")
     with pytest.raises(ValueError, match="unknown repo"):
         svc.list_tickets(repo_id="nope")
 
@@ -353,8 +338,8 @@ def test_register_wires_new_commands():
     plugin = _load_plugin()
     ctx = _FakeCtx()
     plugin.register(ctx)
-    assert {"pool", "task", "claim", "release", "work", "integrate",
-            "audit", "add-repo", "task_add", "task_list"} == set(ctx.commands)
+    assert {"pool", "fetch", "task", "claim", "release", "audit",
+            "add-repo", "task_add", "task_list"} == set(ctx.commands)
 
 
 def test_handler_smoke_new_surface(tmp_path):
@@ -400,12 +385,17 @@ def test_handler_smoke_new_surface(tmp_path):
 
 
 def test_claim_after_add_flow_fetch(tmp_path):
-    """add-repo -> task_add -> claim -> start_work fetch succeeds (FakeTransport)."""
-    conn, _maint, _member, maint_svc, member_svc = _world(tmp_path)
+    """add-repo -> task_add -> claim -> fetch_repo returns the accepted v1
+    signed manifest (Phase 2 fetch surface; FakeTransport)."""
+    conn, maint, _member, maint_svc, member_svc = _world(tmp_path)
     src = _git_repo(tmp_path / "src")
     maint_svc.add_repo("pool-1", "demo", str(src))
     ticket = maint_svc.add_ticket("pool-1", "demo", "Add hello")
     member_svc.claim(ticket["ticket_id"])  # whole-ticket claim
-    # Fetch path used by start_work works with the accepted v1 manifest.
-    manifests = list_repos(conn, "pool-1")
-    assert manifests[0]["accepted_version"] == 1
+    # Fetch path: latest accepted signed manifest for the repo.
+    out = maint_svc.fetch_repo("demo")
+    assert out["ok"] and out["repo_id"] == "demo"
+    assert out["transfer_ticket"]  # transfer ticket present
+    manifest = json.loads(out["manifest_json"])
+    assert manifest["version"] == 1
+    assert manifest["signer_key_id"] == maint.key_id

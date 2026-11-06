@@ -17,7 +17,7 @@ from nacl.signing import SigningKey
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ledger import (create_pool, init_ledger, set_auto_approve)
+from ledger import (create_pool, init_ledger)
 from tickets import PoolService
 from transport import FakeTransport
 from identity import ensure_identity
@@ -50,9 +50,7 @@ def world(tmp_path):
                       caller_box_sk=maint.box_sk)
     # The owner registers (whitelist row written at register).
     svc.register_pool("pool-1", "Team", discord_user_id=OWNER)
-    # Owner turns auto-approve on so the live-scenario tickets mint open
-    # (default is off -> pending, covered by its own tests).
-    svc.set_auto_approve("pool-1", True, source=src(OWNER))
+    # Phase 1: tickets always mint open (no auto-approve toggle).
     # ... and invites the friend.
     svc.invite("pool-1", friend.key_id, role="member",
                box_pubkey_hex=friend.box_pk.encode(RawEncoder).hex(),
@@ -100,16 +98,12 @@ def test_non_invitee_refused_on_every_verb(tmp_path):
 
 def test_authorized_non_owner_refused_on_owner_verbs(tmp_path):
     conn, svc, friend_svc, maint, friend = world(tmp_path)
-    # Owner turns auto-approve OFF so this ticket mints pending (the
-    # live-scenario world enables it; the pending default is pinned here).
-    svc.set_auto_approve("pool-1", False, source=src(OWNER))
-    ticket = svc.add_ticket("pool-1", "demo", "Pending", source=src(OWNER))
-    assert ticket["state"] == "pending"
+    # Phase 1: the owner-only mint is refused to non-owners; tickets mint open.
+    ticket = svc.add_ticket("pool-1", "demo", "Work", source=src(OWNER))
+    assert ticket["state"] == "open"
     for call in (
-        lambda: friend_svc.set_auto_approve("pool-1", True, source=src(FRIEND)),
         lambda: friend_svc.freeze("pool-1", True, source=src(FRIEND)),
         lambda: friend_svc.remove_member("pool-1", maint.key_id, source=src(FRIEND)),
-        lambda: friend_svc.approve_ticket(ticket["ticket_id"], "approve", source=src(FRIEND)),
         lambda: friend_svc.invite("pool-1", "agent:new",
                                   discord_user_id="new-1", source=src(FRIEND)),
     ):
@@ -119,13 +113,11 @@ def test_authorized_non_owner_refused_on_owner_verbs(tmp_path):
 
 def test_owner_passes_everywhere(tmp_path):
     conn, svc, friend_svc, maint, friend = world(tmp_path)
-    # Owner toggles auto-approve both ways.
-    assert svc.set_auto_approve("pool-1", False, source=src(OWNER))["auto_approve"] is False
-    ticket = svc.add_ticket("pool-1", "demo", "Pending", source=src(OWNER))
-    assert ticket["state"] == "pending"
-    assert svc.set_auto_approve("pool-1", True, source=src(OWNER))["auto_approve"] is True
-    # Owner decides on the pending ticket.
-    assert svc.approve_ticket(ticket["ticket_id"], "approve", source=src(OWNER))["ticket_state"] == "open"
+    # Phase 1: tickets mint open; the approval surface is deleted.
+    assert not hasattr(svc, "set_auto_approve")
+    assert not hasattr(svc, "approve_ticket")
+    ticket = svc.add_ticket("pool-1", "demo", "Work", source=src(OWNER))
+    assert ticket["state"] == "open"
     # Owner freezes and unfreezes.
     assert svc.freeze("pool-1", True, source=src(OWNER))["frozen"] is True
     assert svc.freeze("pool-1", False, source=src(OWNER))["frozen"] is False

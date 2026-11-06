@@ -1,5 +1,6 @@
 """Phase 2 propagation tests: submit/audit/accept/fetch + ACL."""
 import json
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -7,7 +8,6 @@ from pathlib import Path
 
 import pytest
 from nacl.encoding import RawEncoder
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from crypto import (blake3_hash, build_manifest, generate_signing_key,
@@ -82,6 +82,42 @@ def world(tmp_path):
     }
 
 
+def _manual_pending_manifest(world):
+    """Build a signed pending manifest for contributor's repo, as if from /push repo.
+
+    submit() is maintainer-only now, so pending submissions are built manually:
+    pack -> hash -> encrypt with fresh DEK -> wrap DEK per member -> transport
+    send -> build_manifest(state=pending) -> sign with contributor key.
+    """
+    from nacl.public import PublicKey
+
+    bundle = pack_bundle(world["src"])
+    content_hash = blake3_hash(bundle)
+    dek = secrets.token_bytes(32)
+    ciphertext = encrypt_bundle(bundle, dek)
+    wrapped_keys = {}
+    for member_id, member in world["prop"]._members.items():
+        if not member.box_pubkey_hex:
+            continue
+        pk = PublicKey(bytes.fromhex(member.box_pubkey_hex), encoder=RawEncoder)
+        wrapped_keys[member_id] = wrap_dek(pk, dek).hex()
+    cipher_file = world["tmp"] / "pending-cipher.enc"
+    cipher_file.write_bytes(ciphertext)
+    sent = world["transport"].send(cipher_file)
+    ticket = sent["ticket"]
+    body = build_manifest(
+        repo_id="demo", version=1,
+        signer_key_id=world["contrib_id"],
+        submitter_key_id=world["contrib_id"],
+        state="pending",
+        wrapped_keys=wrapped_keys,
+        transfer_ticket=ticket,
+        content_hash=content_hash,
+        size_bytes=len(bundle),
+    )
+    return sign_manifest(world["identities"]["a-contrib"].signing_key, body)
+
+
 def test_pack_hash_encrypt_manifest(world):
     bundle = pack_bundle(world["src"])
     assert bundle and len(bundle) > 100
@@ -108,25 +144,38 @@ def test_maintainer_self_accept(world):
     assert res["manifest"]["state"] == "accepted"
 
 
+def test_contributor_submit_refused(world):
+    """Contributor submit is maintainer-only; nothing is persisted."""
+    with pytest.raises(PermissionError, match="maintainer-only"):
+        world["prop"].submit(
+            repo_path=world["src"], repo_id="demo", version=1,
+            submitter=world["members"][world["contrib_id"]],
+            submitter_signing_key=world["identities"]["a-contrib"].signing_key)
+    assert world["conn"].execute("SELECT COUNT(*) FROM repo_versions").fetchone()[0] == 0
+    assert world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0] == 0
+
+
 def test_contributor_pending_audit_accept_chain(world):
-    res = world["prop"].submit(
-        repo_path=world["src"], repo_id="demo", version=1,
-        submitter=world["members"][world["contrib_id"]],
-        submitter_signing_key=world["identities"]["a-contrib"].signing_key)
-    assert res["state"] == "pending"
+    # Contributor submit is now maintainer-only; pending manifests come from /push repo.
+    with pytest.raises(PermissionError, match="maintainer-only"):
+        world["prop"].submit(
+            repo_path=world["src"], repo_id="demo", version=1,
+            submitter=world["members"][world["contrib_id"]],
+            submitter_signing_key=world["identities"]["a-contrib"].signing_key)
+    # Build the pending manifest manually (push-repo path).
+    manifest = _manual_pending_manifest(world)
+    assert manifest["state"] == "pending"
     # chain NOT appended for pending submissions
     assert world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0] == 0
-    states = world["conn"].execute("SELECT state FROM repo_versions").fetchall()
-    assert states == [("pending",)]
 
     aud = world["prop"].audit(
-        manifest=res["manifest"], maintainer=world["members"][world["maint_id"]])
+        manifest=manifest, maintainer=world["members"][world["maint_id"]])
     assert aud["report"]["verdict"] == "clean"
     assert "bwrap" in aud["report"]["sandbox"] or "fallback" in aud["report"]["sandbox"]
     assert aud["report_hash"] == blake3_hash(json.dumps(aud["report"], sort_keys=True).encode())
 
     acc = world["prop"].accept(
-        manifest=res["manifest"], report_hash=aud["report_hash"],
+        manifest=manifest, report_hash=aud["report_hash"],
         maintainer=world["members"][world["maint_id"]],
         maintainer_signing_key=world["identities"]["m-maint"].signing_key)
     assert acc["manifest"]["state"] == "accepted"
@@ -144,16 +193,11 @@ def test_contributor_pending_audit_accept_chain(world):
 def test_fetch_happy_path_maintainer_and_member(world):
     res = world["prop"].submit(
         repo_path=world["src"], repo_id="demo", version=1,
-        submitter=world["members"][world["contrib_id"]],
-        submitter_signing_key=world["identities"]["a-contrib"].signing_key)
-    aud = world["prop"].audit(manifest=res["manifest"],
-                               maintainer=world["members"][world["maint_id"]])
-    acc = world["prop"].accept(manifest=res["manifest"], report_hash=aud["report_hash"],
-                                maintainer=world["members"][world["maint_id"]],
-                                maintainer_signing_key=world["identities"]["m-maint"].signing_key)
+        submitter=world["members"][world["maint_id"]],
+        submitter_signing_key=world["identities"]["m-maint"].signing_key)
     transfer_id = res["transfer_id"]
     assert world["transport"].provider_alive(transfer_id) is True  # alive until fetch done
-    out = world["prop"].fetch(manifest=acc["manifest"],
+    out = world["prop"].fetch(manifest=res["manifest"],
                                fetcher=world["members"][world["member_id"]],
                                dest=world["tmp"] / "fetch-b")
     assert Path(out["clone_dir"], "hello.txt").read_text() == "hello agent pool\n"
@@ -178,13 +222,8 @@ def test_acl_fetch_without_wrapped_key_refused(world):
     from crypto import generate_box_keypair
     res = world["prop"].submit(
         repo_path=world["src"], repo_id="demo", version=1,
-        submitter=world["members"][world["contrib_id"]],
-        submitter_signing_key=world["identities"]["a-contrib"].signing_key)
-    aud = world["prop"].audit(manifest=res["manifest"],
-                               maintainer=world["members"][world["maint_id"]])
-    acc = world["prop"].accept(manifest=res["manifest"], report_hash=aud["report_hash"],
-                                maintainer=world["members"][world["maint_id"]],
-                                maintainer_signing_key=world["identities"]["m-maint"].signing_key)
+        submitter=world["members"][world["maint_id"]],
+        submitter_signing_key=world["identities"]["m-maint"].signing_key)
     # Outsider is not a member and has no wrapped_keys entry.
     outsider = Member(
         key_id=world["outsider_id"],
@@ -194,7 +233,7 @@ def test_acl_fetch_without_wrapped_key_refused(world):
     # Temporarily add outsider to members so only the wrapped-keys check blocks them.
     world["prop"]._members[world["outsider_id"]] = outsider
     with pytest.raises(PermissionError, match="wrapped DEK"):
-        world["prop"].fetch(manifest=acc["manifest"], fetcher=outsider,
+        world["prop"].fetch(manifest=res["manifest"], fetcher=outsider,
                              dest=world["tmp"] / "evil")
 
 
@@ -220,12 +259,9 @@ def test_contributor_signature_not_accepted(world):
 
 
 def test_rejection_leaves_chain_unchanged(world):
-    res = world["prop"].submit(
-        repo_path=world["src"], repo_id="demo", version=1,
-        submitter=world["members"][world["contrib_id"]],
-        submitter_signing_key=world["identities"]["a-contrib"].signing_key)
+    manifest = _manual_pending_manifest(world)
     before = world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0]
-    rej = world["prop"].reject(manifest=res["manifest"], reason="needs tests", maintainer=world["members"][world["maint_id"]])
+    rej = world["prop"].reject(manifest=manifest, reason="needs tests", maintainer=world["members"][world["maint_id"]])
     assert "rejected" in rej["notice"]
     after = world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0]
     assert before == after == 0

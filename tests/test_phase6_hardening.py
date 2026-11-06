@@ -1,19 +1,25 @@
 """Phase 6 hardening test matrix (>=20 named scenarios).
 
 Named scenarios (plan minimum + Phase 6 gaps):
-  01 unsigned manifest rejected            14 button bridge: maintainer approve
-  02 unapproved member fetch refused      15 button bridge: non-maintainer refused
-  03 double-claim                         16 button bridge: hook ignores non-button
-  04 overlap                              17 global freeze blocks claim (2 pools)
-  05 budget kill                          18 global freeze blocks work/integrate
-  06 chain tamper detected                19 global freeze blocks pool mutation
-  07 revocation (forward separation)      20 global freeze unfreezes cleanly
-  08 conflict bounce                      21 legacy accept DEK rotation + unwrap
-  09 gateway-abstraction: full loop fake  22 legacy accept excludes removed member
-  10 sender-offline: retry then success   23 propagator fetch retry (flaky sender)
-  11 sender-offline: bounded failure      24 coordination payload size guard
-  12 300MB repo (scaled fixture, labelled)25 frozen pool blocks integrate/resolve
-  13 budget tracker hard kill (process)
+  01 unsigned manifest rejected            17 global freeze blocks claim (2 pools)
+  02 unapproved member fetch refused      18 global freeze blocks complete [re-gated]
+  03 double-claim                         19 global freeze blocks pool mutation
+  04 overlap                              20 global freeze unfreezes cleanly
+  06 chain tamper detected                21 legacy accept DEK rotation + unwrap [re-gated]
+  07 revocation (forward separation)      22 legacy accept excludes removed member [re-gated]
+  09 gateway-abstraction: full loop fake  23 propagator fetch retry (flaky sender)
+  10 sender-offline: retry then success   24 coordination payload size guard
+  11 sender-offline: bounded failure      25 frozen pool blocks complete [re-gated]
+  12 300MB repo (scaled fixture, labelled)
+
+Phase 2 / WO-013 removals (P6 will fully re-gate this file later):
+  05 budget kill, 13 budget tracker hard kill — execution.py/BudgetTracker deleted.
+  08 conflict bounce — integration gate (integrate/resolve) deleted.
+  14/15/16 button bridge — bridge.py/buttons.py no longer wired.
+Re-gated notes: submit() is now maintainer-only, so contributor-submission
+scenarios were rebuilt around maintainer submit + claim/complete, and the
+legacy accept() DEK-rotation scenarios (21/22) now drive accept() on a
+submitted manifest instead of a pending contributor submission.
 
 The 300MB scenario is exercised in pytest at scaled size (30MB bundle
 over FakeTransport, full submit->fetch->clone path) and at real 300MB
@@ -22,6 +28,8 @@ for the measured run). Nothing here claims 300MB crossed Iroh in pytest.
 """
 import json
 import os
+import secrets
+import tempfile
 import sqlite3
 import subprocess
 import sys
@@ -32,13 +40,11 @@ from nacl.encoding import RawEncoder
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from bridge import (dispatch_button_event, make_platform_event_handler,
-                    parse_button_event)
-from crypto import blake3_hash, manifest_hash, unwrap_dek, verify_chain
-from execution import BudgetExhausted, BudgetTracker
-from ledger import (set_auto_approve,ClaimRefused, add_member, create_pool, get_ticket,
+from crypto import (blake3_hash, build_manifest, manifest_hash, sign_manifest,
+                    unwrap_dek, verify_chain, wrap_dek)
+from ledger import (ClaimRefused, add_member, create_pool, get_ticket,
                     init_ledger, is_global_frozen)
-from propagation import _verify_key
+from propagation import _verify_key, encrypt_bundle, pack_bundle
 from tickets import PoolService
 from transport import (FakeTransport, TransportBackend, TransportUnavailable,
                        fetch_with_retry)
@@ -67,7 +73,6 @@ class _World:
         self.member = ensure_identity(self.tmp / "b")
         self.extra = ensure_identity(self.tmp / "x")
         create_pool(self.conn, "pool-1", "Team", self.maint.key_id, relay_url="off")
-        set_auto_approve(self.conn, "pool-1", True)
         self.conn.execute(
             "INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo','pool-1','Demo',0)")
         for ident, role in ((self.maint, "maintainer"), (self.contrib, "member"),
@@ -100,7 +105,6 @@ class _World:
         (self.src / "hello.txt").write_text("v1\n")
         _git("-C", str(self.src), "add", ".")
         assert _git("-C", str(self.src), "commit", "-q", "-m", "v1").returncode == 0
-        self.work_dir = self.tmp / "gate"
         prop = self.maint_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
         result = prop.submit(repo_path=self.src, repo_id="demo", version=1,
                              submitter=prop._members[self.maint.key_id],
@@ -112,23 +116,6 @@ class _World:
     def make_ticket(self, title="Work", repo="demo"):
         return self.maint_svc.add_ticket("pool-1", repo, title, brief="Scope: hello.txt")
 
-    def contributor_branch(self, ticket_id, filename, text):
-        dest = self.tmp / f"contrib-{ticket_id}"
-        assert _git("clone", "--quiet", str(self.src), str(dest)).returncode == 0
-        _git("-C", str(dest), "config", "user.email", "t@t.t")
-        _git("-C", str(dest), "config", "user.name", "T")
-        assert _git("-C", str(dest), "checkout", "-q", "-b", f"ticket/{ticket_id}").returncode == 0
-        (dest / filename).write_text(text)
-        _git("-C", str(dest), "add", ".")
-        assert _git("-C", str(dest), "commit", "-q", "-m", "contrib change").returncode == 0
-        return dest
-
-    def submit_contrib(self, ticket_id, text="v2\n", version=2):
-        self.contrib_svc.claim(ticket_id, declared_paths=["hello.txt"])
-        branch = self.contributor_branch(ticket_id, "hello.txt", text)
-        return self.contrib_svc.work_submit(ticket_id, branch, version)
-
-
 @pytest.fixture
 def world(tmp_path):
     return _World(tmp_path)
@@ -137,6 +124,42 @@ def world(tmp_path):
 def _dek(world, manifest, ident):
     wrapped = manifest["wrapped_keys"][ident.key_id]
     return unwrap_dek(ident.box_sk, bytes.fromhex(wrapped))
+
+
+def _pending_manifest(world, prop, submitter, signing_key, version=2):
+    """Hand-built pending contributor manifest (the pending branch of the
+    deleted submit() path, Phase 2 re-gate): pack/encrypt/send/sign, stored
+    in repo_versions as 'pending' but NOT appended to the chain. Returns
+    {"manifest": signed, "transfer_id": ...} like the old submit result."""
+    plaintext = pack_bundle(Path(world.src))
+    content_hash = blake3_hash(plaintext)
+    dek = secrets.token_bytes(32)
+    ciphertext = encrypt_bundle(plaintext, dek)
+    wrapped_keys = {}
+    for member_id, member in prop._members.items():
+        if not member.box_pubkey_hex:
+            continue
+        from nacl.public import PublicKey
+        pk = PublicKey(bytes.fromhex(member.box_pubkey_hex), encoder=RawEncoder)
+        wrapped_keys[member_id] = wrap_dek(pk, dek).hex()
+    with tempfile.TemporaryDirectory(prefix="agentpool-pending-") as tmp:
+        cipher_file = Path(tmp) / "bundle.enc"
+        cipher_file.write_bytes(ciphertext)
+        sent = prop._transport.send(cipher_file)
+    body = build_manifest(
+        repo_id="demo", version=version, content_hash=content_hash,
+        size_bytes=len(plaintext), signer_key_id=submitter.key_id,
+        submitter_key_id=submitter.key_id, wrapped_keys=wrapped_keys,
+        transfer_ticket=sent["ticket"],
+        prev_manifest_hash=prop._last_chain_hash("demo"), state="pending")
+    signed = sign_manifest(signing_key, body)
+    world.conn.execute(
+        "INSERT INTO repo_versions (repo_id, version, manifest_json,"
+        " manifest_hash, state) VALUES (?,?,?,?, 'pending')",
+        ("demo", version, json.dumps(signed), manifest_hash(signed)))
+    world.conn.commit()
+    return {"manifest": signed, "transfer_id": sent["transfer_id"],
+            "state": "pending"}
 
 
 # 01 -----------------------------------------------------------------------
@@ -186,16 +209,6 @@ def test_04_overlap(world):
         world.member_svc.claim(t2["ticket_id"], declared_paths=["hello.txt"])
 
 
-# 05 -----------------------------------------------------------------------
-def test_05_budget_kill(world):
-    """Turn budget exhaustion -> blocked report, claim released, re-armable."""
-    tracker = BudgetTracker({"max_turns": 1})
-    tracker.check({"turns": 1, "tokens": 0, "wall_clock_seconds": 0})
-    with pytest.raises(BudgetExhausted) as exc:
-        tracker.check({"turns": 2, "tokens": 0, "wall_clock_seconds": 0})
-    assert "turn budget" in exc.value.reason
-
-
 # 06 -----------------------------------------------------------------------
 def test_06_chain_tamper_detected(world):
     chain = [json.loads(r[0]) for r in world.conn.execute(
@@ -211,52 +224,47 @@ def test_06_chain_tamper_detected(world):
 
 # 07 -----------------------------------------------------------------------
 def test_07_revocation_forward_separation(world):
-    """Removed member keeps the old version's key but gets none on new ones."""
+    """Removed member keeps the old version's key but gets none on new ones.
+
+    Phase 2 re-gate: submit() is maintainer-only and the integrate/resolve
+    gate is deleted, so the new version is a maintainer submit after removal."""
     assert world.extra.key_id in world.v1["wrapped_keys"]
     world.maint_svc.remove_member("pool-1", world.extra.key_id)
-    ticket = world.make_ticket("Post-revoke")
-    world.submit_contrib(ticket["ticket_id"])
-    world.maint_svc.integrate(ticket["ticket_id"], work_dir=world.work_dir)
-    world.maint_svc.resolve_integration(ticket["ticket_id"], "approve",
-                                        work_dir=world.work_dir)
+    prop = world.maint_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
+    assert world.extra.key_id not in prop._members
+    res = prop.submit(repo_path=world.src, repo_id="demo", version=2,
+                      submitter=prop._members[world.maint.key_id],
+                      submitter_signing_key=world.maint.signing_key)
+    assert res["state"] == "accepted"
     from ledger import get_latest_accepted_manifest
     new = get_latest_accepted_manifest(world.conn, "demo")
     assert world.extra.key_id not in new["wrapped_keys"]
     assert world.extra.key_id in world.v1["wrapped_keys"]
 
 
-# 08 -----------------------------------------------------------------------
-def test_08_conflict_bounce(world):
-    ticket = world.make_ticket("Conflict")
-    world.submit_contrib(ticket["ticket_id"], text="contrib-line\n")
-    world.maint_svc.integrate(ticket["ticket_id"], work_dir=world.work_dir)
-    canon = world.work_dir / "canonical-demo"
-    (canon / "hello.txt").write_text("maint-line\n")
-    _git("-C", str(canon), "add", ".")
-    assert _git("-C", str(canon), "commit", "-q", "-m", "advance").returncode == 0
-    resolved = world.maint_svc.resolve_integration(
-        ticket["ticket_id"], "approve", work_dir=world.work_dir)
-    assert resolved["conflict"] is True and resolved["merged"] is False
-    assert get_ticket(world.conn, ticket["ticket_id"])["state"] == "blocked"
-
-
 # 09 -----------------------------------------------------------------------
 def test_09_gateway_abstraction_full_loop_fake(world):
-    """The ENTIRE flow (register->ticket->claim->submit->gate->approve->audit)
-    runs end-to-end (formerly exercised through the deleted FakeGatewayAdapter;
-    now asserted via returned result dicts) and no coordination payload
-    exceeds the 4KB guard (no repo bytes on gateway)."""
+    """Full flow (ticket->claim->complete->submit->audit) runs end-to-end
+    (Phase 2: the integrate/resolve gate is deleted, so completion is via
+    complete()) and no coordination payload exceeds the 4KB guard
+    (no repo bytes on gateway)."""
     ticket = world.make_ticket("Full loop")
     tid = ticket["ticket_id"]
-    world.submit_contrib(tid)
-    gate = world.maint_svc.integrate(tid, work_dir=world.work_dir)
-    assert gate["verdict"] == "clean" and gate["buttons_posted"] is True
-    resolved = world.maint_svc.resolve_integration(tid, "approve", work_dir=world.work_dir)
-    assert resolved["merged"] is True
+    world.contrib_svc.claim(tid, declared_paths=["hello.txt"])
+    done = world.contrib_svc.complete(tid)
+    assert done["state"] == "completed"
+    prop = world.maint_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
+    res = prop.submit(repo_path=world.src, repo_id="demo", version=2,
+                      submitter=prop._members[world.maint.key_id],
+                      submitter_signing_key=world.maint.signing_key)
+    assert res["state"] == "accepted"
+    aud = prop.audit(manifest=res["manifest"],
+                     maintainer=prop._members[world.maint.key_id])
+    assert aud["report"]["verdict"] == "clean"
     shown = world.maint_svc.audit_show(ticket_id=tid)
     assert shown["verdict"] == "clean"
     # Gateway-native: notices are returned strings, not adapter calls.
-    assert gate["notice"]
+    assert done["notice"]
     for n in world.maint_svc.peek_notices() or []:
         assert len(n.encode()) <= 4096
 
@@ -343,120 +351,13 @@ def test_12_large_repo_scaled_fixture(world):
     assert blake3_hash(fetched) == blake3_hash((big / "data.bin").read_bytes())
 
 
-# 13 -----------------------------------------------------------------------
-def test_13_budget_tracker_hard_kill_dimensions():
-    import time
-    tracker = BudgetTracker({"max_turns": 3, "token_cap": 100,
-                             "wall_clock_seconds": 10})
-    tracker.check({"turns": 3, "tokens": 100})
-    for usage, word in (({"turns": 4}, "turn"), ({"tokens": 101}, "token")):
-        with pytest.raises(BudgetExhausted) as exc:
-            tracker.check(usage)
-        assert word in str(exc.value)
-    # Wall-clock dimension: backdate the start (usage() measures elapsed).
-    old = BudgetTracker({"wall_clock_seconds": 10})
-    old.started_at = time.time() - 11
-    with pytest.raises(BudgetExhausted) as exc:
-        old.check({})
-    assert "wall-clock" in str(exc.value)
-
-
-# 14 -----------------------------------------------------------------------
-def _whitelist(world):
-    """Give pool-1 a whitelist: 'discord-maint' owns it, 'discord-contrib'
-    is an authorized user (matches the 2109 production model, where every
-    pool has an owner)."""
-    from ledger import authorize_user
-    world.conn.execute(
-        "UPDATE pools SET owner_discord_user_id='discord-maint'"
-        " WHERE pool_id='pool-1'")
-    for uid in ("discord-maint", "discord-contrib"):
-        authorize_user(world.conn, "pool-1", uid)
-    world.conn.commit()
-    return {"user_id": "discord-maint"}, {"user_id": "discord-contrib"}
-
-
-def test_14_button_bridge_maintainer_approve(world):
-    owner, contrib = _whitelist(world)
-    ticket = world.maint_svc.add_ticket("pool-1", "demo", "Bridge approve",
-                                        brief="Scope: hello.txt", source=owner)
-    tid = ticket["ticket_id"]
-    world.contrib_svc.claim(tid, declared_paths=["hello.txt"], source=contrib)
-    branch = world.contributor_branch(tid, "hello.txt", "v2\n")
-    world.contrib_svc.work_submit(tid, branch, 2, source=contrib)
-    world.maint_svc.integrate(tid, work_dir=world.work_dir, source=owner)
-    result = dispatch_button_event(
-        world.maint_svc, "discord", "button",
-        {"custom_id": f"approve:{tid}", "user_id": "discord-maint"},
-        identity_map={"discord-maint": world.maint.key_id},
-        work_dir=world.work_dir)
-    assert result["dispatched"] is True and result["merged"] is True
-    assert result["via"] == "button_bridge"
-    assert get_ticket(world.conn, tid)["state"] == "merged"
-
-
-# 15 -----------------------------------------------------------------------
-def test_15_button_bridge_non_maintainer_refused(world):
-    owner, contrib = _whitelist(world)
-    ticket = world.maint_svc.add_ticket("pool-1", "demo", "Bridge refuse",
-                                        brief="Scope: hello.txt", source=owner)
-    tid = ticket["ticket_id"]
-    world.contrib_svc.claim(tid, declared_paths=["hello.txt"], source=contrib)
-    branch = world.contributor_branch(tid, "hello.txt", "v2\n")
-    world.contrib_svc.work_submit(tid, branch, 2, source=contrib)
-    world.maint_svc.integrate(tid, work_dir=world.work_dir, source=owner)
-    # An authorized non-owner is refused by the button gate.
-    with pytest.raises(PermissionError):
-        dispatch_button_event(
-            world.maint_svc, "discord", "button",
-            {"custom_id": f"approve:{tid}", "user_id": "discord-contrib"},
-            identity_map={"discord-contrib": world.contrib.key_id},
-            work_dir=world.work_dir)
-    # An intruder with no whitelist row is refused too (fail closed).
-    with pytest.raises(PermissionError):
-        dispatch_button_event(
-            world.maint_svc, "discord", "button",
-            {"custom_id": f"approve:{tid}", "user_id": "discord-intruder"},
-            identity_map={"discord-intruder": world.member.key_id},
-            work_dir=world.work_dir)
-    assert get_ticket(world.conn, tid)["state"] == "review"  # untouched
-    # Unresolvable author is refused too (fail closed).
-    with pytest.raises(PermissionError):
-        dispatch_button_event(
-            world.maint_svc, "discord", "button",
-            {"custom_id": f"approve:{tid}", "user_id": "unknown-user"},
-            identity_map={}, work_dir=world.work_dir)
-
-
-# 16 -----------------------------------------------------------------------
-def test_16_button_bridge_parse_and_hook_ignore(world):
-    assert parse_button_event({"custom_id": "approve:t-abc123"}) == \
-        {"decision": "approve", "ticket_id": "t-abc123"}
-    assert parse_button_event({"text": "see approve:t-abc123 please"}) == \
-        {"decision": "approve", "ticket_id": "t-abc123"}
-    assert parse_button_event("discard:t-xyz") == \
-        {"decision": "discard", "ticket_id": "t-xyz"}
-    # Every currently-normalized gateway_platform_event parses to None.
-    for payload in ({"chat_id": "1", "message_id": "2", "emojis": ["👍"]},
-                    {"chat_id": "1", "message_id": "2", "text": "edited"},
-                    {"thread_id": "9", "name": "t"}, None, 42, "hello"):
-        assert parse_button_event(payload) is None
-    # The hook handler is observer-only: never raises, returns None.
-    handler = make_platform_event_handler(lambda: world.maint_svc)
-    assert handler("discord", "message_edited",
-                   {"chat_id": "1", "text": "edited"}) is None
-    assert handler("discord", "reaction", {"emojis": []}) is None
-
-
 # 17 -----------------------------------------------------------------------
 def test_17_global_freeze_blocks_claim_across_pools(world):
-    create_pool(world.conn, "pool-2", "Other", world.maint.key_id)
-    set_auto_approve(world.conn, "pool-2", True)
-    world.conn.execute(
-        "INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo2','pool-2','Demo2',0)")
-    world.conn.commit()
+    # Phase 1: one pool per gateway — a second hosted pool is refused.
+    with pytest.raises(ValueError, match="one pool per gateway"):
+        create_pool(world.conn, "pool-2", "Other", world.maint.key_id)
     t1 = world.make_ticket("Pool one")
-    t2 = world.maint_svc.add_ticket("pool-2", "demo2", "Pool two")
+    t2 = world.make_ticket("Pool one again")
     world.maint_svc.freeze_global(True)
     assert is_global_frozen(world.conn) is True
     with pytest.raises(ClaimRefused, match="pool frozen"):
@@ -467,17 +368,18 @@ def test_17_global_freeze_blocks_claim_across_pools(world):
 
 # 18 -----------------------------------------------------------------------
 def test_18_global_freeze_blocks_work_and_integrate(world):
+    """Phase 2 re-gate: work_submit/integrate/resolve are deleted; the
+    frozen pool now blocks claim and complete."""
     ticket = world.make_ticket("Frozen work")
     tid = ticket["ticket_id"]
     world.contrib_svc.claim(tid, declared_paths=["hello.txt"])
-    branch = world.contributor_branch(tid, "hello.txt", "v2\n")
+    other = world.make_ticket("Frozen other")
     world.maint_svc.freeze_global(True)
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.contrib_svc.work_submit(tid, branch, 2)
+        world.contrib_svc.claim(other["ticket_id"], declared_paths=["hello.txt"])
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.maint_svc.integrate(tid, work_dir=world.work_dir)
-    with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.maint_svc.resolve_integration(tid, "approve", work_dir=world.work_dir)
+        world.contrib_svc.complete(tid)
+    assert get_ticket(world.conn, tid)["state"] == "claimed"  # untouched
 
 
 # 19 -----------------------------------------------------------------------
@@ -506,12 +408,12 @@ def test_20_global_freeze_unfreezes_cleanly(world):
 
 # 21 -----------------------------------------------------------------------
 def test_21_legacy_accept_rotates_dek(world):
-    """Phase 6 gap 1a: RepoPropagator.accept() must rotate the DEK."""
+    """Phase 6 gap 1a, Phase 2 re-gate: RepoPropagator.accept() must rotate
+    the DEK. submit() is now maintainer-only, so the pending contributor
+    manifest is hand-built by _pending_manifest() (deleted submit path)."""
     prop = world.maint_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
-    # Fresh contributor submission (pending), then maintainer accept.
-    res = prop.submit(repo_path=world.src, repo_id="demo", version=2,
-                      submitter=prop._members[world.contrib.key_id],
-                      submitter_signing_key=world.contrib.signing_key)
+    res = _pending_manifest(world, prop, prop._members[world.contrib.key_id],
+                            world.contrib.signing_key)
     assert res["state"] == "pending"
     pending_dek = _dek(world, res["manifest"], world.member)
     aud = prop.audit(manifest=res["manifest"],
@@ -535,11 +437,12 @@ def test_21_legacy_accept_rotates_dek(world):
 # 22 -----------------------------------------------------------------------
 def test_22_legacy_accept_excludes_removed_member(world):
     """A member removed before acceptance gets no wrapped key on the
-    accepted manifest, even though the pending one wrapped for them."""
+    accepted manifest, even though the submitted one wrapped for them.
+    Phase 2 re-gate: pending manifest hand-built (see test_21)."""
     prop = world.maint_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
-    res = prop.submit(repo_path=world.src, repo_id="demo", version=2,
-                      submitter=prop._members[world.contrib.key_id],
-                      submitter_signing_key=world.contrib.signing_key)
+    res = _pending_manifest(world, prop, prop._members[world.contrib.key_id],
+                            world.contrib.signing_key)
+    assert res["state"] == "pending"
     assert world.extra.key_id in res["manifest"]["wrapped_keys"]
     world.maint_svc.remove_member("pool-1", world.extra.key_id)
     # Rebuild the propagator AFTER removal (members come from the registry).
@@ -592,12 +495,14 @@ def test_24_coordination_payload_size_guard(world):
 
 # 25 -----------------------------------------------------------------------
 def test_25_per_pool_freeze_blocks_integrate(world):
+    """Phase 2 re-gate: integrate() is deleted; a per-pool freeze now
+    blocks complete() (complete() checks frozen)."""
     ticket = world.make_ticket("Per-pool freeze")
     tid = ticket["ticket_id"]
-    world.submit_contrib(tid)
+    world.contrib_svc.claim(tid, declared_paths=["hello.txt"])
     world.maint_svc.freeze("pool-1", True)
     with pytest.raises(ClaimRefused, match="frozen"):
-        world.maint_svc.integrate(tid, work_dir=world.work_dir)
+        world.contrib_svc.complete(tid)
     world.maint_svc.freeze("pool-1", False)
-    gate = world.maint_svc.integrate(tid, work_dir=world.work_dir)
-    assert gate["verdict"] == "clean"
+    done = world.contrib_svc.complete(tid)
+    assert done["state"] == "completed"

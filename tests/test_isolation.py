@@ -36,24 +36,19 @@ def test_pool_not_local_refusal(tmp_path):
 
 
 def test_chat_binding_resolution_order(tmp_path):
-    # 2109 P2: no chat binding. Explicit --pool or the single hosted pool;
-    # foreign pools are refused naming hosted pools.
+    # Phase 1: one pool per gateway. Explicit --pool or the single hosted
+    # pool; foreign pools are refused naming hosted pools; a second
+    # hosted pool is refused.
     conn, svc, maint = _setup(tmp_path)
-    create_pool(conn, "pool-2", "Two", maint.key_id)
-    conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('r2','pool-2','R2',0)")
-    add_member(conn, "pool-2", maint.key_id, role="maintainer", box_pubkey_hex=maint.box_pk.encode(RawEncoder).hex())
-    conn.commit()
+    with pytest.raises(ValueError, match="one pool per gateway"):
+        create_pool(conn, "pool-2", "Two", maint.key_id)
     assert svc._resolve_pool("pool-1", source={"chat_id": "c1"}) == "pool-1"
-    assert svc._resolve_pool("pool-2", source={"chat_id": "c1"}) == "pool-2"
-    # single-pool fallback
+    # single-pool fallback (no --pool)
     conn2, svc2, _ = _setup(tmp_path)
     assert svc2._resolve_pool(None, source={"chat_id": "unknown"}) == "pool-1"
     # foreign pool refused naming hosted
     with pytest.raises(PoolNotLocalError, match="is not hosted by this gateway"):
         svc._resolve_pool("pool-foreign", source=None)
-    # no pool bound + multiple pools -> refusal
-    with pytest.raises(PoolNotLocalError, match="no pool bound"):
-        svc._resolve_pool(None, source={"chat_id": "unknown2"})
 
 
 def test_profile_data_dir_isolation(tmp_path, monkeypatch):

@@ -2,7 +2,7 @@ import sqlite3, sys, json
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ledger import (init_ledger, create_pool, add_member, bind_discord_user,
-                    set_auto_approve, list_members, authorize_user, is_owner,
+                    list_members, authorize_user, is_owner,
                     is_authorized)
 from tickets import PoolService
 from nacl.signing import SigningKey, VerifyKey
@@ -75,17 +75,24 @@ def test_F3_remote_write_refused_and_fetch_is_the_read_path():
     svc=PoolService(c, caller_key_id="agent:alice", caller_signing_key=SigningKey.generate())
     with pytest.raises(PoolNotLocalError):
         svc._resolve_pool("pool-remote")
-    # /pool fetch answers only for hosted pools, naming its hosts.
+    # /fetch repo answers only for hosted pools, naming its hosts.
     with pytest.raises(PoolNotLocalError) as exc:
-        svc.pool_fetch("r1", pool_id="pool-remote")
+        svc.fetch_repo("r1", pool_id="pool-remote")
     assert "not hosted by this gateway" in str(exc.value)
     assert "pool-1" in str(exc.value)
 
 def test_F4_dead_peer_code_removed():
     assert not hasattr(PoolService, "register_remote_peer")
     assert not hasattr(PoolService, "confirm_peer")
-    # 2109 Phase 2: the whole remote-view surface is gone from the ledger.
     import ledger as _L
+    # Phase 1: the proposal/approval surface is deleted.
+    for gone in ("propose", "accept_proposal", "approve_ticket", "resolve_pending",
+                 "list_pending", "set_auto_approve", "_packet_hash"):
+        assert not hasattr(PoolService, gone), gone
+    for gone in ("get_pending_manifest", "get_auto_approve", "set_auto_approve",
+                 "get_remote_repo", "upsert_remote_repo"):
+        assert not hasattr(_L, gone), gone
+    # 2109 Phase 2: the whole remote-view surface is gone from the ledger.
     for gone in ("upsert_peer", "get_peer", "list_peers", "set_peer_trust",
                  "get_trust_anchor", "list_trust_anchors", "pin_trust_anchor",
                  "revoke_trust_anchor", "import_version", "import_ticket",

@@ -106,36 +106,6 @@ def verify_chain(signed_manifests, verify_keys) -> tuple:
     return True, "ok"
 
 
-def build_proposal(kind: str, payload: dict, proposer_key_id: str,
-                   signing_key: SigningKey) -> dict:
-    body = {
-        "type": "proposal",
-        "kind": kind,
-        "payload": dict(payload or {}),
-        "proposer_key_id": proposer_key_id,
-        "signer_key_id": proposer_key_id,
-        "prev_manifest_hash": None,
-    }
-    return sign_manifest(signing_key, body)
-
-
-def verify_proposal(verify_key: VerifyKey, packet: dict) -> bool:
-    if not isinstance(packet, dict) or packet.get("type") != "proposal":
-        return False
-    return verify_manifest(verify_key, packet)
-
-
-def proposal_packet_string(packet: dict) -> str:
-    return json.dumps(packet, sort_keys=True, separators=(",", ":"))
-
-
-def parse_proposal(text: str) -> dict:
-    data = json.loads(text)
-    if not isinstance(data, dict) or data.get("type") != "proposal":
-        raise ValueError("not a proposal packet")
-    return data
-
-
 def build_manifest(*, repo_id: str, version: int, content_hash: str,
                    size_bytes: int, signer_key_id: str, submitter_key_id: str,
                    wrapped_keys=None, transfer_ticket: str = "",

@@ -285,14 +285,19 @@ class RepoPropagator:
                submitter: Member, submitter_signing_key) -> dict:
         """Pack -> hash -> encrypt -> Iroh-send -> manifest.
 
-        Maintainer submissions self-accept (appended + posted). Contributor
-        submissions are recorded as pending review (NOT chained) and posted
-        as a review notice.
+        Maintainer-only (Phase 2 / WO-013): maintainers submit repo bytes
+        as new accepted versions (self-accept: appended + posted).
+        Contributors push via ``/push repo`` (Phase 4) — a non-maintainer
+        submit is refused here.
         """
         if not self._is_member(submitter.key_id):
             raise PermissionError(f"submit refused: {submitter.key_id!r} is not a pool member")
         if submitter.key_id not in self._members:
             raise PermissionError(f"submit refused: {submitter.key_id!r} not in pool")
+        if submitter.key_id != self._maintainer_key_id:
+            raise PermissionError(
+                f"submit is maintainer-only: {submitter.key_id!r} is not the "
+                f"maintainer; contributors push via /push repo")
 
         plaintext = pack_bundle(Path(repo_path))
         content_hash = blake3_hash(plaintext)
@@ -314,45 +319,31 @@ class RepoPropagator:
             transfer_id = sent["transfer_id"]
 
         is_maintainer = submitter.key_id == self._maintainer_key_id
-        state = "accepted" if is_maintainer else "pending"
+        assert is_maintainer  # non-maintainers refused above (Phase 2)
         body = build_manifest(
             repo_id=repo_id, version=version, content_hash=content_hash,
             size_bytes=len(plaintext),
             signer_key_id=submitter.key_id, submitter_key_id=submitter.key_id,
             wrapped_keys=wrapped_keys, transfer_ticket=ticket,
             prev_manifest_hash=self._last_chain_hash(repo_id),
-            state=state,
+            state="accepted",
         )
         signed = sign_manifest(submitter_signing_key, body)
         m_hash = manifest_hash(signed)
 
-        if is_maintainer:
-            append_manifest(self._conn, repo_id, signed, m_hash)
-            _manifest_emit = self._emit("post_manifest", {"manifest": signed})
-            _notice_emit = self._emit("post_notice", {
-                "text": f"latest accepted: {repo_id} v{version} ({m_hash[:12]})",
-                "kind": "latest_accepted",
-            })
-            record_event(self._conn, self._pool_id, "self_accepted",
-                         {"repo_id": repo_id, "version": version, "hash": m_hash})
-        else:
-            self._conn.execute(
-                "INSERT INTO repo_versions (repo_id, version, manifest_json, manifest_hash, state)"
-                " VALUES (?,?,?,?,?)",
-                (repo_id, version, json.dumps(signed), m_hash, "pending"))
-            self._conn.commit()
-            _notice_emit = self._emit("post_notice", {
-                "text": f"review requested: {repo_id} v{version} by {submitter.key_id}",
-                "kind": "review_request",
-            })
-            _manifest_emit = {}
-            record_event(self._conn, self._pool_id, "submitted_pending",
-                         {"repo_id": repo_id, "version": version, "hash": m_hash})
+        append_manifest(self._conn, repo_id, signed, m_hash)
+        _manifest_emit = self._emit("post_manifest", {"manifest": signed})
+        _notice_emit = self._emit("post_notice", {
+            "text": f"latest accepted: {repo_id} v{version} ({m_hash[:12]})",
+            "kind": "latest_accepted",
+        })
+        record_event(self._conn, self._pool_id, "self_accepted",
+                     {"repo_id": repo_id, "version": version, "hash": m_hash})
 
         return {**self._transport_info(),
                 "manifest": signed, "manifest_hash": m_hash,
                 "transfer_id": transfer_id, "content_hash": content_hash,
-                "state": state, "notice": _notice_emit.get("notice", "")}
+                "state": "accepted", "notice": _notice_emit.get("notice", "")}
 
     # -- audit + accept/reject ----------------------------------------------
 
@@ -487,8 +478,9 @@ class RepoPropagator:
               verify_chain: bool = True) -> dict:
         """Verify chain -> ACL -> Iroh-fetch -> decrypt -> BLAKE3 -> git clone.
 
-        ``verify_chain=False`` is the cross-gateway ``/work fetch`` case: the
-        manifest came from ``/pool fetch`` on the pool's own gateway and
+        ``verify_chain=False`` is the cross-gateway ``/fetch repo --manifest``
+        case: the manifest came from ``/fetch repo`` on the pool's own
+        gateway and
         there is no local chain to compare against. The chain check is
         defense-in-depth on that path — the **wrapped-key ACL is the
         authorization boundary** (only an invited agent's key can unwrap
@@ -543,7 +535,7 @@ class RepoPropagator:
         return {"clone_dir": str(clone_dir), "bundle_file": str(bundle_file),
                 "content_hash": manifest["content_hash"]}
 
-    # -- Phase 5: pending-branch fetch for the integration gate ---------------
+    # -- pending-branch fetch (integration gate input; Phase 4 removes with the gate) --
 
     def fetch_pending(self, *, manifest: dict, maintainer: Member, dest: Path) -> dict:
         """Fetch a PENDING contributor branch bundle (integration gate input).

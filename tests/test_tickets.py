@@ -1,5 +1,6 @@
 """Phase 3 tests: ledger claim rules, freeze, ticket lifecycle via the gateway,
-command-handler smoke tests, and the real Phase 2 flow behind /work submit."""
+command-handler smoke tests, and the Phase 2 flow (add -> claim -> fetch ->
+complete)."""
 import importlib.util
 import json
 import os
@@ -13,7 +14,7 @@ from nacl.encoding import RawEncoder
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ledger import (set_auto_approve,ClaimRefused, add_member, claim_ticket_enforced, create_pool,
+from ledger import (ClaimRefused, add_member, claim_ticket_enforced, create_pool,
                     create_ticket, get_ticket, init_ledger, is_frozen, list_members,
                     release_ticket, set_frozen, set_ticket_state)
 from tickets import PoolService
@@ -31,7 +32,6 @@ def _memdb():
 def conn():
     c = _memdb()
     create_pool(c, "pool-1", "Team", "agent:maint", relay_url="off")
-    set_auto_approve(c, "pool-1", True)
     c.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
               " VALUES ('demo','pool-1','Demo',0)")
     c.commit()
@@ -126,11 +126,18 @@ def test_freeze_blocks_claims(conn):
 
 def test_state_transitions(conn):
     create_ticket(conn, "t-1", "pool-1", "demo", "Lifecycle")
+    # Phase 1: only open->claimed->completed / claimed->open are legal.
     with pytest.raises(ValueError, match="not allowed"):
+        set_ticket_state(conn, "t-1", "completed")
+    with pytest.raises(ValueError, match="unknown ticket state"):
         set_ticket_state(conn, "t-1", "merged")
-    set_ticket_state(conn, "t-1", "blocked")
+    set_ticket_state(conn, "t-1", "claimed")
     set_ticket_state(conn, "t-1", "open")
-    assert get_ticket(conn, "t-1")["state"] == "open"
+    set_ticket_state(conn, "t-1", "claimed")
+    set_ticket_state(conn, "t-1", "completed")
+    assert get_ticket(conn, "t-1")["state"] == "completed"
+    with pytest.raises(ValueError, match="not allowed"):
+        set_ticket_state(conn, "t-1", "open")
 
 
 def test_member_roles_persist(conn):
@@ -163,16 +170,16 @@ def test_ticket_creation_thread_and_state_marker(conn, tmp_path):
     assert len(json.dumps(ticket).encode()) <= 4096
 
 
-def test_full_flow_claim_review_integrate_audit_show(tmp_path):
-    """add -> claim -> work submit (real submit) -> integrate (real audit) ->
-    audit show. Maintainer and contributor are distinct local identities."""
+def test_full_flow_claim_fetch_complete(tmp_path):
+    """add -> claim -> maintainer add_repo (accepted v1) -> fetch_repo
+    manifest -> complete -> task list drops it, repo list keeps it.
+    Maintainer and contributor are distinct local identities."""
     conn = _memdb()
     gateway = None
     transport = FakeTransport()
     maint = ensure_identity(tmp_path / "m")
     contrib = ensure_identity(tmp_path / "a")
     create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
-    set_auto_approve(conn, "pool-1", True)
     conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
                  " VALUES ('demo','pool-1','Demo',0)")
     for ident, role in ((maint, "maintainer"), (contrib, "member")):
@@ -188,7 +195,9 @@ def test_full_flow_claim_review_integrate_audit_show(tmp_path):
     work_svc = _service(conn, gateway, contrib, transport)
 
     ticket = maint_svc.add_ticket("pool-1", "demo", "Add hello", brief="Scope: hello.txt")
-    work_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"])
+    claimed = work_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"])
+    assert claimed["state"] == "active"
+    assert "start" not in claimed  # Phase 2: claim no longer returns a 'start' key
 
     src = tmp_path / "src"
     src.mkdir()
@@ -199,18 +208,27 @@ def test_full_flow_claim_review_integrate_audit_show(tmp_path):
     subprocess.run(["git", "-C", str(src), "add", "."], check=True)
     subprocess.run(["git", "-C", str(src), "commit", "-q", "-m", "v1"], check=True)
 
-    submitted = work_svc.work_submit(ticket["ticket_id"], src, 1)
-    assert submitted["state"] == "pending"
-    assert get_ticket(conn, ticket["ticket_id"])["state"] == "review"
-    assert get_ticket(conn, ticket["ticket_id"])["state"] == "review"
+    added = maint_svc.add_repo("pool-1", "demo", str(src))
+    assert added["ok"] and added["version"] == 1 and added["state"] == "accepted"
 
-    integrated = maint_svc.integrate(ticket["ticket_id"])
-    assert integrated["verdict"] == "clean"
-    assert get_ticket(conn, ticket["ticket_id"])["state"] == "review"
-    assert integrated["notice"]
+    fetched = work_svc.fetch_repo("demo")
+    assert fetched["ok"] and fetched["repo_id"] == "demo"
+    manifest = json.loads(fetched["manifest_json"])
+    assert manifest["repo_id"] == "demo" and manifest["version"] == 1
+    assert fetched["manifest_hash"] and "transfer_ticket" in fetched
 
-    shown = maint_svc.audit_show(ticket_id=ticket["ticket_id"])
-    assert shown["verdict"] == "clean" and shown["report"]["verdict"] == "clean"
+    completed = work_svc.complete(ticket["ticket_id"])
+    assert completed["state"] == "completed"
+    assert get_ticket(conn, ticket["ticket_id"])["state"] == "completed"
+
+    tasks = work_svc.fetch_task_list()
+    assert tasks["ok"]
+    assert ticket["ticket_id"] not in [t["ticket_id"] for t in tasks["tasks"]]
+
+    repos = work_svc.fetch_repo_list()
+    assert repos["ok"]
+    demo = [r for r in repos["repos"] if r["repo_id"] == "demo"]
+    assert demo and demo[0]["accepted_version"] == 1
 
 
 def test_freeze_via_service_blocks_claim_and_ticket(conn, tmp_path):
@@ -262,9 +280,8 @@ def test_register_wires_all_commands():
     plugin = _load_plugin()
     ctx = _FakeCtx()
     plugin.register(ctx)
-    assert set(ctx.commands) == {"pool", "task", "claim", "release", "work",
-                                 "integrate", "audit", "add-repo", "task_add",
-                                 "task_list"}
+    assert set(ctx.commands) == {"pool", "fetch", "task", "claim", "release",
+                                 "audit", "add-repo", "task_add", "task_list"}
     out = json.loads(ctx.tools["pool_status"]({}))
     assert out["ok"] is True and out["phase"] == 3
 
@@ -286,7 +303,7 @@ def test_command_handlers_smoke(tmp_path):
         out = json.loads(ctx.commands["pool"]("register pool-1 --name Team --discord-user owner-1"))
         assert out["ok"] and out["maintainer"] == ident.key_id
         out = json.loads(ctx.commands["pool"]("auto-approve on --pool pool-1", source=OWNER))
-        assert out["ok"] and out["auto_approve"] is True
+        assert out["ok"] is False  # deleted in Phase 1
         out = json.loads(ctx.commands["pool"](f"invite pool-1 agent:alice --role member --discord-user alice-1", source=OWNER))
         assert out["role"] == "member"
         out = json.loads(ctx.commands["pool"]("members pool-1", source=OWNER))
@@ -307,11 +324,21 @@ def test_command_handlers_smoke(tmp_path):
         assert json.loads(out["claim"]["budget_json"])["max_turns"] == 7
         out = json.loads(ctx.commands["release"](ticket_id, source=OWNER))
         assert out["ok"] and out["ticket_id"] == ticket_id and out["state"] == "open"
-        out = json.loads(ctx.commands["work"](
-            f"submit {ticket_id} --repo-path /nonexistent --version 1", source=OWNER))
-        assert out["ok"] is False  # not claimed -> clean error, no crash
-        out = json.loads(ctx.commands["integrate"](ticket_id, source=OWNER))
-        assert out["ok"] is False  # owner, but nothing to integrate yet
+        out = json.loads(ctx.commands["fetch"]("repo list", source=OWNER))
+        assert out["ok"] and out["pool_id"] == "pool-1"
+        assert [r["repo_id"] for r in out["repos"]] == ["demo"]
+        out = json.loads(ctx.commands["fetch"]("task list", source=OWNER))
+        assert out["ok"] and out["pool_id"] == "pool-1"
+        assert [t["ticket_id"] for t in out["tasks"]] == [ticket_id]
+        out = json.loads(ctx.commands["fetch"]("repo unknown-repo", source=OWNER))
+        assert out["ok"] is False  # no accepted version -> clean error, no crash
+        assert "no ACCEPTED version" in out["error"]
+        out = json.loads(ctx.commands["fetch"]("repo list",
+                                               source={"user_id": "stranger-1"}))
+        assert out["ok"] is False
+        assert (out.get("error_code") == "unauthorized"
+                or "unauthorized" in out.get("error", "")
+                or "not authorized" in out.get("error", ""))
         out = json.loads(ctx.commands["audit"](f"show {ticket_id}", source=OWNER))
         assert out["ok"] is False  # no audit yet -> clean error
         # Freeze is owner-only (2109): a non-owner is refused outright.

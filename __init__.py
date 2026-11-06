@@ -1,13 +1,16 @@
 """Agent Pool plugin — gateway-native: Hermes posts, plugin returns content.
 
-Slash commands: ``/pool register|invite|members|remove|freeze|list|fetch``,
+Slash commands: ``/pool register|invite|members|remove|freeze|list, status``,
 ``/task add|list|show`` (flat aliases ``/task_add`` / ``/task_list``),
 ``/add-repo`` (register a project + submit its bytes as a new version),
 ``/claim`` (paths optional — omit ``--paths`` for a whole-ticket claim;
 ``--any-project --max-tasks N`` takes up to N open tickets), ``/release``,
-``/work fetch`` (download a pool project from a fetched manifest),
-``/work submit``, ``/integrate``, ``/audit show``. Every handler returns a
-string Hermes posts; the plugin never posts to Discord itself.
+``/fetch repo list`` (projects + available tasks + gateway addressing),
+``/fetch task list`` (tasks with claimed status), ``/fetch repo <id>``
+(latest accepted signed manifest), ``/fetch repo --manifest <json>``
+(download + decrypt + clone on the contributor's own gateway),
+``/audit show``. Every handler returns a string Hermes posts; the plugin
+never posts to Discord itself.
 
 Authorization is the whitelisted Discord user id ONLY (owner or
 pool_authorized). Keys are crypto-only: an ed25519 signing key proves
@@ -242,14 +245,6 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
                              source=source,
                              discord_user_id=opts.get("discord_user", ""),
                              verify_pubkey_hex=opts.get("verify_key", ""))
-        elif sub == "auto-approve":
-            # `/pool auto-approve <on|off> [--pool <id>]` — owner-only.
-            pool_id = opts.get("pool", "") or opts.get("pool_id", "")
-            arg = (rest[0] if rest else opts.get("state", "") or "").strip().lower()
-            if arg not in ("on", "off", "true", "false"):
-                return _result({"ok": False, "error": "usage: /pool auto-approve <on|off> [--pool <id>]"})
-            resolved = svc._resolve_pool(pool_id or None, source=source)
-            out = svc.set_auto_approve(resolved, arg in ("on", "true"), source=source)
         elif sub == "members":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             out = {"ok": True, "pool_id": pool_id, "members": svc.members(pool_id, source=source)}
@@ -277,20 +272,12 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
                                   "submitter_key_id") if k in p}
                                 | ({"note": p["note"]} if "note" in p else {})
                                 for p in projects]}
-        elif sub == "fetch":
-            # `/pool fetch <repo_id> | --projects | --tasks [--pool <id>]`
-            # Hosted pool only. Returns artifacts for /work fetch.
-            repo_id = rest[0] if rest else opts.get("repo", "")
-            out = svc.pool_fetch(repo_id or None,
-                                 projects="projects" in flags or (not repo_id and "tasks" not in flags),
-                                 tasks="tasks" in flags, pool_id=opts.get("pool") or opts.get("pool_id") or None,
-                                 source=source)
         elif sub in ("import", "trust", "peer", "confirm"):
-            return _result({"ok": False, "error": "import/trust/peers removed: use /pool fetch (reads are fetch commands on the pool gateway)"})
+            return _result({"ok": False, "error": "import/trust/peers removed: use /fetch repo list / /fetch task list / /fetch repo (reads are fetch commands on the pool gateway)"})
         else:
             return _result({"ok": False,
                             "error": f"unknown /pool subcommand: {sub}",
-                            "usage": "/pool register|invite|members|remove|freeze|list|fetch|auto-approve"})
+                            "usage": "/pool register|invite|members|remove|freeze|list"})
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -304,23 +291,11 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
             return _result({"ok": False, "error": "usage: /task add|list|show"})
         sub, rest = pos[0], pos[1:]
         if sub == "add":
-            if opts.get("packet"):
-                try:
-                    # Whitelist model: the driving user is forwarded as source
-                    # (the wrapper is the gate; the service is defense-in-depth).
-                    ticket = svc.accept_proposal(opts["packet"], source=source)
-                except Exception as exc:
-                    return _result({"ok": False, "error": str(exc)})
-                out = {"ok": True, "ticket_id": ticket.get("ticket_id", ""), "state": ticket.get("state", ""), "via": "proposal"}
-            else:
-                ticket = svc.add_ticket(opts.get("pool_id", ""), opts.get("repo", ""),
-                                        opts.get("title", ""), brief=opts.get("brief", ""),
-                                        budget=_budget_from_opts(opts), source=source)
-                if ticket.get("proposal"):
-                    out = {"ok": True, "kind": ticket.get("kind"), "proposal": ticket.get("proposal"), "packet": ticket.get("packet"), "notice": ticket.get("notice")}
-                else:
-                    out = {"ok": True, "ticket_id": ticket["ticket_id"],
-                           "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
+            ticket = svc.add_ticket(opts.get("pool_id", ""), opts.get("repo", ""),
+                                    opts.get("title", ""), brief=opts.get("brief", ""),
+                                    budget=_budget_from_opts(opts), source=source)
+            out = {"ok": True, "ticket_id": ticket["ticket_id"],
+                   "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
         elif sub == "list":
             rows = svc.list_tickets(pool_id=opts.get("pool_id") or None,
                                     state=opts.get("state") or None,
@@ -330,28 +305,6 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
                 {"ticket_id": t["ticket_id"], "title": t["title"], "state": t["state"],
                  "repo_id": t["repo_id"], "claimant": t.get("claimant_key_id"),
                  "thread_ref": t.get("thread_ref")} for t in rows]}
-            # Maintainer approval queue (Phase 4): ask_choice Approve/Deny/Modify.
-            try:
-                if ctx is not None and getattr(ctx, "ask_choice", None) and callable(getattr(ctx, "ask_choice")):
-                    pid = opts.get("pool_id") or None
-                    if pid:
-                        try:
-                            resolved = svc._resolve_pool(pid, source=source)
-                        except Exception:
-                            resolved = pid
-                    else:
-                        resolved = None
-                    if resolved and svc._is_bound_maintainer(resolved, source=source):
-                        pending = [t for t in svc.list_pending(resolved) if t["ticket_id"] not in {r["ticket_id"] for r in rows}]
-                        for t in pending:
-                            choice = ctx.ask_choice(
-                                f"Pending ticket {t['ticket_id']}: {t['title']} — approve? "
-                                f"(choice is recorded; use /task approve|deny|modify to apply)",
-                                ["Approve", "Deny", "Modify"])
-                            out.setdefault("pending_decisions", []).append(
-                                {"ticket_id": t["ticket_id"], "choice": str(choice).strip()})
-            except Exception:
-                pass
         elif sub == "show":
             ticket_id = rest[0] if rest else opts.get("ticket", "")
             t = svc.show_ticket(ticket_id)
@@ -361,15 +314,9 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
                 "brief": t.get("brief", ""), "claimant": t.get("claimant_key_id"),
                 "budget": json.loads(t.get("budget_json") or "{}"),
                 "thread_ref": t.get("thread_ref")}}
-        elif sub in ("approve", "deny", "modify"):
-            ticket_id = rest[0] if rest else opts.get("ticket", "")
-            out = svc.approve_ticket(ticket_id, sub if sub != "deny" else "deny",
-                                     source=source,
-                                     edit_files={opts["edit_file"]: opts["edit_content"]} if opts.get("edit_file") and opts.get("edit_content") is not None else None,
-                                     reason=opts.get("reason", ""))
         else:
             return _result({"ok": False, "error": f"unknown /task subcommand: {sub}",
-                            "usage": "/task add|list|show|approve|deny|modify"})
+                            "usage": "/task add|list|show"})
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -394,12 +341,11 @@ def _handle_add_repo(ctx, raw: str, *, source=None, session_id="", session_key="
         pos, opts, _flags = _parse_args(raw)
         repo_id = pos[0] if pos else opts.get("repo", "")
         path = opts.get("path", "")
-        link = opts.get("link") or opts.get("repo_link") or ""
         if not repo_id and path:
             repo_id = _slugify_path(path)
         out = svc.add_repo(opts.get("pool", "") or opts.get("pool_id", ""),
                            repo_id, path,
-                           display_name=opts.get("name", ""), source=source, repo_link=link or None)
+                           display_name=opts.get("name", ""), source=source)
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -418,11 +364,8 @@ def _handle_task_add(ctx, raw: str, *, source=None, session_id="", session_key="
                                 opts["repo"], opts.get("title", ""),
                                 brief=opts.get("brief", ""),
                                 budget=_budget_from_opts(opts), source=source)
-        if ticket.get("proposal"):
-            out = {"ok": True, "kind": ticket.get("kind"), "proposal": ticket.get("proposal"), "packet": ticket.get("packet"), "notice": ticket.get("notice")}
-        else:
-            out = {"ok": True, "ticket_id": ticket["ticket_id"],
-                   "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
+        out = {"ok": True, "ticket_id": ticket["ticket_id"],
+               "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -465,22 +408,7 @@ def _handle_claim(ctx, raw: str, *, source=None, session_id="", session_key="", 
         claim = svc.claim(ticket_id, key_id=opts.get("as") or None,
                           declared_paths=paths, budget=_budget_from_opts(opts),
                           maintainer_override="override" in flags, source=source)
-        # Phase 4: on successful claim, start the worker (fetch accepted
-        # version over Iroh -> worktree -> worker session) when a lifecycle
-        # or work root is configured. Failure here never rolls back the claim.
         out = {"ok": True, "claim": claim}
-        try:
-            lifecycle = _lifecycle_for(ctx) if "_lifecycle_for" in globals() else None
-            work_root = _work_root_for(ctx) if "_work_root_for" in globals() else None
-            if lifecycle is not None or "start" in flags:
-                out["start"] = svc.start_work(ticket_id, work_root=work_root,
-                                              lifecycle=lifecycle,
-                                              worker_command=opts.get("worker_command", "").split() or None,
-                                              acceptance_cmd=opts.get("acceptance", "").split() or None)
-            else:
-                out["start"] = {"ok": False, "note": "not started: no Hermes lifecycle; use /work start <ticket> --worker-command ..."}
-        except Exception as exc:
-            out["start"] = {"ok": False, "error": str(exc)}
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -497,86 +425,39 @@ def _handle_release(ctx, raw: str, *, source=None, session_id="", session_key=""
         return _error(exc)
 
 
-def _handle_work(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
-    try:
-        pos, _opts, _flags = _parse_args(raw)
-    except ValueError as exc:
-        return _error(exc)
-    if pos and pos[0] == "fetch":
-        try:
-            svc = _service_for(ctx, source=source)
-            _pos, opts, _flags = _parse_args(raw)
-            manifest_raw = opts.get("manifest", "")
-            try:
-                manifest = json.loads(manifest_raw) if manifest_raw else {}
-            except Exception as exc:
-                return _result({"ok": False, "error": f"bad manifest JSON: {exc}"})
-            out = svc.work_fetch(manifest, dest=opts.get("dest", "/tmp/fetch"), source=source)
-            return _result(out, svc, source)
-        except Exception as exc:
-            return _error(exc)
-    if not pos or pos[0] != "submit":
-        if "_handle_work_exec" in globals():
-            return globals()["_handle_work_exec"](ctx, raw)
-        return _result({"ok": False, "error": "usage: /work submit <ticket> --repo-path PATH --version N"})
+def _handle_fetch(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
+    """``/fetch repo list`` / ``/fetch task list [--ticket <id>]`` /
+    ``/fetch repo <repo_id>`` / ``/fetch repo --manifest <json> [--dest DIR]``."""
     try:
         svc = _service_for(ctx, source=source)
         pos, opts, _flags = _parse_args(raw)
-        if not pos or pos[0] != "submit":
-            return _result({"ok": False, "error": "usage: /work submit <ticket> "
-                            "--repo-path PATH --version N"})
-        ticket_id = pos[1] if len(pos) > 1 else opts.get("ticket", "")
-        out = svc.work_submit(ticket_id, opts.get("repo_path", ""),
-                              opts.get("version", "1"), source=source)
+        if not pos:
+            return _result({"ok": False, "error": "usage: /fetch repo list | /fetch task list [--ticket <id>] | /fetch repo <repo_id> | /fetch repo --manifest <json>"})
+        kind = pos[0]
+        if kind == "repo":
+            if opts.get("manifest"):
+                try:
+                    manifest = json.loads(opts["manifest"])
+                except Exception as exc:
+                    return _result({"ok": False, "error": f"bad manifest JSON: {exc}"})
+                out = svc.fetch_repo_download(manifest, dest=opts.get("dest", "/tmp/fetch"), source=source)
+            elif len(pos) > 1 and pos[1] == "list":
+                out = svc.fetch_repo_list(pool_id=opts.get("pool") or opts.get("pool_id") or None, source=source)
+            else:
+                repo_id = pos[1] if len(pos) > 1 else opts.get("repo", "")
+                if not repo_id:
+                    return _result({"ok": False, "error": "usage: /fetch repo <repo_id> or /fetch repo list or /fetch repo --manifest <json>"})
+                out = svc.fetch_repo(repo_id, pool_id=opts.get("pool") or opts.get("pool_id") or None, source=source)
+        elif kind == "task":
+            sub = pos[1] if len(pos) > 1 else ""
+            if sub != "list":
+                return _result({"ok": False, "error": "usage: /fetch task list [--ticket <id>]"})
+            out = svc.fetch_task_list(pool_id=opts.get("pool") or opts.get("pool_id") or None,
+                                      source=source, ticket=opts.get("ticket") or None)
+        else:
+            return _result({"ok": False, "error": f"unknown /fetch subcommand: {kind}",
+                            "usage": "/fetch repo list | /fetch task list [--ticket <id>] | /fetch repo <repo_id> | /fetch repo --manifest <json>"})
         return _result(out, svc, source)
-    except Exception as exc:
-        return _error(exc)
-
-
-def _handle_integrate(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
-    try:
-        svc = _service_for(ctx, source=source)
-        pos, opts, _flags = _parse_args(raw)
-        if pos and pos[0] in ("approve", "edit", "discard"):
-            decision = pos[0]
-            ticket_id = pos[1] if len(pos) > 1 else opts.get("ticket", "")
-            edit_files = None
-            edit_patch = None
-            if opts.get("edit_file") and opts.get("edit_content") is not None:
-                edit_files = {opts["edit_file"]: opts["edit_content"]}
-            if opts.get("edit_patch_file"):
-                edit_patch = Path(opts["edit_patch_file"]).read_text()
-            out = svc.resolve_integration(
-                ticket_id, decision, work_dir=_work_root_for(ctx) / "integrate"
-                if "_work_root_for" in globals() else None,
-                edit_files=edit_files, edit_patch=edit_patch,
-                reason=opts.get("reason", ""), source=source)
-            return _result(out, svc, source)
-        # Gate path: run /integrate audit, then ask_choice instant fallback (D1c).
-        ticket_id = pos[0] if pos else opts.get("ticket", "")
-        gate = svc.integrate(
-            ticket_id, work_dir=_work_root_for(ctx) / "integrate"
-            if "_work_root_for" in globals() else None, source=source)
-        gate["queued_notices"] = svc.drain_notices() if svc else []
-        try:
-            ask = getattr(ctx, "ask_choice", None)
-            if callable(ask) and gate.get("verdict") == "clean":
-                question = (gate.get("button_prompt")
-                            or f"Integration review {ticket_id}: approve, edit, or discard?")
-                choice = ask(question, ["Approve", "Edit", "Discard"])
-                decision = {"Approve": "approve", "Edit": "edit",
-                            "Discard": "discard"}.get(str(choice).strip())
-                if decision:
-                    out = svc.resolve_integration(
-                        ticket_id, decision,
-                        work_dir=_work_root_for(ctx) / "integrate"
-                        if "_work_root_for" in globals() else None,
-                        reason=opts.get("reason", ""), source=source)
-                    out["via"] = "ask_choice"
-                    return _result(out, svc, source)
-        except Exception:
-            pass  # ask_choice is best-effort; return the gate result.
-        return _result(gate, svc, source)
     except Exception as exc:
         return _error(exc)
 
@@ -601,10 +482,12 @@ _POOL_STATUS_SCHEMA = {
 }
 
 _COMMANDS = (
-    ("pool", _handle_pool, "Agent Pool: register|invite|members|remove|freeze|list|fetch|auto-approve, status",
-     "register|invite|members|remove|freeze|list|fetch|auto-approve [options]"),
-    ("task", _handle_task, "Agent Pool tickets: add|list|show|approve|deny|modify",
-     "add|list|show|approve|deny|modify [options]"),
+    ("pool", _handle_pool, "Agent Pool: register|invite|members|remove|freeze|list, status",
+     "register|invite|members|remove|freeze|list [options]"),
+    ("fetch", _handle_fetch, "Fetch repo list (projects + available tasks + gateway addressing), task list (with claimed status), or one repo manifest / download form",
+     "repo list | task list [--ticket <id>] | repo <repo_id> | repo --manifest <json> [options]"),
+    ("task", _handle_task, "Agent Pool tickets: add|list|show",
+     "add|list|show [options]"),
     ("add-repo", _handle_add_repo, "Register a project and submit its repo bytes as a new version",
      "<repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]"),
     ("task_add", _handle_task_add, "Create a ticket for a registered project (alias of /task add)",
@@ -615,10 +498,6 @@ _COMMANDS = (
      "[ticket] [--paths <paths>] [--any-project --max-tasks N] [options]"),
     ("release", _handle_release, "Release a claimed ticket back to open",
      "[ticket]"),
-    ("work", _handle_work, "Submit finished work for a claimed ticket",
-     "submit|start|complete|cancel|progress|fetch [options]"),
-    ("integrate", _handle_integrate, "Owner: audit a submitted ticket",
-     "approve|edit|discard [ticket] [options]"),
     ("audit", _handle_audit, "Show the audit report for a ticket",
      "show [ticket]"),
 )
@@ -652,11 +531,7 @@ def _wrap_command(handler, ctx):
                 try:
                     if pool_id:
                         resolved = svc._resolve_pool(pool_id, source=source)
-                    elif handler.__name__ == "_handle_work":
-                        tid = pos[1] if len(pos) > 1 else opts.get("ticket", "")
-                        if tid:
-                            resolved = svc.show_ticket(tid)["pool_id"]
-                    elif handler.__name__ in ("_handle_claim", "_handle_release", "_handle_integrate", "_handle_audit"):
+                    elif handler.__name__ in ("_handle_claim", "_handle_release", "_handle_audit"):
                         tid = pos[0] if pos else opts.get("ticket", "")
                         if tid:
                             resolved = svc.show_ticket(tid)["pool_id"]
@@ -744,19 +619,14 @@ def _wrap_command(handler, ctx):
                                 return _result({"ok": False, "error_code": "unauthorized",
                                                 "error": f"not authorized for pool {resolved} — ask the maintainer"})
                             _owner_only = False
-                            if handler.__name__ == "_handle_pool" and sub in ("invite", "remove", "auto-approve", "register", "fetch"):
+                            if handler.__name__ == "_handle_pool" and sub in ("invite", "remove", "register"):
                                 # register has no resolved pool yet (creation);
                                 # treated as owner-only only when resolved.
-                                # fetch is authorized-only (reads), handled below.
                                 if sub != "register":
                                     _owner_only = True
-                                if sub == "fetch":
-                                    _owner_only = False
-                            elif handler.__name__ == "_handle_task" and sub in ("add", "approve", "deny", "modify"):
+                            elif handler.__name__ == "_handle_task" and sub in ("add",):
                                 _owner_only = True
                             elif handler.__name__ in ("_handle_add_repo", "_handle_task_add"):
-                                _owner_only = True
-                            elif handler.__name__ == "_handle_integrate":
                                 _owner_only = True
                             elif handler.__name__ == "_handle_pool" and sub in ("list", "members"):
                                 _owner_only = False
@@ -766,7 +636,7 @@ def _wrap_command(handler, ctx):
                         # user_id present but no resolvable pool: fail-closed
                         # for owner-only verbs, else let handler run (it will
                         # refuse pool resolution itself).
-                        elif handler.__name__ == "_handle_pool" and sub in ("invite", "remove", "auto-approve"):
+                        elif handler.__name__ == "_handle_pool" and sub in ("invite", "remove"):
                             return _result({"ok": False, "error_code": "unauthorized",
                                             "error": "not authorized — ask the maintainer"})
             except Exception:
@@ -791,104 +661,3 @@ def register(ctx):
                                  argument_mode="text")
         except Exception as exc:
             logger.warning("agent-pool: command %s registration failed: %s", name, exc)
-    # Discord button gate via register_platform_handler (spec §4a) + ask_choice
-    # fallback inside /integrate. Keep gateway_platform_event hook (neutral).
-    try:
-        from .buttons import make_discord_button_factory
-    except ImportError:
-        from buttons import make_discord_button_factory
-    try:
-        def _dispatch_to_service(decision, ticket_id, discord_user_id):
-            svc = _service_for(ctx)
-            try:
-                from . import ledger as _L
-            except ImportError:
-                import ledger as _L
-            # Whitelist: button click must be the pool owner (Discord id).
-            ticket = svc.show_ticket(ticket_id)
-            if not _L.is_owner(svc._conn, ticket["pool_id"], str(discord_user_id)):
-                raise PermissionError(
-                    "button click refused: only the pool owner may decide integration")
-            # Attribution only (OD1): the invite-bound key for the record.
-            attribution_key = _L.lookup_key_by_discord_user(
-                svc._conn, str(discord_user_id))
-            return svc.resolve_integration(
-                ticket_id, decision, source={"user_id": str(discord_user_id)},
-                key_id=attribution_key,
-                work_dir=_work_root_for(ctx) / "integrate")
-        try:
-            ctx.register_platform_handler("discord",
-                                          make_discord_button_factory(_dispatch_to_service))
-        except Exception as exc:
-            logger.warning("agent-pool: platform handler registration failed: %s", exc)
-    except Exception as exc:
-        logger.warning("agent-pool: button factory setup failed: %s", exc)
-    try:
-        try:
-            from .bridge import make_platform_event_handler
-        except ImportError:
-            from bridge import make_platform_event_handler
-        identity_map = {}
-        try:
-            if isinstance(getattr(ctx, "state", None), dict):
-                identity_map = ctx.state.get("agent_pool_identity_map", {}) or {}
-        except Exception:
-            identity_map = {}
-
-        def _button_hook(platform, event_type, payload, **kwargs):
-            # Work dir: same default the /integrate handler uses.
-            try:
-                work_dir = _work_root_for(ctx) / "integrate"
-            except Exception:
-                work_dir = None
-            handler = make_platform_event_handler(
-                lambda: _service_for(ctx), identity_map=identity_map,
-                work_dir=work_dir)
-            return handler(platform, event_type, payload, **kwargs)
-
-        ctx.register_hook("gateway_platform_event", _button_hook)
-    except Exception as exc:
-        logger.warning("agent-pool: button bridge hook registration failed: %s", exc)
-
-# --- Phase 4 execution wiring (appended handlers) ----------------------------
-
-def _work_root_for(ctx):
-    configured = _cfg(ctx, "work_root", "") if ctx else ""
-    if configured:
-        return Path(configured)
-    return Path.home() / ".hermes" / "plugin-data" / "agent-pool" / "work"
-
-def _lifecycle_for(ctx):
-    try:
-        return ctx.subagent_lifecycle if ctx is not None else None
-    except Exception:
-        return None
-
-def _handle_work_exec(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
-    """``/work start <ticket> --acceptance "cmd..."`` / ``/work complete <ticket>``
-    / ``/work cancel <ticket>`` / ``/work progress <ticket> <text>``."""
-    try:
-        svc = _service_for(ctx, source=source)
-        pos, opts, flags = _parse_args(raw)
-        if not pos:
-            return _result({"ok": False, "error": "usage: /work start|complete|cancel|progress <ticket> ..."})
-        sub, rest = pos[0], pos[1:]
-        ticket_id = rest[0] if rest else opts.get("ticket", "")
-        if sub == "start":
-            acceptance = opts.get("acceptance", "").split() or None
-            out = svc.start_work(ticket_id, work_root=_work_root_for(ctx),
-                                 lifecycle=_lifecycle_for(ctx),
-                                 worker_command=opts.get("worker_command", "").split() or None,
-                                 acceptance_cmd=acceptance)
-        elif sub == "complete":
-            out = svc.complete_work(ticket_id, timeout_seconds=int(opts.get("timeout", "0") or 0) or None)
-        elif sub == "cancel":
-            out = svc.cancel_work(ticket_id, reason=opts.get("reason", "cancelled by operator"))
-        elif sub == "progress":
-            text = " ".join(rest[1:]) or opts.get("text", "")
-            out = svc.report_progress(ticket_id, text)
-        else:
-            return _result({"ok": False, "error": f"unknown /work subcommand: {sub}"})
-        return _result(out, svc, source)
-    except Exception as exc:
-        return _error(exc)

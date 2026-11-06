@@ -66,15 +66,14 @@ def test_unmapped_discord_user_refused_via_wrap():
 def test_owner_passes_and_non_owner_refused_on_owner_verb():
     c=whitelisted(memdb(), extra=("friend-1",))
     svc=PoolService(c, caller_key_id="agent:maint", caller_signing_key=SigningKey.generate())
-    # Owner mints (auto-approve off by default -> the ticket starts pending).
+    # Owner mints (Phase 1: tickets always mint open).
     t=svc.add_ticket("pool-1","demo","Owner mint", source={"user_id":"owner-1"})
-    assert t["ticket_id"] and t["state"]=="pending"
+    assert t["ticket_id"] and t["state"]=="open"
     # Authorized non-owner is refused the owner-only mint (F1: the gateway
     # agent key is the pool maintainer and still does not grant access).
     with pytest.raises(PermissionError):
         svc.add_ticket("pool-1","demo","Friend mint", source={"user_id":"friend-1"})
-    # Same user on an authorized-level verb passes (owner approves first).
-    svc.approve_ticket(t["ticket_id"], "approve", source={"user_id":"owner-1"})
+    # Same user on an authorized-level verb passes (ticket is already open).
     svc2=PoolService(c, caller_key_id="agent:friend", caller_signing_key=SigningKey.generate())
     claim=svc2.claim(t["ticket_id"], source={"user_id":"friend-1"})
     assert claim["state"]=="active"

@@ -60,3 +60,67 @@ def test_events_recorded(conn):
     record_event(conn, "pool-1", "pool_created", {"pool_id": "pool-1"})
     kinds = [r[0] for r in conn.execute("SELECT kind FROM events")]
     assert kinds == ["pool_created"]
+
+
+def test_one_pool_per_gateway(conn):
+    with pytest.raises(ValueError, match="one pool per gateway"):
+        create_pool(conn, "pool-2", "Second", "agent:maintainer")
+
+
+def test_ticket_states_and_illegal_transitions(conn):
+    conn.row_factory = sqlite3.Row
+    from ledger import TICKET_STATES, _TRANSITIONS, set_ticket_state
+    assert TICKET_STATES == ("open", "claimed", "completed")
+    assert _TRANSITIONS == {"open": {"claimed"},
+                             "claimed": {"open", "completed"},
+                             "completed": set()}
+    create_ticket(conn, "t-1", "pool-1", "static-echo", "Lifecycle")
+    with pytest.raises(ValueError, match="unknown ticket state"):
+        create_ticket(conn, "t-2", "pool-1", "static-echo", "Bad", state="pending")
+    with pytest.raises(ValueError, match="not allowed"):
+        set_ticket_state(conn, "t-1", "completed")
+
+
+def test_pool_gateways_record(conn):
+    from ledger import list_gateways, record_gateway
+    assert list_gateways(conn) == []
+    record_gateway(conn, "pool-x", gateway_endpoint="gw:1", transport_addr="t:1", role="member")
+    rows = list_gateways(conn)
+    assert rows[0]["pool_id"] == "pool-x" and rows[0]["gateway_endpoint"] == "gw:1"
+    record_gateway(conn, "pool-x", role="contributor")
+    assert list_gateways(conn)[0]["role"] == "contributor"
+
+
+def test_state_migration_idempotent():
+    from ledger import get_ticket
+    c = init_ledger(sqlite3.connect(":memory:"))
+    c.row_factory = sqlite3.Row
+    # Simulate a pre-2.6.0 DB: clear the guard and insert old-state rows
+    # directly (create_ticket now refuses old states).
+    c.execute("DELETE FROM meta WHERE key='state_migration'")
+    create_pool(c, "pool-1", "Team", "agent:maint")
+    c.execute("INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('r','pool-1','R',0)")
+    for tid, old in (("t-pend", "pending"), ("t-rev", "review"),
+                     ("t-block", "blocked"), ("t-merged", "merged"),
+                     ("t-open", "open"), ("t-claimed", "claimed")):
+        c.execute("INSERT INTO tickets (ticket_id, pool_id, repo_id, title, state, created_at, updated_at)"
+                  " VALUES (?,?,?,?,?,0,0)", (tid, "pool-1", "r", tid, old))
+    c.commit()
+    init_ledger(c)  # runs the 2.6.0 migration
+    expect = {"t-pend": "open", "t-rev": "claimed", "t-block": "open",
+              "t-merged": "completed", "t-open": "open", "t-claimed": "claimed"}
+    for tid, want in expect.items():
+        assert get_ticket(c, tid)["state"] == want, tid
+    kinds = [r[0] for r in c.execute("SELECT kind FROM events WHERE kind='state_migrated_2_6_0'")]
+    assert len(kinds) == 4  # one record_event per migrated row
+    guard = c.execute("SELECT value FROM meta WHERE key='state_migration'").fetchone()[0]
+    assert guard == "2.6.0"
+    # Run twice more: no further rows, no further events (idempotent).
+    init_ledger(c); init_ledger(c)
+    for tid, want in expect.items():
+        assert get_ticket(c, tid)["state"] == want, tid
+    kinds2 = [r[0] for r in c.execute("SELECT kind FROM events WHERE kind='state_migrated_2_6_0'")]
+    assert kinds2 == kinds
+    # Old tables stay on disk (no destructive migration).
+    tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"remote_repos", "pool_chats"} <= tables

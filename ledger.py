@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS pool_chats (
 );
 -- NOTE (2109 Phase 2): the peers / imported_* / trust-anchor tables are
 -- GONE — no import, no peer trust, no anchors. Reads are fetch commands
--- on the pool's own gateway (/pool fetch + /work fetch). Existing DBs keep
+-- on the pool's own gateway (/fetch repo + /fetch repo --manifest). Existing DBs keep
 -- the old tables on disk and they are simply never read again (no
 -- destructive migration); new DBs never create them.
 --
@@ -140,11 +140,19 @@ CREATE TABLE IF NOT EXISTS pool_authorized (
     discord_user_id TEXT NOT NULL,
     PRIMARY KEY (pool_id, discord_user_id)
 );
+CREATE TABLE IF NOT EXISTS pool_gateways (
+    pool_id TEXT PRIMARY KEY,
+    gateway_endpoint TEXT,
+    transport_addr TEXT,
+    role TEXT,
+    added_at REAL,
+    last_seen REAL
+);
 """
 
 TABLES = ("pools", "members", "identities", "repos", "repo_versions",
           "manifest_chain", "tickets", "claims", "file_claims", "audits",
-          "events", "pool_chats", "remote_repos", "pool_authorized")
+          "events", "pool_chats", "remote_repos", "pool_authorized", "pool_gateways")
 
 
 def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -188,6 +196,29 @@ def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
         conn.commit()
     except Exception:
         pass
+    # --- Phase 1 (2.6.0) ticket-state migration -------------------------
+    # MIGRATION_2_6_0_START
+    # Old ticket states map onto the three-state machine. Idempotent and
+    # guarded by meta.state_migration; one record_event per migrated row.
+    # No tables/rows are dropped: old tables stay on disk unread.
+    try:
+        _row = conn.execute("SELECT value FROM meta WHERE key='state_migration'").fetchone()
+        if _row is None or _row[0] != "2.6.0":
+            _map = (("pending", "open"), ("review", "claimed"),
+                    ("blocked", "open"), ("merged", "completed"))
+            for _old, _new in _map:
+                for _tid, _pid in conn.execute(
+                        "SELECT ticket_id, pool_id FROM tickets WHERE state=?",
+                        (_old,)).fetchall():
+                    conn.execute("UPDATE tickets SET state=?, updated_at=? WHERE ticket_id=?",
+                                 (_new, _now(), _tid))
+                    record_event(conn, _pid, "state_migrated_2_6_0",
+                                 {"ticket_id": _tid, "from": _old, "to": _new})
+            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('state_migration','2.6.0')")
+            conn.commit()
+    except Exception:
+        pass
+    # MIGRATION_2_6_0_END
     return conn
 
 
@@ -222,6 +253,10 @@ def record_event(conn, pool_id, kind, payload=None) -> None:
 
 
 def create_pool(conn, pool_id, name, maintainer_key_id, relay_url="", settings=None, owner_discord_user_id=None) -> None:
+    _existing = conn.execute("SELECT pool_id FROM pools LIMIT 1").fetchone()
+    if _existing is not None:
+        raise ValueError(
+            f"this gateway already hosts pool {_existing[0]} — one pool per gateway")
     conn.execute(
         "INSERT INTO pools (pool_id, name, maintainer_key_id, owner_discord_user_id, relay_url, settings_json, created_at)"
         " VALUES (?,?,?,?,?,?,?)",
@@ -258,7 +293,7 @@ def append_manifest(conn, repo_id, signed_manifest, manifest_hash_value) -> None
 
 def create_ticket(conn, ticket_id, pool_id, repo_id, title, brief="",
                   budget=None, thread_ref=None, state="open") -> None:
-    if state not in ("open", "pending", "claimed", "review", "merged", "blocked"):
+    if state not in TICKET_STATES:
         raise ValueError(f"unknown ticket state: {state!r}")
     conn.execute(
         "INSERT INTO tickets (ticket_id, pool_id, repo_id, title, brief, state,"
@@ -286,15 +321,12 @@ def claim_ticket(conn, claim_id, ticket_id, key_id, declared_paths=None, budget=
 
 # --- Phase 3: ticket coordination (freeze, overlap, budgets, lifecycle) -----
 
-TICKET_STATES = ("pending", "open", "claimed", "review", "merged", "blocked")
+TICKET_STATES = ("open", "claimed", "completed")
 # Allowed transitions enforced by set_ticket_state().
 _TRANSITIONS = {
-    "pending": {"open", "blocked"},
-    "open": {"claimed", "blocked"},
-    "claimed": {"review", "open", "blocked"},
-    "review": {"merged", "blocked", "review"},
-    "blocked": {"open", "review"},
-    "merged": set(),
+    "open": {"claimed"},
+    "claimed": {"open", "completed"},
+    "completed": set(),
 }
 BUDGET_FIELDS = ("max_turns", "max_tasks_per_day", "token_cap", "wall_clock_seconds")
 BUDGET_DEFAULTS = {"max_turns": 25, "max_tasks_per_day": 5, "token_cap": 50000,
@@ -545,7 +577,7 @@ def _overlaps(conn, repo_id, ticket_id, paths) -> list:
     rows = conn.execute(
         "SELECT fc.path, fc.ticket_id FROM file_claims fc"
         " JOIN tickets t ON t.ticket_id = fc.ticket_id"
-        " WHERE t.repo_id=? AND fc.ticket_id<>? AND t.state IN ('claimed','review','blocked')",
+        " WHERE t.repo_id=? AND fc.ticket_id<>? AND t.state IN ('claimed')",
         (repo_id, ticket_id)).fetchall()
     claimed = {r[0] for r in rows}
     if WHOLE_TICKET_PATH in claimed:
@@ -558,7 +590,7 @@ def _live_file_claims(conn, repo_id, ticket_id) -> list:
     rows = conn.execute(
         "SELECT fc.path FROM file_claims fc"
         " JOIN tickets t ON t.ticket_id = fc.ticket_id"
-        " WHERE t.repo_id=? AND fc.ticket_id<>? AND t.state IN ('claimed','review','blocked')",
+        " WHERE t.repo_id=? AND fc.ticket_id<>? AND t.state IN ('claimed')",
         (repo_id, ticket_id)).fetchall()
     return sorted({r[0] for r in rows})
 
@@ -646,6 +678,51 @@ def release_ticket(conn, ticket_id, key_id) -> dict:
     return get_ticket_or_raise(conn, ticket_id)
 
 
+def complete_ticket(conn, ticket_id, key_id=None) -> dict:
+    """End a claimed ticket as ``completed`` (terminal).
+
+    The claim row ends with state ``completed``; file claims are freed.
+    Only the claimant may complete (when a key_id is given).
+    """
+    ticket = get_ticket_or_raise(conn, ticket_id)
+    if ticket["state"] != "claimed":
+        raise ClaimRefused(f"complete refused: ticket {ticket_id!r} is {ticket['state']!r}, not claimed")
+    if key_id is not None and ticket["claimant_key_id"] != key_id:
+        raise ClaimRefused("complete refused: only the claimant may complete the ticket")
+    if is_global_frozen(conn):
+        raise ClaimRefused(FROZEN_MESSAGE)
+    if is_frozen(conn, ticket["pool_id"]):
+        raise ClaimRefused(FROZEN_MESSAGE)
+    conn.execute("UPDATE claims SET state='completed' WHERE ticket_id=? AND state='active'", (ticket_id,))
+    conn.execute("DELETE FROM file_claims WHERE ticket_id=?", (ticket_id,))
+    conn.execute("UPDATE tickets SET state='completed', updated_at=? WHERE ticket_id=?", (_now(), ticket_id))
+    conn.commit()
+    record_event(conn, ticket["pool_id"], "completed", {"ticket_id": ticket_id, "key_id": ticket["claimant_key_id"]})
+    return get_ticket_or_raise(conn, ticket_id)
+
+
+def record_gateway(conn, pool_id, gateway_endpoint="", transport_addr="", role="") -> dict:
+    """Record a pool/gateway this agent interacts with (differentiation, not management)."""
+    now = _now()
+    conn.execute(
+        "INSERT INTO pool_gateways (pool_id, gateway_endpoint, transport_addr, role, added_at, last_seen)"
+        " VALUES (?,?,?,?,?,?)"
+        " ON CONFLICT(pool_id) DO UPDATE SET gateway_endpoint=excluded.gateway_endpoint,"
+        " transport_addr=excluded.transport_addr, role=excluded.role, last_seen=excluded.last_seen",
+        (str(pool_id), gateway_endpoint or "", transport_addr or "", role or "", now, now))
+    conn.commit()
+    return {"pool_id": str(pool_id), "gateway_endpoint": gateway_endpoint or "",
+            "transport_addr": transport_addr or "", "role": role or ""}
+
+
+def list_gateways(conn) -> list:
+    cur = conn.execute(
+        "SELECT pool_id, gateway_endpoint, transport_addr, role, added_at, last_seen"
+        " FROM pool_gateways ORDER BY pool_id")
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
 def get_active_claim(conn, ticket_id) -> dict | None:
     row = conn.execute(
         "SELECT * FROM claims WHERE ticket_id=? AND state='active'", (ticket_id,)).fetchone()
@@ -664,7 +741,7 @@ def release_claim_for_ticket(conn, ticket_id) -> None:
     """Mark the active claim released and clear the claimant (budget-kill path).
 
     Unlike release_ticket() this does NOT flip the ticket state: the caller
-    moves the ticket to ``blocked`` with a structured report first.
+    moves the ticket to ``open`` with a structured report first.
     """
     ticket = get_ticket_or_raise(conn, ticket_id)
     conn.execute("UPDATE claims SET state='released' WHERE ticket_id=? AND state='active'",
@@ -693,16 +770,6 @@ def get_audit(conn, repo_id, version=None) -> dict | None:
             "SELECT * FROM audits WHERE repo_id=? AND version=? ORDER BY created_at DESC LIMIT 1",
             (repo_id, version)).fetchone()
     return dict(row) if row else None
-
-
-def get_pending_manifest(conn, repo_id, version=None) -> dict | None:
-    query = "SELECT manifest_json FROM repo_versions WHERE repo_id=? AND state='pending'"
-    params = [repo_id]
-    if version is not None:
-        query += " AND version=?"; params.append(version)
-    query += " ORDER BY version DESC LIMIT 1"
-    row = conn.execute(query, params).fetchone()
-    return json.loads(row[0]) if row else None
 
 
 # --- Phase 5: member revocation ---------------------------------------------
@@ -903,37 +970,8 @@ def peek_notices(conn, pool_id=None):
 # --- Operator link note (OD5, survives 2109 Phase 2) -------------------------
 # remote_repos holds ONLY the human-readable --link pointer recorded at
 # /add-repo --link. It is NEVER a fetch source: /pool fetch is the real
-# read path. A link is a note for a human, nothing more.
+# read path. A link is a note for a human, nothing more. The table stays
+# on disk; the add_repo --link branch writes it via inline SQL in
+# tickets.py (no ledger remote-repo API remains).
 
-def upsert_remote_repo(conn, repo_id, pool_id, remote_repo_id=None, link=""):
-    repo_id = str(repo_id)
-    conn.execute(
-        "INSERT INTO remote_repos (pool_id, repo_id, remote_repo_id, link) VALUES (?,?,?,?)"
-        " ON CONFLICT(pool_id, repo_id) DO UPDATE SET"
-        " remote_repo_id=excluded.remote_repo_id, link=excluded.link",
-        (pool_id, repo_id, remote_repo_id or repo_id, link or ""))
-    conn.commit()
-
-
-def get_remote_repo(conn, repo_id, pool_id=None):
-    if pool_id:
-        row = conn.execute("SELECT * FROM remote_repos WHERE pool_id=? AND repo_id=?", (pool_id, repo_id)).fetchone()
-        return dict(row) if row else None
-    row = conn.execute("SELECT * FROM remote_repos WHERE repo_id=? ORDER BY pool_id LIMIT 1", (repo_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def get_auto_approve(conn, pool_id) -> bool:
-    row = conn.execute("SELECT value FROM meta WHERE key=?", (f"auto_approve:{pool_id}",)).fetchone()
-    if row is None:
-        # Default: auto-approve OFF — tickets mint as "pending".
-        return False
-    return row[0] == "1"
-
-
-def set_auto_approve(conn, pool_id, enabled: bool):
-    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)",
-                 (f"auto_approve:{pool_id}", "1" if enabled else "0"))
-    conn.commit()
-    return bool(enabled)
 
