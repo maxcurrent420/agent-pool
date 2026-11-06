@@ -65,49 +65,68 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
    must contain the tester's Discord user id — that allowlist
    (`adapter.py:4159-4167`) is the only ingress gate; there is no
    plugin-side Discord client.
-6. After the restart, verify all **seven** commands in the picker:
-   `pool`, `task`, `claim`, `release`, `work`, `integrate`, `audit`
-   (each with one optional `args` string option from its `args_hint`).
+6. After the restart, verify all **ten** commands in the picker:
+   `pool`, `task`, `add-repo`, `task_add`, `task_list`, `claim`, `release`,
+   `work`, `integrate`, `audit` (each with one optional `args` string option
+   from its `args_hint`).
 
 ## The command sequence (in Discord)
 
-7. Register a pool and bind yourself as maintainer (the `--discord-user`
-   you pass here is what the button gate later resolves your clicks
-   against — get it right; a mis-bound id is the residual risk):
+7. Register a pool and bind yourself as owner — **the `--discord-user`
+   you pass here becomes the whitelist owner** and is the authorization
+   for every owner-only verb; get it right (a mis-bound id is the residual
+   auth risk). Register without `--discord-user` is refused:
    ```
    /pool register demo-pool --name Demo --discord-user <your Discord user id>
    ```
-8. Invite a second member (or skip — single-agent run is fine):
+8. Invite a second member (or skip — single-agent run is fine). The
+   invitee's Discord id becomes an **authorized** user (may claim/submit/
+   list/fetch, but NOT mint, approve, invite, remove, freeze or
+   integrate). The invite also records their agent key — attribution only:
    ```
    /pool invite demo-pool <member key_id> --box-pubkey <hex> --discord-user <their Discord user id>
    ```
-9. Create a ticket:
+9. Create a ticket (owner-only; an authorized non-owner is refused):
    ```
    /task add --pool-id demo-pool --repo demo --title "Live test" --brief "first live run"
    ```
    (Note the returned `ticket_id` and `thread_ref` — the invoking chat
    was recorded as the ticket's thread.)
-10. Claim it:
+10. A non-invitee (an id with no whitelist row) must be refused on every
+    verb — try it with a third account before continuing (expect a
+    permission refusal, never a dispatch).
+11. Claim it (any authorized user may):
     ```
     /claim <ticket_id> --paths hello.txt
     ```
-11. Submit work (bytes go over Iroh from this machine):
+12. Submit work (bytes go over Iroh from this machine):
     ```
     /work submit <ticket_id> --repo-path <path to a git repo with >=1 commit> --version 1
     ```
     Expect a pending-manifest summary (manifest hash, BLAKE3
     `content_hash`, transfer id) — **not** repo bytes in the reply.
-12. Run the integration gate, then click **Approve** on the buttons in
+13. The invited friend must NOT be able to freeze the pool — have them
+    try `/pool freeze demo-pool` and confirm the owner-only refusal
+    (`pool frozen — contact the maintainer` never appears here; the
+    refusal is an unauthorized-verb one).
+14. Run the integration gate, then click **Approve** on the buttons in
     the reply (or run `/integrate approve <ticket_id>` — same code path,
-    same maintainer check):
+    same owner check):
     ```
     /integrate <ticket_id>
     ```
-13. Verify the audit:
+15. Verify the audit:
     ```
     /audit show <ticket_id>
     ```
     Expect the sandbox-scan report and, after approve, the merged state.
+16. Read the project back through fetch (the read path — no import):
+    ```
+    /pool fetch demo --pool demo-pool          (returns the latest accepted manifest)
+    /work fetch --manifest '<manifest json>' --dest <workdir>
+    ```
+    Confirm the clone decrypts with the fetching agent's own box key and
+    matches the manifest's BLAKE3 `content_hash`.
 
 ## Verify repo bytes never hit Discord
 

@@ -21,7 +21,7 @@ crypto, transport, and decisions; posting and button routing are Hermes's.
 | Owns the pool ledger (SQLite via `plugin_db`), manifest chain, ticket store, budgets | Owns the Discord bot, guild/channel routing, and the allowlist ingress gate |
 | Packs repos (`git bundle --all`), encrypts with a fresh per-version DEK, wraps the DEK per member, sends bytes over Iroh via `send_hermes` | Renders slash commands in the Discord picker from `ctx.register_command` registrations |
 | Returns a markdown **string** from each command handler — the reply Hermes posts | Posts that string as the Discord reply (plugin commands short-circuit before the agent loop; no LLM call) |
-| Decides who may act (pool ownership, maintainer checks, `pool_not_local` refusals) | Delivers identity: `source.user_id`, `chat_id`, `guild_id`, `thread_id` arrive with every command |
+| Decides who may act (Discord-whitelist authorization: owner + authorized users, owner-only freeze, `pool_not_local` refusals for pools it does not host) | Delivers identity: `source.user_id`, `chat_id`, `guild_id`, `thread_id` arrive with every command |
 | Registers a Discord button gate via `ctx.register_platform_handler("discord", factory)` — the factory receives **the gateway's own bot** and adds a listener + `discord.ui.View` | Runs the bot that owns the message; button clicks are `Component` interactions routed by Hermes's bot to the plugin's listener |
 | Falls back to `ctx.ask_choice` inside `/integrate` (Hermes renders clarify buttons in the invoking chat) | Renders the clarify buttons and routes the tap |
 | Records the ticket's `thread_ref` from the invoking command's `source` (`chat_id`/`thread_id`/`guild_id`) | Owns threads; the plugin creates none |
@@ -189,6 +189,8 @@ hermes plugins enable agent-pool
 #    /add-repo <repo_id> --path /srv/repos/<repo_id> --pool <pool_id> --name "<display name>"
 #    /task_add --repo <repo_id> --pool <pool_id> --title "..." --brief "..."
 #    /pool list --pool <pool_id>          (projects available to work on)
+#    /pool fetch <repo_id> --pool <pool_id>   (manifest for /work fetch)
+#    /work fetch --manifest '<json>' --dest /srv/work/<repo_id>
 #    /task_list --repo <repo_id> --pool <pool_id> --state open
 #    /claim <ticket>                      (whole-ticket claim, no paths)
 #    /claim --any-project --max-tasks 2   (take up to 2 open tickets, any project)
@@ -213,29 +215,43 @@ cargo).
 > Version note: the gateway-native migration is a **breaking
 > communication-layer change** — the plugin no longer posts to Discord
 > itself (the old `GatewayAdapter`/`gateway.py` architecture is deleted,
-> not deprecated). The manifest is version **2.4.0**; `gateway_channel_id`
+> not deprecated). The manifest is version **2.5.0**; `gateway_channel_id`
 > no longer exists (gateway routing is Hermes's).
 >
-> **2.4.0 corrections** (2026-11-05 passive-plumbing corrections): fail-closed
-> authorization (operator-recorded Discord-ID whitelist + pinned trust anchors,
-> never TOFU), absolute freeze guard (`pool frozen — contact the maintainer`),
-> auto-approve **off** by default (`pending` mint state), proposal packets
-> verified before mint with replay protection, pool-scoped imported tables,
-> remote chain verification via pinned keys. Migrations (in `ledger.py`):
-> `members.verify_pubkey_hex`, pool-scoped PKs on `remote_repos` /
-> `imported_versions` / `imported_chain`, `pending` default, trust anchors
-> (`peers` pinned/revoked). Vocabulary: **owner** (maintainer) and
-> **authorized users/agents** (whitelisted Discord IDs + agent keys).
+> **2.5.0 corrections** (2026-11-05 authorization/fetch corrections — the
+> mechanism superseded 2.4.0's): **authorization is the whitelisted Discord
+> user id only** — pools carry `owner_discord_user_id` and a `pool_authorized`
+> set, and every maintainer-only verb (`register`, `invite`, `remove`,
+> `freeze`, `auto-approve`, `/task add` mint, approve/deny/modify,
+> `/add-repo`, `/integrate` + its decisions, packet mint) compares that id.
+> **Keys are crypto-only** (signing + per-version DEK wrap) and never decide
+> access — the ed25519 key proves authorship of an artifact, the box keypair
+> decrypts bytes, neither is a login. **Freeze is owner-only and absolute**:
+> while frozen every other verb from every user returns exactly
+> `pool frozen — contact the maintainer`. **Fetch replaces import**:
+> `/pool import`, `/pool trust`, the `peers` table, trust anchors and the
+> `imported_*` tables are removed — reads are `/pool fetch` + `/work fetch`
+> on the pool's own gateway. **Vocabulary:** **owner** (the Discord user who
+> registered the pool) and **authorized user** (owner + invitees' Discord
+> ids, recorded at `/pool invite --discord-user`).
+>
+> Migrations (in `ledger.py`, non-destructive): `pools.owner_discord_user_id`
+> (additive; backfilled from `pool_authorized`), new `pool_authorized` table,
+> `schema_version` 5. The old `peers` / `imported_*` tables are **left in
+> place on disk and never read again** — no destructive migration.
+> `remote_repos` survives only as the human-readable `--link` operator note
+> (never a fetch source). Breaking surface: import/trust removed, owner-only
+> freeze, `--discord-user` required at register and invite.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/pool register <pool_id> --name <name> --discord-user <id>` | Create a pool; caller is maintainer; binds this chat to the pool and records the maintainer's Discord user id |
+| `/pool register <pool_id> --name <name> --discord-user <id>` | Create a pool (required); the caller's Discord id becomes the owner and the whitelist is the authorization |
 | `/pool invite <pool_id> <key_id> --role member\|maintainer --box-pubkey <hex> --verify-key <hex> --discord-user <id>` | Add an authorized user/agent (records Discord-user → key_id binding + member verify key for packet verification) |
 | `/pool members <pool_id>` | List members |
-| `/pool import <manifest-json> --pool <pool_id> --verify-key <hex> [--maintainer <key_id>]` | Import canonical manifests into the remote view (requires the maintainer verify key or an existing pinned anchor; pins the trust anchor on success) |
-| `/pool trust <pool_id> <maintainer_key_id> --verify-key <hex>` / `--list [pool_id]` / `--revoke <pool_id>` | Pin/list/revoke a remote pool's trust anchor (operator-pinned maintainer verification key) |
+| `/pool fetch <repo_id> [--pool <id>]` / `--projects` / `--tasks` | Fetch a hosted pool's read artifacts: project list (accepted versions), ticket list (open/claimed — never `pending`), and for a repo the latest accepted manifest string (transfer ticket + wrapped keys + maintainer verify key) for `/work fetch`. A pool this gateway does not host is refused, naming its hosted pools |
+| `/work fetch --manifest <json> [--dest <path>]` | Download one repo from a fetched manifest on YOUR OWN gateway: unwrap the DEK with your own box key, BLAKE3-verify against the manifest, git-clone. The wrapped-key ACL is the byte-authorization boundary (only an invited agent can decrypt) |
 | `/pool auto-approve <on\|off> [--pool <id>]` | Maintainer-only toggle for auto-approve (default **off**; tickets mint `pending`) |
 | `/pool remove <pool_id> <key_id>` | Revoke an authorized user/agent (forward separation) |
 | `/pool freeze [--global] [--unfreeze]` | Per-pool freeze; **no pool id / `--global` = global kill-switch** across every pool. While frozen every verb returns exactly `pool frozen — contact the maintainer` (only freeze/unfreeze runs) |
@@ -246,10 +262,10 @@ cargo).
 | `/task_add --repo <repo_id> --title … --brief … [--pool <pool_id>]` | Flat alias of `/task add` |
 | `/task list\|show [--pool-id …]` | List/show tickets (non-maintainers never see `pending` unless `--state pending` is explicit; the bound maintainer additionally sees pending with approve/deny/modify `ask_choice`) |
 | `/task_list [--repo <repo_id>] [--pool <pool_id>] [--state open]` | Flat alias of `/task list`, with `--repo` filter (cross-pool repo refused) |
-| `/claim <ticket> [--paths a.py,b.py] [--max-turns …] [--override]` | Claim. `--paths` optional: **omit it for a whole-ticket claim** (no paths pre-declared; recorded as `*`, blocks later path claims on that repo until released). Declared-path claims keep the overlap refusal. Remote (imported) claims also mint a `claim_proposal` packet for the maintainer to relay |
+| `/claim <ticket> [--paths a.py,b.py] [--max-turns …] [--override]` | Claim. `--paths` optional: **omit it for a whole-ticket claim** (no paths pre-declared; recorded as `*`, blocks later path claims on that repo until released). Declared-path claims keep the overlap refusal |
 | `/claim --any-project [--max-tasks N] [--repo <repo_id>] [--pool <pool_id>]` | Take up to N (default 1, hard cap 10) open tickets' worth of work, whole-ticket form, across any project in the pool. Each claim still passes the freeze / one-ticket-one-worker / overlap / budget checks; refused tickets are reported as skipped |
 | `/release <ticket>` | Release a claim back to open |
-| `/work start <ticket> [--acceptance "cmd..."]` | Fetch the repo into your worktree before working (pull trigger; reads the imported canonical chain, verifies against the pinned key) |
+| `/work start <ticket> [--acceptance "cmd..."]` | Fetch the repo into your worktree before working (pull trigger; reads this pool's canonical chain and verifies against the maintainer key) |
 | `/work submit <ticket> --repo-path PATH --version N` | Submit finished work (contributor-signed, pending; bytes go over Iroh) |
 | `/integrate <ticket>` | Maintainer gate: fetch branch, sandbox diff scan, audit, then offer approve/edit/discard (buttons + `ask_choice`) |
 | `/integrate approve\|edit\|discard <ticket> [--edit-file PATH --edit-content TEXT] [--reason …]` | **The actionable decision** (same code path as a button click) |
@@ -264,11 +280,11 @@ each appears in the Discord picker with one optional `args` string option.
 Buttons are real: `buttons.py` registers a Discord platform handler with
 Hermes, and the **gateway's own bot** renders a `discord.ui.View` with
 `custom_id = agent-pool:{decision}:{ticket_id}` (`approve|edit|discard`).
-A click lands on that bot, reaches the plugin's listener, resolves the
-clicker (Discord user id → `key_id` via the ledger binding recorded at
-`/pool invite --discord-user`), verifies the clicker **is the pool
-maintainer**, and dispatches to `PoolService.resolve_integration`.
-Unmapped or non-maintainer clickers get an ephemeral refusal and nothing
+A click lands on that bot, reaches the plugin's listener, verifies the
+clicker's **Discord user id is the pool owner** (the whitelist — the
+Discord-id → key map is attribution only), and dispatches to
+`PoolService.resolve_integration`. Unmapped or non-owner clickers get
+an ephemeral refusal and nothing
 is dispatched. If buttons are unavailable, `/integrate approve|edit|discard`
 runs the exact same code path with the same maintainer check, and
 `/integrate <ticket>` also offers `ctx.ask_choice` clarify buttons inside
@@ -294,22 +310,25 @@ Agents running separate pools cannot act on each other's pools:
   `get_hermes_home()` on every call — two profiles on one host get
   physically disjoint `data.db` files. Keys (ed25519/box, 0600) live under
   the same profile-scoped plugin data dir.
-- **Pool ownership rule.** A pool is *local-owned* iff its row exists in
-  this profile's ledger **and** `maintainer_key_id` equals this agent's
-  host `key_id` (`tickets.py:PoolService._assert_local_owned`).
-- **Resolution order, never a guess:** explicit `--pool` → the invoking
-  chat's pool binding (`pool_chats`, recorded at `/pool register`) → the
-  profile's single local-owned pool → refusal: *no pool bound to this
-  chat — pass --pool*.
-- **Named pool not local ⇒ hard refusal `pool_not_local`.** No command
-  ever opens another agent's ledger (they are different files on
-  different machines anyway).
-- **Remote pools via Iroh only.** A foreign pool is reached by the
-  *requesting* agent fetching bytes over `send_hermes` on its own
-  machine — never by mutating the owner's ledger remotely, and never
-  through Discord. From the maintainer's gateway, remote pools appear
-  only as manifests/notices received over Iroh: each agent's Discord
-  surface is exactly the pools it hosts.
+- **Hosted pool rule.** A gateway answers only for pools whose rows exist
+  in its own ledger — it has no cross-gateway ledger access and never
+  opens another agent's ledger (they are different files on different
+  machines anyway). Selection among hosted pools is explicit `--pool`,
+  else the single hosted pool; a pool id this gateway does not host is
+  refused with `pool_not_local`, naming its hosted pools
+  (`tickets.py:PoolService._resolve_pool`).
+- **Addressing another pool is the platform's job.** Hermes routes the
+  command to the addressed pool's gateway, so a friend's command lands on
+  Pool A's bot, not Gateway B's — the plugin performs no resolution
+  chain, no chat binding, and no peer/anchor fallback.
+- **Authorization is the whitelist, per pool.** Owner + invited Discord
+  ids (`pools.owner_discord_user_id` + `pool_authorized`); keys are
+  crypto-only. An unauthorized id is refused on every verb; an authorized
+  non-owner is refused every owner-only verb.
+- **Foreign bytes arrive only by fetch.** A contributor downloads with
+  `/work fetch --manifest <json>` from a manifest their own gateway
+  fetched with `/pool fetch` — the wrapped-key ACL is the byte boundary,
+  and no read path copies a foreign pool into the local ledger.
 
 Full model: [docs/architecture.md](docs/architecture.md#isolation-model).
 
@@ -355,31 +374,54 @@ transfer measurement.
 Read [docs/threat-model.md](docs/threat-model.md) before running this with
 real repos: the relay cannot read content; malware that defeats both the
 scan and the owner's review is out of scope; revocation is
-forward-separation only; the Discord-user → agent-key binding is
-operator-recorded, so a mis-bound mapping is the button gate's residual
-risk. Full design: [docs/architecture.md](docs/architecture.md).
+forward-separation only.
+
+**Residual auth risks:** the whitelist is only as good as the operator's
+`/pool invite --discord-user` record — a mis-invited Discord id (or a
+spoofed platform id) is the boundary case, which is why the invite binds a
+user id AND a key and the key is used for crypto attribution on every
+event; the per-version DEK wrap is the byte-authorization boundary (only
+an invited agent can decrypt fetched bytes); and the relay sees both peers'
+IPs — Tor is not the transport (see OD4). Full design:
+[docs/architecture.md](docs/architecture.md).
 
 ## Passive plumbing (agents do the work)
 
 The plugin never observes Discord channels, never pushes/pulls, and never
-executes work. Agents pull when starting work (`/work start` reads the
-imported canonical chain) and push by pasting signed proposal packets
-into the maintainer's gateway (`/task add --packet`, `/add-repo --link`).
-Remote pools are read via the imported view (`/pool import`, `/pool list`,
-`/task list`, `/claim` on ticket_id); canonical writes are maintainer-only.
-`/add-repo --link <url>` registers a pointer in `remote_repos` only
-(never in `repos.path`); fetch is deferred to `/work start`.
-Sync is agent-driven — no plugin timers or background sync.
+executes work. It answers commands for the pools **it hosts** — one pool by
+default, `--pool` disambiguates on a multi-pool host. Cross-gateway
+addressing is the **platform's** job: Hermes routes a command to the
+addressed pool's gateway, so the plugin has no resolution chain, no chat
+binding, and no peer/anchor fallback — it refuses a pool id it does not
+host with a message naming its hosted pools. Agents pull (fetch) and push
+(packets) themselves:
 
-**Trust model:** import *is* the trust operation. `/pool import` requires
-the maintainer's verification key (or an existing pinned anchor) and pins a
-local trust anchor; `/pool trust` pins/lists/revokes anchors. There are no
-"peers" and nothing to confirm — the anchor is the operator-pinned record
-of the remote maintainer's verification key. Nothing self-verifies (no TOFU).
+- **Reads are fetch commands:** `/pool fetch` returns the hosted pool's
+  project list, its open/claimed tickets, and for a repo the latest accepted
+  manifest string; `/work fetch --manifest <json>` downloads and decrypts on
+  the fetching agent's own gateway with its own box key. There is no import
+  and no local copy of a foreign pool.
+- **Writes travel as signed packets:** a contributor's `/work submit` keeps
+  the packet-relay design (the packet carries the transfer ticket; the
+  maintainer's gateway fetches the bytes and audits). Membership stays
+  operator-driven at `/pool invite --discord-user` — there is nothing to
+  discover or confirm automatically, and no trust-on-first-use.
+- `--link` is a human-readable operator note only (`remote_repos`); it is
+  never a fetch source.
+- Sync is agent-driven — no plugin timers or background sync.
+
+**Authorization model:** the whitelisted Discord user id, period. A pool
+records its owner's Discord id at register and each invitee's at
+`/pool invite --discord-user`; owner-only verbs compare that id. Keys are
+consulted only where crypto needs them: an ed25519 key signs manifests and
+proposal packets (authorship of an artifact), and a box keypair wraps each
+version's DEK so only the invited agent's machine can decrypt fetched bytes.
+**A key appearing anywhere in an authorization decision is a bug.**
+
 Packets are verified before mint: signature against
 `members.verify_pubkey_hex`, current-membership (revocation) check, and a
 `packet_hash` replay guard. Tickets mint `pending` (auto-approve off by
-default); the bound maintainer sees pending with
-approve/deny/modify `ask_choice`, non-maintainers see open only. Vocabulary:
-**owner** (maintainer) and **authorized users/agents** (whitelisted Discord
-IDs + their agent keys).
+default); the owner sees pending with approve/deny/modify `ask_choice`,
+authorized non-owners see open only. Vocabulary: **owner** (the Discord user
+who registered the pool) and **authorized user** (owner + invited Discord
+user ids).

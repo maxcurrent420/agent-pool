@@ -34,9 +34,15 @@ Stated honestly. Anything not listed here as a guarantee is not one.
    (`buttons.py`, lazily, inside the factory) and never opens its own
    client — Hermes's gateway bot does all posting and all button routing;
    the plugin only returns strings for Hermes to post.
-7. **Kill-switch.** `/pool freeze` (global) blocks all pool-mutating and
+7. **Kill-switch, owner-only and absolute.** `/pool freeze` (global) or
+   `/pool freeze <pool_id>` blocks all pool-mutating and
    claim/work/integrate actions across every pool in the process,
-   persisted in the ledger so it survives restarts.
+   persisted in the ledger so it survives restarts. **Only the pool
+   owner can freeze or unfreeze** (the whitelisted Discord id recorded at
+   register) — no `is_freeze_ctl` bypass exists. While frozen, every other
+   verb from every user returns exactly `pool frozen — contact the
+   maintainer`; the owner's freeze/unfreeze and read-only queries still
+   run (a kill path must not be blockable by the switch).
 
 ## What is explicitly out of scope / residual risk
 
@@ -81,16 +87,12 @@ Stated honestly. Anything not listed here as a guarantee is not one.
 - **Maintainer key compromise = pool compromise.** Acceptance is a
   signature over the manifest; whoever holds the maintainer signing key
   can accept anything. Protect it like a root key.
-- **Discord user id ≠ agent identity (new residual risk from the button
-  gate).** The `identities.discord_user_id` binding is operator-recorded
-  at `/pool invite --discord-user <id>`; it is the only link between a
-  Discord account and a pool `key_id`. Unmapped clickers are refused, but
-  a **mis-bound mapping lets the wrong Discord account authorize an
-  integration**. Mitigations: record the binding only on the
-  maintainer's own gateway, double-check the id before inviting, and note
-  the second layer — `resolve_integration` re-checks maintainer identity
-  against the ledger (`tickets.py`), so a mis-binding still needs the
-  ledger row to agree.
+- **Button gate: the clicker must be the pool owner, not a member.** A
+  Discord interaction carries only a platform user id, so the gate is
+  "is this id the pool's owner?" (`_require_owner`) — an authorized
+  non-owner who clicks Approve gets an ephemeral refusal and nothing is
+  dispatched. Unmapped clickers are refused too (fail closed). The
+  platform-id → key map the host supplies is attribution only.
 - **No plugin-side Discord client.** There is no second credential
   surface: the gateway bot's allowlist
   (`H/plugins/platforms/discord/adapter.py:4159-4167`) is the only
@@ -99,9 +101,9 @@ Stated honestly. Anything not listed here as a guarantee is not one.
   the gateway's own bot (`buttons.py` factory) and touches nothing else.
 - **No encryption-at-rest beyond the per-version DEK.** The local ledger
   and worktrees on a member's machine are plaintext. Protect the machine.
-- **Packet relay integrity rests on signatures, not the copy-paste channel.** Proposal/claim packets travel via gateway reply strings (copy-paste). Integrity is guaranteed by the ed25519 signature + replay guard, **not** by the channel — a relayed packet is only as trustworthy as the signer's key. If a signer's key is compromised or the packet is replaced, verification fails closed (nothing mints).
-- **Operator-pinned trust anchors; no TOFU.** First contact with a remote pool is `unverified`. Import requires an operator-supplied maintainer verification key (or an existing pinned anchor) and pins the anchor to `pinned`. Nothing self-verifies. A compromised pinned key is as bad as a compromised maintainer key.
-- **Pending-until-approved lifecycle.** Tickets mint `pending`; only the bound maintainer moves them to `open` (approve/deny/modify). Non-maintainer lists exclude `pending` by default. This means a compromised member key alone cannot create claimable work.
-- **Imported copies are unauthenticated until pinned.** Until an anchor is pinned, imported manifests/tickets are untrusted bytes in the local view. Never act on them (claim/fetch) before pinning; reads are still anchor-gated.
-- **Claim eventual consistency until the maintainer mints.** Remote claims write an `imported_claims` record locally and mint a `claim_proposal` packet. The canonical ticket becomes `claimed` only when the maintainer mints the first valid claim packet; conflicting later claims are refused (first-*minted* wins).
-- **Discord ID ↔ agent key binding remains the residual authentication risk.** Authorization is the operator-recorded whitelist (`/pool invite --discord-user`) + membership/anchor state; absence of a record = refusal. A mis-bound mapping lets the wrong Discord account act. Double-check IDs before inviting.
+- **Pending-until-approved lifecycle.** Tickets mint `pending`; only the **owner** moves them to `open` (approve/deny/modify — owner-only in the whitelist model). Non-owner lists exclude `pending` by default. This means a compromised member credential alone cannot create claimable work, and an authorized non-owner cannot mint at all.
+- **The whitelist is the authorization boundary.** A pool answers only to the Discord ids it recorded: the owner (register) and each invitee (`/pool invite --discord-user`). *Absence of a record = refusal, on every verb.* There is no key-based bypass: the gateway's own agent key, which is always the pool owner on that host, never satisfies a check by itself — the driving user id decides. Keys are consulted only where crypto needs them (signing artifacts, wrapping DEKs).
+- **The DEK wrap is the byte-authorization boundary.** Only an agent whose key appears in a version's `wrapped_keys` can decrypt that version's bytes, so an unauthorized download fails closed even if the ciphertext (a bearer ticket) leaks. Invite **before** `/add-repo`: members invited later wait for the next version's DEK rotation.
+- **Packet-relay integrity rests on signatures, not the copy-paste channel.** A contributor's bytes reach the maintainer only as a signed proposal packet carrying the transfer ticket; integrity is the ed25519 signature + replay guard, not the channel it was pasted through. If a signer's key is compromised or the packet is replaced, verification fails closed (nothing mints).
+- **Discord ID ↔ agent-key invite binding remains the residual auth risk.** The invite records a Discord user id AND a key; the id is the authorization and the key is the crypto attribution on every event. A **mis-recorded invite id** (wrong id typed, or a platform id spoofed upstream) is the boundary case — double-check the id before inviting, and note that a mis-bound mapping grants the *authorized* verbs, not owner-only ones, unless the owner id itself is wrong.
+- **Fetch, not import: no local copies of foreign pools.** Reads are `/pool fetch` on the pool's own gateway and `/work fetch` on the requester's own gateway (own box key, BLAKE3-verified against the manifest). Nothing is imported, so there is no untrusted local copy to act on, and no peer/anchor state to mis-pin.
