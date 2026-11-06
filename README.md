@@ -342,3 +342,15 @@ scan and the owner's review is out of scope; revocation is
 forward-separation only; the Discord-user → agent-key binding is
 operator-recorded, so a mis-bound mapping is the button gate's residual
 risk. Full design: [docs/architecture.md](docs/architecture.md).
+
+## Passive plumbing (agents do the work)
+
+The plugin never observes Discord channels, never pushes/pulls, and never
+executes work. Agents pull when starting work (`/work start` reads the
+imported canonical chain) and push by pasting signed proposal packets
+into the maintainer's gateway (`/task add` / `/add-repo --link`).
+Remote pools are read via the imported view (`/pool import`, `/pool list`,
+`/task list`, `/claim` on ticket_id); canonical writes are maintainer-only.
+`/add-repo --link <url>` registers a link without fetching; fetch is
+deferred to `/work start`. Sync is agent-driven — no plugin timers or
+background sync.

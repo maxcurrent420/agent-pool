@@ -118,11 +118,65 @@ CREATE TABLE IF NOT EXISTS pool_chats (
     pool_id TEXT NOT NULL REFERENCES pools(pool_id),
     PRIMARY KEY (chat_id, guild_id, thread_id)
 );
+CREATE TABLE IF NOT EXISTS peers (
+    pool_id TEXT NOT NULL,
+    agent_key_id TEXT NOT NULL,
+    maintainer_key_id TEXT NOT NULL,
+    trust_state TEXT NOT NULL DEFAULT 'unverified',
+    PRIMARY KEY (pool_id, agent_key_id)
+);
+CREATE TABLE IF NOT EXISTS remote_repos (
+    repo_id TEXT PRIMARY KEY,
+    pool_id TEXT NOT NULL,
+    remote_repo_id TEXT NOT NULL,
+    link TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS imported_versions (
+    repo_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    manifest_json TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'accepted',
+    PRIMARY KEY (repo_id, version)
+);
+CREATE TABLE IF NOT EXISTS imported_chain (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    prev_manifest_hash TEXT,
+    signer_key_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    UNIQUE (repo_id, version)
+);
+CREATE TABLE IF NOT EXISTS imported_tickets (
+    ticket_id TEXT PRIMARY KEY,
+    pool_id TEXT NOT NULL,
+    repo_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    brief TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'open',
+    claimant_key_id TEXT,
+    budget_json TEXT NOT NULL DEFAULT '{}',
+    thread_ref TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS imported_claims (
+    claim_id TEXT PRIMARY KEY,
+    ticket_id TEXT NOT NULL,
+    key_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active',
+    declared_paths_json TEXT NOT NULL DEFAULT '[]',
+    budget_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
 """
 
 TABLES = ("pools", "members", "identities", "repos", "repo_versions",
           "manifest_chain", "tickets", "claims", "file_claims", "audits",
-          "events", "pool_chats")
+          "events", "pool_chats", "peers", "remote_repos", "imported_versions",
+          "imported_chain", "imported_tickets", "imported_claims")
 
 
 def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -209,11 +263,13 @@ def append_manifest(conn, repo_id, signed_manifest, manifest_hash_value) -> None
 
 
 def create_ticket(conn, ticket_id, pool_id, repo_id, title, brief="",
-                  budget=None, thread_ref=None) -> None:
+                  budget=None, thread_ref=None, state="open") -> None:
+    if state not in ("open", "pending", "claimed", "review", "merged", "blocked"):
+        raise ValueError(f"unknown ticket state: {state!r}")
     conn.execute(
         "INSERT INTO tickets (ticket_id, pool_id, repo_id, title, brief, state,"
-        " budget_json, thread_ref, created_at, updated_at) VALUES (?,?,?,?,?,'open',?,?,?,?)",
-        (ticket_id, pool_id, repo_id, title, brief, json.dumps(budget or {}),
+        " budget_json, thread_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?, ?,?,?)",
+        (ticket_id, pool_id, repo_id, title, brief, state, json.dumps(budget or {}),
          thread_ref, _now(), _now()))
     conn.commit()
 
@@ -802,3 +858,134 @@ def peek_notices(conn, pool_id=None):
         if d.get("text"):
             out.append(d["text"])
     return out
+
+
+# --- Remote pool view (passive plumbing) -------------------------------------
+# Copies of canonical state imported via gateway reply strings. The plugin
+# never writes another agent's ledger; these tables hold only verified
+# imports. Canonical writes stay maintainer-only on the owning ledger.
+
+def upsert_peer(conn, pool_id, agent_key_id, maintainer_key_id, trust_state="unverified") -> dict:
+    conn.execute(
+        "INSERT INTO peers (pool_id, agent_key_id, maintainer_key_id, trust_state)"
+        " VALUES (?,?,?,?) ON CONFLICT(pool_id, agent_key_id) DO UPDATE SET"
+        " maintainer_key_id=excluded.maintainer_key_id, trust_state=excluded.trust_state",
+        (pool_id, agent_key_id, maintainer_key_id, trust_state))
+    conn.commit()
+    return get_peer(conn, pool_id, agent_key_id)
+
+
+def get_peer(conn, pool_id, agent_key_id=None):
+    if agent_key_id:
+        row = conn.execute("SELECT * FROM peers WHERE pool_id=? AND agent_key_id=?",
+                           (pool_id, agent_key_id)).fetchone()
+        return dict(row) if row else None
+    row = conn.execute("SELECT * FROM peers WHERE pool_id=? ORDER BY agent_key_id LIMIT 1",
+                       (pool_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_peers(conn, pool_id=None):
+    if pool_id:
+        return [dict(r) for r in conn.execute("SELECT * FROM peers WHERE pool_id=? ORDER BY agent_key_id", (pool_id,))]
+    return [dict(r) for r in conn.execute("SELECT * FROM peers ORDER BY pool_id, agent_key_id")]
+
+
+def set_peer_trust(conn, pool_id, agent_key_id, trust_state):
+    if trust_state not in ("unverified", "verified", "revoked"):
+        raise ValueError(f"unknown trust_state: {trust_state!r}")
+    conn.execute("UPDATE peers SET trust_state=? WHERE pool_id=? AND agent_key_id=?",
+                 (trust_state, pool_id, agent_key_id))
+    conn.commit()
+    return get_peer(conn, pool_id, agent_key_id)
+
+
+def upsert_remote_repo(conn, repo_id, pool_id, remote_repo_id=None, link=""):
+    conn.execute(
+        "INSERT INTO remote_repos (repo_id, pool_id, remote_repo_id, link) VALUES (?,?,?,?)"
+        " ON CONFLICT(repo_id) DO UPDATE SET pool_id=excluded.pool_id,"
+        " remote_repo_id=excluded.remote_repo_id, link=excluded.link",
+        (repo_id, pool_id, remote_repo_id or repo_id, link or ""))
+    conn.commit()
+
+
+def get_remote_repo(conn, repo_id):
+    row = conn.execute("SELECT * FROM remote_repos WHERE repo_id=?", (repo_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_imported(conn, pool_id=None, repo_id=None):
+    q, p = "SELECT * FROM imported_versions WHERE 1=1", []
+    if repo_id: q += " AND repo_id=?"; p.append(repo_id)
+    q += " ORDER BY repo_id, version"
+    rows = [dict(r) for r in conn.execute(q, p)]
+    if pool_id:
+        rows = [r for r in rows if get_remote_repo(conn, r["repo_id"]) and get_remote_repo(conn, r["repo_id"])["pool_id"] == pool_id]
+    return rows
+
+
+def import_version(conn, signed_manifest, manifest_hash_value):
+    repo_id = signed_manifest["repo_id"]
+    conn.execute(
+        "INSERT OR REPLACE INTO imported_versions (repo_id, version, manifest_json, manifest_hash, state)"
+        " VALUES (?,?,?,?,?)",
+        (repo_id, signed_manifest["version"], json.dumps(signed_manifest),
+         manifest_hash_value, signed_manifest.get("state", "accepted")))
+    conn.execute(
+        "INSERT OR REPLACE INTO imported_chain (repo_id, version, manifest_hash, prev_manifest_hash, signer_key_id, signature)"
+        " VALUES (?,?,?,?,?,?)",
+        (repo_id, signed_manifest["version"], manifest_hash_value,
+         signed_manifest.get("prev_manifest_hash"), signed_manifest["signer_key_id"],
+         signed_manifest.get("signature", "")))
+    conn.commit()
+
+
+def import_ticket(conn, ticket):
+    conn.execute(
+        "INSERT OR REPLACE INTO imported_tickets (ticket_id, pool_id, repo_id, title, brief, state,"
+        " claimant_key_id, budget_json, thread_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (ticket["ticket_id"], ticket["pool_id"], ticket.get("repo_id", ""),
+         ticket.get("title", ""), ticket.get("brief", ""), ticket.get("state", "open"),
+         ticket.get("claimant_key_id"), json.dumps(ticket.get("budget") or ticket.get("budget_json") and json.loads(ticket["budget_json"]) or {}),
+         ticket.get("thread_ref"), ticket.get("created_at", _now()), ticket.get("updated_at", _now())))
+    conn.commit()
+
+
+def get_imported_ticket(conn, ticket_id):
+    row = conn.execute("SELECT * FROM imported_tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_imported_tickets(conn, pool_id=None, state=None, repo_id=None):
+    q, p = "SELECT * FROM imported_tickets WHERE 1=1", []
+    if pool_id: q += " AND pool_id=?"; p.append(pool_id)
+    if repo_id: q += " AND repo_id=?"; p.append(repo_id)
+    if state: q += " AND state=?"; p.append(state)
+    q += " ORDER BY created_at, ticket_id"
+    return [dict(r) for r in conn.execute(q, p)]
+
+
+def get_latest_imported_manifest(conn, repo_id):
+    row = conn.execute("SELECT manifest_json FROM imported_versions WHERE repo_id=? AND state='accepted' ORDER BY version DESC LIMIT 1", (repo_id,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def list_imported_chain(conn, repo_id):
+    rows = conn.execute("SELECT manifest_json FROM imported_versions WHERE repo_id=? AND state='accepted' ORDER BY version", (repo_id,)).fetchall()
+    return [json.loads(r[0]) for r in rows]
+
+
+def get_auto_approve(conn, pool_id) -> bool:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (f"auto_approve:{pool_id}",)).fetchone()
+    if row is None:
+        # Default: auto-approve ON for backwards compat (existing tickets open)
+        return True
+    return row[0] == "1"
+
+
+def set_auto_approve(conn, pool_id, enabled: bool):
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)",
+                 (f"auto_approve:{pool_id}", "1" if enabled else "0"))
+    conn.commit()
+    return bool(enabled)
+

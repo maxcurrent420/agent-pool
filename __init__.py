@@ -255,6 +255,41 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
                                   "submitter_key_id") if k in p}
                                 | ({"note": p["note"]} if "note" in p else {})
                                 for p in projects]}
+        elif sub == "import":
+            # Read-only bootstrap: import canonical manifest string(s) into
+            # the remote view. No new command family; plugin stays passive.
+            pool_id = opts.get("pool_id") or opts.get("pool", "")
+            manifest_raw = opts.get("manifest", "")
+            if not manifest_raw and rest:
+                # positional: /pool import <pool_id> <json>
+                pool_id = rest[0] if rest else pool_id
+                manifest_raw = rest[1] if len(rest) > 1 else ""
+            try:
+                manifest = json.loads(manifest_raw) if manifest_raw else {}
+            except Exception as exc:
+                return _result({"ok": False, "error": f"bad manifest JSON: {exc}"})
+            manifests = [manifest] if isinstance(manifest, dict) and "repo_id" in manifest else manifest.get("manifests", []) if isinstance(manifest, dict) else []
+            vk_hex = opts.get("verify_key", "")
+            maintainer = opts.get("maintainer", "")
+            verify_keys = {}
+            if vk_hex and maintainer:
+                from nacl.signing import VerifyKey
+                from nacl.encoding import RawEncoder
+                verify_keys = {maintainer: VerifyKey(bytes.fromhex(vk_hex), encoder=RawEncoder)}
+            elif manifests:
+                # TOFU: signer in manifest is the maintainer key.
+                signer = manifests[0].get("signer_key_id", "")
+                if vk_hex and signer:
+                    from nacl.signing import VerifyKey
+                    from nacl.encoding import RawEncoder
+                    verify_keys = {signer: VerifyKey(bytes.fromhex(vk_hex), encoder=RawEncoder)}
+            out = svc.import_canonical(pool_id, manifests, verify_keys,
+                                       tickets=manifest.get("tickets") if isinstance(manifest, dict) else None,
+                                       maintainer_key_id=maintainer or None) if manifests else {"ok": False, "error": "no manifests to import"}
+        elif sub in ("peer", "confirm"):
+            pool_id = rest[0] if rest else opts.get("pool_id", "")
+            agent_key = rest[1] if len(rest) > 1 else opts.get("key_id", "")
+            out = svc.confirm_peer(pool_id, agent_key)
         else:
             return _result({"ok": False,
                             "error": f"unknown /pool subcommand: {sub}",
@@ -272,11 +307,21 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
             return _result({"ok": False, "error": "usage: /task add|list|show"})
         sub, rest = pos[0], pos[1:]
         if sub == "add":
-            ticket = svc.add_ticket(opts.get("pool_id", ""), opts.get("repo", ""),
-                                    opts.get("title", ""), brief=opts.get("brief", ""),
-                                    budget=_budget_from_opts(opts), source=source)
-            out = {"ok": True, "ticket_id": ticket["ticket_id"],
-                   "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
+            if opts.get("packet"):
+                try:
+                    ticket = svc.accept_proposal(opts["packet"])
+                except Exception as exc:
+                    return _result({"ok": False, "error": str(exc)})
+                out = {"ok": True, "ticket_id": ticket.get("ticket_id", ""), "state": ticket.get("state", ""), "via": "proposal"}
+            else:
+                ticket = svc.add_ticket(opts.get("pool_id", ""), opts.get("repo", ""),
+                                        opts.get("title", ""), brief=opts.get("brief", ""),
+                                        budget=_budget_from_opts(opts), source=source)
+                if ticket.get("proposal"):
+                    out = {"ok": True, "kind": ticket.get("kind"), "proposal": ticket.get("proposal"), "packet": ticket.get("packet"), "notice": ticket.get("notice")}
+                else:
+                    out = {"ok": True, "ticket_id": ticket["ticket_id"],
+                           "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
         elif sub == "list":
             rows = svc.list_tickets(pool_id=opts.get("pool_id") or None,
                                     state=opts.get("state") or None,
@@ -292,8 +337,8 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
             out = {"ok": True, "ticket": {
                 "ticket_id": t["ticket_id"], "title": t["title"], "state": t["state"],
                 "repo_id": t["repo_id"], "pool_id": t["pool_id"],
-                "brief": t["brief"], "claimant": t.get("claimant_key_id"),
-                "budget": json.loads(t["budget_json"] or "{}"),
+                "brief": t.get("brief", ""), "claimant": t.get("claimant_key_id"),
+                "budget": json.loads(t.get("budget_json") or "{}"),
                 "thread_ref": t.get("thread_ref")}}
         else:
             return _result({"ok": False, "error": f"unknown /task subcommand: {sub}",
@@ -322,11 +367,12 @@ def _handle_add_repo(ctx, raw: str, *, source=None, session_id="", session_key="
         pos, opts, _flags = _parse_args(raw)
         repo_id = pos[0] if pos else opts.get("repo", "")
         path = opts.get("path", "")
+        link = opts.get("link") or opts.get("repo_link") or ""
         if not repo_id and path:
             repo_id = _slugify_path(path)
         out = svc.add_repo(opts.get("pool", "") or opts.get("pool_id", ""),
                            repo_id, path,
-                           display_name=opts.get("name", ""), source=source)
+                           display_name=opts.get("name", ""), source=source, repo_link=link or None)
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -345,8 +391,11 @@ def _handle_task_add(ctx, raw: str, *, source=None, session_id="", session_key="
                                 opts["repo"], opts.get("title", ""),
                                 brief=opts.get("brief", ""),
                                 budget=_budget_from_opts(opts), source=source)
-        out = {"ok": True, "ticket_id": ticket["ticket_id"],
-               "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
+        if ticket.get("proposal"):
+            out = {"ok": True, "kind": ticket.get("kind"), "proposal": ticket.get("proposal"), "packet": ticket.get("packet"), "notice": ticket.get("notice")}
+        else:
+            out = {"ok": True, "ticket_id": ticket["ticket_id"],
+                   "state": ticket["state"], "thread_ref": ticket.get("thread_ref")}
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)

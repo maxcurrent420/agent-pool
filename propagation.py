@@ -241,7 +241,15 @@ class RepoPropagator:
         row = self._conn.execute(
             "SELECT manifest_hash FROM manifest_chain WHERE repo_id=? ORDER BY seq DESC LIMIT 1",
             (repo_id,)).fetchone()
-        return row[0] if row else None
+        if row:
+            return row[0]
+        try:
+            row = self._conn.execute(
+                "SELECT manifest_hash FROM imported_chain WHERE repo_id=? ORDER BY seq DESC LIMIT 1",
+                (repo_id,)).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
 
     def _chain_manifests(self, repo_id: str) -> list[dict]:
         rows = self._conn.execute(
@@ -254,6 +262,18 @@ class RepoPropagator:
             manifest = json.loads(row[0])
             if manifest.get("state") == "accepted":
                 out.append(manifest)
+        if out:
+            return out
+        # Remote pool: fall back to imported chain.
+        try:
+            from ledger import list_imported_chain
+        except ImportError:
+            try:
+                from .ledger import list_imported_chain
+            except Exception:
+                list_imported_chain = None
+        if list_imported_chain is not None:
+            return list_imported_chain(self._conn, repo_id)
         return out
 
     def _verify_keys(self) -> dict:

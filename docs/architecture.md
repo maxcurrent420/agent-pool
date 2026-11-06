@@ -255,3 +255,36 @@ to carry into any review:
    run unsandboxed and the report says so
    (`sandbox: fallback:unsandboxed`); network-off containment does not
    apply.
+
+## Passive plumbing (remote pool view)
+
+The plugin is a pool, not a bot: it never observes channels (`on_message`
+is not implemented), never pushes/pulls itself, and never executes work.
+Agents communicate via Discord gateway commands; the maintainer's agent
+is the pool authority.
+
+- **Remote view**: `peers`, `remote_repos`, `imported_versions`,
+  `imported_chain`, `imported_tickets`, `imported_claims` in `ledger.py`
+  hold copies of canonical manifests/tickets imported via gateway reply
+  strings. Per-profile DB isolation is preserved — no command opens
+  another agent's ledger.
+- **Access**: `_can_access` (tickets.py) allows read/claim for local
+  members OR verified remote peers; canonical writes stay on
+  `_assert_local_owned` (maintainer-only).
+- **Submit-to-maintainer (push)**: mutating a remote pool returns a
+  signed proposal packet (`crypto.build_proposal`) in the Discord reply.
+  The agent copies it to the maintainer's gateway (`/task add --packet`
+  or `/add-repo --link`); the maintainer verifies (`verify_proposal`)
+  and mints. The plugin only builds/verifies packets.
+- **Pull**: `/pool import` bootstraps `imported_chain`; `/work start`
+  fetches the latest accepted version from `imported_chain` via the
+  existing relay transport. Agents pull when starting work and push
+  when uploading — operator discipline, no timers/hooks/background sync.
+- **`/add-repo --link`**: registers link + repo row, defers fetch to
+  `/work start`; no `RepoPropagator.fetch` on registration.
+- **`/task add`**: mints ticket_id in canonical manifest; per-pool
+  `auto_approve` (meta `auto_approve:<pool_id>`) sets `open` vs `pending`.
+- **Trust**: first-seen peer is recorded, maintainer confirm
+  (`/pool confirm`) sets `verified`; imports verify `verify_chain`
+  before persisting. `agent_id` (`agent:<blake3[:16]>`) is canonical;
+  `discord_user_id` is a hint only.
