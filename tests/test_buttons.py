@@ -24,10 +24,12 @@ def test_custom_id_format_and_parse():
 
 
 def _setup(tmp_path):
+    """Whitelisted pool: the owner's Discord id is the authorization."""
     conn = init_ledger(sqlite3.connect(":memory:"))
     conn.row_factory = sqlite3.Row
     maint = ensure_identity(tmp_path / "m")
-    create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
+    create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off",
+                owner_discord_user_id="u-maint")
     set_auto_approve(conn, "pool-1", True)
     conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo','pool-1','Demo',0)")
     conn.execute("INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, created_at) VALUES (?,?,?,0)",
@@ -40,7 +42,8 @@ def _setup(tmp_path):
 
 def test_button_refuses_unmapped_user(tmp_path):
     conn, svc, maint = _setup(tmp_path)
-    ticket = svc.add_ticket("pool-1", "demo", "T", brief="b")
+    ticket = svc.add_ticket("pool-1", "demo", "T", brief="b",
+                            source={"user_id": "u-maint"})
     # seed integration ctx so maintainer check is reached — but unmapped must fail first
     with pytest.raises(PermissionError):
         dispatch_button_event(svc, "discord", "button",
@@ -56,8 +59,12 @@ def test_button_refuses_non_maintainer(tmp_path):
     conn.execute("INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, created_at) VALUES (?,?,?,0)",
                  (other.key_id, other.verify_key.encode(RawEncoder).hex(), other.box_pk.encode(RawEncoder).hex()))
     add_member(conn, "pool-1", other.key_id, role="member", box_pubkey_hex=other.box_pk.encode(RawEncoder).hex())
+    # Authorized as a pool member, but NOT the owner: owner-only verbs refuse.
+    from ledger import authorize_user
+    authorize_user(conn, "pool-1", "u-other")
     conn.commit()
-    ticket = svc.add_ticket("pool-1", "demo", "T", brief="b")
+    ticket = svc.add_ticket("pool-1", "demo", "T", brief="b",
+                            source={"user_id": "u-maint"})
     with pytest.raises(PermissionError):
         dispatch_button_event(svc, "discord", "button",
                               {"custom_id": f"agent-pool:approve:{ticket['ticket_id']}", "user_id": "u-other"},
@@ -67,7 +74,8 @@ def test_button_refuses_non_maintainer(tmp_path):
 def test_button_dispatches_maintainer_decision(tmp_path):
     # Use mocked resolve_integration to avoid full gate.
     conn, svc, maint = _setup(tmp_path)
-    ticket = svc.add_ticket("pool-1", "demo", "Gate", brief="b")
+    ticket = svc.add_ticket("pool-1", "demo", "Gate", brief="b",
+                            source={"user_id": "u-maint"})
     # need review state + gate ctx: stub integrate by directly setting state + ctx file
     # Instead test dispatch path via monkeypatching resolve.
     called = {}

@@ -162,11 +162,15 @@ def test_pool_list_marks_repo_without_bytes(tmp_path):
     assert projects[0]["open_tickets"] == 1
 
 
-def test_pool_list_excludes_non_member_pools(tmp_path):
+def test_pool_list_excludes_pools_the_caller_is_not_authorized_for(tmp_path):
+    """2109 model: a gateway lists the HOSTED pools the caller is
+    authorized for. A hosted pool the caller has no whitelist row for is
+    not listed and is refused when named explicitly."""
     conn, _maint, _member, svc, _svc2 = _world(tmp_path)
-    # A second pool where the caller is NOT a member.
+    # A second hosted pool owned by somebody else (it has a whitelist).
     other = ensure_identity(tmp_path / "o")
-    create_pool(conn, "pool-2", "Other", other.key_id, relay_url="off")
+    create_pool(conn, "pool-2", "Other", other.key_id, relay_url="off",
+                owner_discord_user_id="other-owner")
     set_auto_approve(conn, "pool-2", True)
     conn.execute("INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex,"
                  " created_at) VALUES (?,?,?,0)",
@@ -177,10 +181,19 @@ def test_pool_list_excludes_non_member_pools(tmp_path):
     conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
                  " VALUES ('secret','pool-2','Secret',0)")
     conn.commit()
+    # The caller is not authorized for pool-2 -> not listed.
     projects = svc.list_projects()
     assert [p["repo_id"] for p in projects] == []
+    # Naming it explicitly is refused (authorized-only read verb).
+    with pytest.raises(PermissionError):
+        svc.list_projects("pool-2", source={"user_id": "somebody-else"})
+
+
+def test_pool_list_refuses_a_pool_this_gateway_does_not_host(tmp_path):
+    """A pool id this gateway does not host is refused (pool_not_local)."""
+    conn, _maint, _member, svc, _svc2 = _world(tmp_path)
     with pytest.raises(PoolNotLocalError):
-        svc.list_projects("pool-2")
+        svc.list_projects("pool-elsewhere")
 
 
 def test_task_list_repo_filter_and_cross_pool_refusal(tmp_path):
@@ -205,14 +218,21 @@ def test_task_list_repo_filter_and_cross_pool_refusal(tmp_path):
 # --- permissions / freeze ----------------------------------------------------
 
 def test_add_repo_non_member_refused(tmp_path):
+    """The pool IS hosted here, so the refusal is an authorization one:
+    a stranger with no whitelist row and no membership cannot add a repo.
+    (The pool is given an owner so the whitelist gate is active — exactly
+    as production pools always are.)"""
     conn, _maint, _member, svc, _svc2 = _world(tmp_path)
+    conn.execute("UPDATE pools SET owner_discord_user_id='owner-1'"
+                 " WHERE pool_id='pool-1'")
+    conn.commit()
     stranger = ensure_identity(tmp_path / "s")
     svc2 = PoolService(conn, FakeTransport(), caller_key_id=stranger.key_id,
                        caller_signing_key=stranger.signing_key,
                        caller_box_sk=stranger.box_sk)
     src = _git_repo(tmp_path / "src")
-    with pytest.raises(PoolNotLocalError):
-        svc2.add_repo("pool-1", "demo", str(src))
+    with pytest.raises(PermissionError):
+        svc2.add_repo("pool-1", "demo", str(src), source={"user_id": "stranger-1"})
 
 
 def test_freeze_blocks_add_repo_and_task_add_but_not_listings(tmp_path):

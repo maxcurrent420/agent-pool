@@ -31,30 +31,26 @@ def _setup(tmp_path):
 
 def test_pool_not_local_refusal(tmp_path):
     conn, svc, _ = _setup(tmp_path)
-    with pytest.raises(PoolNotLocalError, match="pool_not_local"):
+    with pytest.raises(PoolNotLocalError, match="is not hosted by this gateway"):
         svc.add_ticket("pool-remote", "demo", "Nope")
-    # also via invite
-    with pytest.raises(PoolNotLocalError, match="pool_not_local"):
-        svc.invite("pool-remote", "agent:x")
 
 
 def test_chat_binding_resolution_order(tmp_path):
+    # 2109 P2: no chat binding. Explicit --pool or the single hosted pool;
+    # foreign pools are refused naming hosted pools.
     conn, svc, maint = _setup(tmp_path)
-    # explicit beats chat binding
     create_pool(conn, "pool-2", "Two", maint.key_id)
     conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('r2','pool-2','R2',0)")
     add_member(conn, "pool-2", maint.key_id, role="maintainer", box_pubkey_hex=maint.box_pk.encode(RawEncoder).hex())
     conn.commit()
-    # bind chat to pool-2, but call with explicit pool-1 must win
-    source = {"chat_id": "c1", "guild_id": "g1", "thread_id": None}
-    svc.register_pool("pool-3", "Three", source=source)  # device1 pool-3 caller is maint; binds c1->pool-3
-    # After register, resolving for that chat should be pool-3
-    assert svc._resolve_pool(None, source=source) == "pool-3"
-    # explicit pool-1 still wins
-    assert svc._resolve_pool("pool-1", source=source) == "pool-1"
-    # single-pool fallback: when only one pool and no chat binding
+    assert svc._resolve_pool("pool-1", source={"chat_id": "c1"}) == "pool-1"
+    assert svc._resolve_pool("pool-2", source={"chat_id": "c1"}) == "pool-2"
+    # single-pool fallback
     conn2, svc2, _ = _setup(tmp_path)
     assert svc2._resolve_pool(None, source={"chat_id": "unknown"}) == "pool-1"
+    # foreign pool refused naming hosted
+    with pytest.raises(PoolNotLocalError, match="is not hosted by this gateway"):
+        svc._resolve_pool("pool-foreign", source=None)
     # no pool bound + multiple pools -> refusal
     with pytest.raises(PoolNotLocalError, match="no pool bound"):
         svc._resolve_pool(None, source={"chat_id": "unknown2"})

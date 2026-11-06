@@ -120,11 +120,12 @@ class FakeCtx:
 
 
 def _setup_world(tmp_path, monkeypatch):
-    """Real in-memory ledger + real PoolService; maintainer bound to '42'."""
+    """Real in-memory ledger + real PoolService; owner is Discord user '42'."""
     conn = L.init_ledger(sqlite3.connect(":memory:"))
     conn.row_factory = sqlite3.Row
     maint = ensure_identity(tmp_path / "m")
-    L.create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
+    L.create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off",
+                  owner_discord_user_id="42")
     conn.execute(
         "INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo','pool-1','Demo',0)")
     conn.execute(
@@ -139,7 +140,8 @@ def _setup_world(tmp_path, monkeypatch):
     svc = PoolService(conn, __import__("transport").FakeTransport(),
                       caller_key_id=maint.key_id, caller_signing_key=maint.signing_key,
                       caller_box_sk=maint.box_sk)
-    ticket = svc.add_ticket("pool-1", "demo", "Gate ticket", brief="b")
+    ticket = svc.add_ticket("pool-1", "demo", "Gate ticket", brief="b",
+                            source={"user_id": "42"})
 
     # Point the plugin's _service_for at this ledger + tmp data dir.
     monkeypatch.setattr(L, "get_db", lambda: conn)

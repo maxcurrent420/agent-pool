@@ -362,11 +362,29 @@ def test_13_budget_tracker_hard_kill_dimensions():
 
 
 # 14 -----------------------------------------------------------------------
+def _whitelist(world):
+    """Give pool-1 a whitelist: 'discord-maint' owns it, 'discord-contrib'
+    is an authorized user (matches the 2109 production model, where every
+    pool has an owner)."""
+    from ledger import authorize_user
+    world.conn.execute(
+        "UPDATE pools SET owner_discord_user_id='discord-maint'"
+        " WHERE pool_id='pool-1'")
+    for uid in ("discord-maint", "discord-contrib"):
+        authorize_user(world.conn, "pool-1", uid)
+    world.conn.commit()
+    return {"user_id": "discord-maint"}, {"user_id": "discord-contrib"}
+
+
 def test_14_button_bridge_maintainer_approve(world):
-    ticket = world.make_ticket("Bridge approve")
+    owner, contrib = _whitelist(world)
+    ticket = world.maint_svc.add_ticket("pool-1", "demo", "Bridge approve",
+                                        brief="Scope: hello.txt", source=owner)
     tid = ticket["ticket_id"]
-    world.submit_contrib(tid)
-    world.maint_svc.integrate(tid, work_dir=world.work_dir)
+    world.contrib_svc.claim(tid, declared_paths=["hello.txt"], source=contrib)
+    branch = world.contributor_branch(tid, "hello.txt", "v2\n")
+    world.contrib_svc.work_submit(tid, branch, 2, source=contrib)
+    world.maint_svc.integrate(tid, work_dir=world.work_dir, source=owner)
     result = dispatch_button_event(
         world.maint_svc, "discord", "button",
         {"custom_id": f"approve:{tid}", "user_id": "discord-maint"},
@@ -379,10 +397,22 @@ def test_14_button_bridge_maintainer_approve(world):
 
 # 15 -----------------------------------------------------------------------
 def test_15_button_bridge_non_maintainer_refused(world):
-    ticket = world.make_ticket("Bridge refuse")
+    owner, contrib = _whitelist(world)
+    ticket = world.maint_svc.add_ticket("pool-1", "demo", "Bridge refuse",
+                                        brief="Scope: hello.txt", source=owner)
     tid = ticket["ticket_id"]
-    world.submit_contrib(tid)
-    world.maint_svc.integrate(tid, work_dir=world.work_dir)
+    world.contrib_svc.claim(tid, declared_paths=["hello.txt"], source=contrib)
+    branch = world.contributor_branch(tid, "hello.txt", "v2\n")
+    world.contrib_svc.work_submit(tid, branch, 2, source=contrib)
+    world.maint_svc.integrate(tid, work_dir=world.work_dir, source=owner)
+    # An authorized non-owner is refused by the button gate.
+    with pytest.raises(PermissionError):
+        dispatch_button_event(
+            world.maint_svc, "discord", "button",
+            {"custom_id": f"approve:{tid}", "user_id": "discord-contrib"},
+            identity_map={"discord-contrib": world.contrib.key_id},
+            work_dir=world.work_dir)
+    # An intruder with no whitelist row is refused too (fail closed).
     with pytest.raises(PermissionError):
         dispatch_button_event(
             world.maint_svc, "discord", "button",

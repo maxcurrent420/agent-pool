@@ -280,41 +280,48 @@ def test_command_handlers_smoke(tmp_path):
     try:
         ctx = _FakeCtx()
         plugin.register(ctx)
-        out = json.loads(ctx.commands["pool"]("register pool-1 --name Team"))
+        # Whitelist model: register requires the owner discord id, and
+        # every owner-only verb below is driven by that same id.
+        OWNER = {"user_id": "owner-1"}
+        out = json.loads(ctx.commands["pool"]("register pool-1 --name Team --discord-user owner-1"))
         assert out["ok"] and out["maintainer"] == ident.key_id
-        out = json.loads(ctx.commands["pool"]("auto-approve on --pool pool-1"))
+        out = json.loads(ctx.commands["pool"]("auto-approve on --pool pool-1", source=OWNER))
         assert out["ok"] and out["auto_approve"] is True
-        out = json.loads(ctx.commands["pool"](f"invite pool-1 agent:alice --role member"))
+        out = json.loads(ctx.commands["pool"](f"invite pool-1 agent:alice --role member --discord-user alice-1", source=OWNER))
         assert out["role"] == "member"
-        out = json.loads(ctx.commands["pool"]("members pool-1"))
+        out = json.loads(ctx.commands["pool"]("members pool-1", source=OWNER))
         assert {m["key_id"] for m in out["members"]} == {ident.key_id, "agent:alice"}
         out = json.loads(ctx.commands["task"](
-            'add --pool-id pool-1 --repo demo --title "Fix it" --brief "Scope: a.py"'))
+            'add --pool-id pool-1 --repo demo --title "Fix it" --brief "Scope: a.py"',
+            source=OWNER))
         assert out["ok"] and out["state"] == "open"
         ticket_id = out["ticket_id"]
         assert ticket_id.startswith("t-")
-        out = json.loads(ctx.commands["task"]("list --pool-id pool-1"))
+        out = json.loads(ctx.commands["task"]("list --pool-id pool-1", source=OWNER))
         assert [t["ticket_id"] for t in out["tickets"]] == [ticket_id]
-        out = json.loads(ctx.commands["task"](f"show {ticket_id}"))
+        out = json.loads(ctx.commands["task"](f"show {ticket_id}", source=OWNER))
         assert out["ticket"]["title"] == "Fix it"
         out = json.loads(ctx.commands["claim"](
-            f"{ticket_id} --paths src/a.py --max-turns 7"))
+            f"{ticket_id} --paths src/a.py --max-turns 7", source=OWNER))
         assert out["ok"] and out["claim"]["state"] == "active"
         assert json.loads(out["claim"]["budget_json"])["max_turns"] == 7
-        out = json.loads(ctx.commands["release"](ticket_id))
+        out = json.loads(ctx.commands["release"](ticket_id, source=OWNER))
         assert out["ok"] and out["ticket_id"] == ticket_id and out["state"] == "open"
         out = json.loads(ctx.commands["work"](
-            f"submit {ticket_id} --repo-path /nonexistent --version 1"))
+            f"submit {ticket_id} --repo-path /nonexistent --version 1", source=OWNER))
         assert out["ok"] is False  # not claimed -> clean error, no crash
-        out = json.loads(ctx.commands["integrate"](ticket_id))
-        assert out["ok"] is False  # not maintainer -> clean error
-        out = json.loads(ctx.commands["audit"](f"show {ticket_id}"))
+        out = json.loads(ctx.commands["integrate"](ticket_id, source=OWNER))
+        assert out["ok"] is False  # owner, but nothing to integrate yet
+        out = json.loads(ctx.commands["audit"](f"show {ticket_id}", source=OWNER))
         assert out["ok"] is False  # no audit yet -> clean error
-        out = json.loads(ctx.commands["pool"]("freeze pool-1"))
+        # Freeze is owner-only (2109): a non-owner is refused outright.
+        out = json.loads(ctx.commands["pool"]("freeze pool-1", source={"user_id": "alice-1"}))
+        assert out["ok"] is False
+        out = json.loads(ctx.commands["pool"]("freeze pool-1", source=OWNER))
         assert out["frozen"] is True
-        out = json.loads(ctx.commands["pool"]("freeze pool-1 --unfreeze"))
+        out = json.loads(ctx.commands["pool"]("freeze pool-1 --unfreeze", source=OWNER))
         assert out["frozen"] is False
-        out = json.loads(ctx.commands["pool"]("bogus pool-1"))
+        out = json.loads(ctx.commands["pool"]("bogus pool-1", source=OWNER))
         assert out["ok"] is False
     finally:
         plugin._service_for = original
