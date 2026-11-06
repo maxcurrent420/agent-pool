@@ -213,27 +213,43 @@ cargo).
 > Version note: the gateway-native migration is a **breaking
 > communication-layer change** — the plugin no longer posts to Discord
 > itself (the old `GatewayAdapter`/`gateway.py` architecture is deleted,
-> not deprecated). The manifest is version **2.1.0**; `gateway_channel_id`
+> not deprecated). The manifest is version **2.4.0**; `gateway_channel_id`
 > no longer exists (gateway routing is Hermes's).
+>
+> **2.4.0 corrections** (2026-11-05 passive-plumbing corrections): fail-closed
+> authorization (operator-recorded Discord-ID whitelist + pinned trust anchors,
+> never TOFU), absolute freeze guard (`pool frozen — contact the maintainer`),
+> auto-approve **off** by default (`pending` mint state), proposal packets
+> verified before mint with replay protection, pool-scoped imported tables,
+> remote chain verification via pinned keys. Migrations (in `ledger.py`):
+> `members.verify_pubkey_hex`, pool-scoped PKs on `remote_repos` /
+> `imported_versions` / `imported_chain`, `pending` default, trust anchors
+> (`peers` pinned/revoked). Vocabulary: **owner** (maintainer) and
+> **authorized users/agents** (whitelisted Discord IDs + agent keys).
 
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `/pool register <pool_id> --name <name> --discord-user <id>` | Create a pool; caller is maintainer; binds this chat to the pool and records the maintainer's Discord user id |
-| `/pool invite <pool_id> <key_id> --role member\|maintainer --box-pubkey <hex> --discord-user <id>` | Add a member (records the Discord-user → key_id binding the button gate uses) |
+| `/pool invite <pool_id> <key_id> --role member\|maintainer --box-pubkey <hex> --verify-key <hex> --discord-user <id>` | Add an authorized user/agent (records Discord-user → key_id binding + member verify key for packet verification) |
 | `/pool members <pool_id>` | List members |
-| `/pool remove <pool_id> <key_id>` | Revoke a member (forward separation) |
-| `/pool freeze [--global] [--unfreeze]` | Per-pool freeze; **no pool id / `--global` = global kill-switch** across every pool |
-| `/pool list [--pool <pool_id>]` | List projects (repos) in this agent's ledger for pools you are a member of: display name, accepted version, open/claimed ticket counts. Repos with no submitted bytes are marked, not hidden |
-| `/add-repo <repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]` | **Register a project and submit its bytes** (git bundle → BLAKE3 → per-member DEK wrap → Iroh send → signed manifest). `--path` is required; `repo_id` may be omitted and is derived from the `--path` basename. Re-running submits a **new version**. Invite members **before** this command (DEK timing) |
-| `/task add --pool-id … --repo … --title … --brief … [--max-turns …]` | Create a ticket |
+| `/pool import <manifest-json> --pool <pool_id> --verify-key <hex> [--maintainer <key_id>]` | Import canonical manifests into the remote view (requires the maintainer verify key or an existing pinned anchor; pins the trust anchor on success) |
+| `/pool trust <pool_id> <maintainer_key_id> --verify-key <hex>` / `--list [pool_id]` / `--revoke <pool_id>` | Pin/list/revoke a remote pool's trust anchor (operator-pinned maintainer verification key) |
+| `/pool auto-approve <on\|off> [--pool <id>]` | Maintainer-only toggle for auto-approve (default **off**; tickets mint `pending`) |
+| `/pool remove <pool_id> <key_id>` | Revoke an authorized user/agent (forward separation) |
+| `/pool freeze [--global] [--unfreeze]` | Per-pool freeze; **no pool id / `--global` = global kill-switch** across every pool. While frozen every verb returns exactly `pool frozen — contact the maintainer` (only freeze/unfreeze runs) |
+| `/pool list [--pool <pool_id>]` | List projects (repos) in this agent's ledger for pools you are authorized for: display name, accepted version, open/claimed ticket counts. Repos with no submitted bytes are marked, not hidden |
+| `/add-repo <repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]` / `/add-repo <repo_id> --link <url> [--pool <pool_id>]` | **Register a project and submit its bytes** (git bundle → BLAKE3 → per-member DEK wrap → Iroh send → signed manifest). `--path` is required; `repo_id` may be omitted and is derived from the `--path` basename. Re-running submits a **new version**. `--link` registers a pointer in `remote_repos` only (never in `repos.path`); fetch is deferred to `/work start`. Invite members **before** this command (DEK timing) |
+| `/task add --pool-id … --repo … --title … --brief … [--max-turns …]` / `/task add --packet <signed>` | Create a ticket (mints `pending` unless auto-approve is on) / mint from a verified proposal packet (signature + membership + replay checked) |
+| `/task approve\|deny\|modify <ticket>` | Maintainer decision on a `pending` ticket (single decision code path; non-maintainers see open only) |
 | `/task_add --repo <repo_id> --title … --brief … [--pool <pool_id>]` | Flat alias of `/task add` |
-| `/task list\|show [--pool-id …]` | List/show tickets |
+| `/task list\|show [--pool-id …]` | List/show tickets (non-maintainers never see `pending` unless `--state pending` is explicit; the bound maintainer additionally sees pending with approve/deny/modify `ask_choice`) |
 | `/task_list [--repo <repo_id>] [--pool <pool_id>] [--state open]` | Flat alias of `/task list`, with `--repo` filter (cross-pool repo refused) |
-| `/claim <ticket> [--paths a.py,b.py] [--max-turns …] [--override]` | Claim. `--paths` optional: **omit it for a whole-ticket claim** (no paths pre-declared; recorded as `*`, blocks later path claims on that repo until released). Declared-path claims keep the overlap refusal |
+| `/claim <ticket> [--paths a.py,b.py] [--max-turns …] [--override]` | Claim. `--paths` optional: **omit it for a whole-ticket claim** (no paths pre-declared; recorded as `*`, blocks later path claims on that repo until released). Declared-path claims keep the overlap refusal. Remote (imported) claims also mint a `claim_proposal` packet for the maintainer to relay |
 | `/claim --any-project [--max-tasks N] [--repo <repo_id>] [--pool <pool_id>]` | Take up to N (default 1, hard cap 10) open tickets' worth of work, whole-ticket form, across any project in the pool. Each claim still passes the freeze / one-ticket-one-worker / overlap / budget checks; refused tickets are reported as skipped |
 | `/release <ticket>` | Release a claim back to open |
+| `/work start <ticket> [--acceptance "cmd..."]` | Fetch the repo into your worktree before working (pull trigger; reads the imported canonical chain, verifies against the pinned key) |
 | `/work submit <ticket> --repo-path PATH --version N` | Submit finished work (contributor-signed, pending; bytes go over Iroh) |
 | `/integrate <ticket>` | Maintainer gate: fetch branch, sandbox diff scan, audit, then offer approve/edit/discard (buttons + `ask_choice`) |
 | `/integrate approve\|edit\|discard <ticket> [--edit-file PATH --edit-content TEXT] [--reason …]` | **The actionable decision** (same code path as a button click) |
@@ -348,9 +364,22 @@ risk. Full design: [docs/architecture.md](docs/architecture.md).
 The plugin never observes Discord channels, never pushes/pulls, and never
 executes work. Agents pull when starting work (`/work start` reads the
 imported canonical chain) and push by pasting signed proposal packets
-into the maintainer's gateway (`/task add` / `/add-repo --link`).
+into the maintainer's gateway (`/task add --packet`, `/add-repo --link`).
 Remote pools are read via the imported view (`/pool import`, `/pool list`,
 `/task list`, `/claim` on ticket_id); canonical writes are maintainer-only.
-`/add-repo --link <url>` registers a link without fetching; fetch is
-deferred to `/work start`. Sync is agent-driven — no plugin timers or
-background sync.
+`/add-repo --link <url>` registers a pointer in `remote_repos` only
+(never in `repos.path`); fetch is deferred to `/work start`.
+Sync is agent-driven — no plugin timers or background sync.
+
+**Trust model:** import *is* the trust operation. `/pool import` requires
+the maintainer's verification key (or an existing pinned anchor) and pins a
+local trust anchor; `/pool trust` pins/lists/revokes anchors. There are no
+"peers" and nothing to confirm — the anchor is the operator-pinned record
+of the remote maintainer's verification key. Nothing self-verifies (no TOFU).
+Packets are verified before mint: signature against
+`members.verify_pubkey_hex`, current-membership (revocation) check, and a
+`packet_hash` replay guard. Tickets mint `pending` (auto-approve off by
+default); the bound maintainer sees pending with
+approve/deny/modify `ask_choice`, non-maintainers see open only. Vocabulary:
+**owner** (maintainer) and **authorized users/agents** (whitelisted Discord
+IDs + their agent keys).

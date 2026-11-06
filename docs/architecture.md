@@ -288,3 +288,12 @@ is the pool authority.
   (`/pool confirm`) sets `verified`; imports verify `verify_chain`
   before persisting. `agent_id` (`agent:<blake3[:16]>`) is canonical;
   `discord_user_id` is a hint only.
+
+### Passive plumbing — corrected model (2.4.0)
+
+- **Anchor pinning:** `/pool import <manifest> --verify-key <hex>` verifies the chain against the supplied key and pins a local trust anchor (`peers` pinned). `/pool trust` pins/lists/revokes anchors. Revoking blocks future imports/fetches; existing local copies remain.
+- **Verify-key threading:** `/pool invite --verify-key <hex>` records `members.verify_pubkey_hex`; `/task add --packet` verifies the signature against it before mint, checks current membership (revocation) and replays (`packet_hash` in `events`).
+- **Pool-scoped imports:** `remote_repos`, `imported_versions`, `imported_chain` are PK'd `(pool_id, repo_id, ...)` — same repo name in two pools stays distinct.
+- **Resolver order:** explicit `--pool` → pinned-anchor remote → local pool. A named remote pool resolves only via a pinned anchor; `_can_access` is fail-closed (maintainer/member or anchor + `wrapped_keys` for claims/fetch).
+- **Freeze:** one guard in `_wrap_command`; frozen returns exactly `pool frozen — contact the maintainer` and records a `freeze_blocked` event. Only freeze/unfreeze runs while frozen.
+- **Approval queue:** non-maintainers see open/accepted only; the bound maintainer sees `pending` with approve/deny/modify `ask_choice` → `resolve_pending`.
