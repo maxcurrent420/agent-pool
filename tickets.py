@@ -678,25 +678,19 @@ class PoolService:
     def list_projects(self, pool_id=None, source=None) -> list:
         """Hosted-pool-only project listing for /pool list.
 
-        Authorized-only read verb (whitelist model); when no pool is
-        named and the gateway hosts several, every hosted pool the
-        caller is authorized for is listed.
+        Authorized-only read verb (whitelist model). One pool per gateway:
+        when no pool is named, the single hosted pool is resolved via
+        _resolve_pool; a PoolNotLocalError (no/foreign/multiple hosted
+        pools) is re-raised as pool_not_local — never aggregated across
+        hosted pools.
         """
         if pool_id:
             resolved = self._resolve_pool(pool_id, source=source)
             self._require_pool_authorized(resolved, source)
             return self._project_rows(resolved)
-        try:
-            bound = self._resolve_pool(None, source=source)
-            self._require_pool_authorized(bound, source)
-            return self._project_rows(bound)
-        except PoolNotLocalError:
-            pass
-        projects: list = []
-        for pid in L.list_local_pools(self._conn):
-            if self._is_authorized_or_legacy(pid, source):
-                projects.extend(self._project_rows(pid))
-        return projects
+        bound = self._resolve_pool(None, source=source)
+        self._require_pool_authorized(bound, source)
+        return self._project_rows(bound)
 
     def _is_authorized_or_legacy(self, pool_id, source) -> bool:
         """True when the caller may read *pool_id*: authorized, or the

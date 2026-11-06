@@ -44,7 +44,7 @@ state.
 
 Budgets are **recorded per claim, not metered**: `normalize_budget`
 validates positive ints (`ledger.py:421-430`); there is no runtime
-metering/kill. `L.release_claim_for_ticket` is dead code (no caller).
+metering/kill.
 `BUDGET_DEFAULTS = {"max_turns":25, "max_tasks_per_day":5, "token_cap":50000,
 "wall_clock_seconds":1800}` (`ledger.py:341-342`).
 
@@ -140,15 +140,11 @@ ControlPort is cookie-auth-disabled and bound to `127.0.0.1` only
 | `token_cap` | `50000` | per-claim budget (recorded, not metered) |
 | `wall_clock_seconds` | `1800` | per-claim budget (recorded, not metered) |
 | `pools` | `{}` | per-pool overrides (budgets, relay) |
-| `transport` | `real` (declared) | code falls back to `fake` (in-memory) when unset — see note |
+| `transport` | `real` | `real` (send_hermes/Iroh) or `fake` (in-memory, tests/CLI) |
 
-Note: `plugin.yaml` declares `transport` default `real`, but the plugin's
-own code uses `_cfg(ctx, "transport", "fake")` (`__init__.py:177`), and
-Hermes does not seed `config_schema` defaults into `plugins.entries`
-settings. An operator who never saves settings therefore runs with the
-in-memory fake transport. **Set `transport: real` explicitly for live
-transfers.** This mismatch is a known defect flagged for follow-up (not
-changed in this phase).
+The code default for `transport` is `real`, matching `plugin.yaml`: an
+unset key runs the real transport. Set `transport: fake` only for
+tests/CLI.
 
 Env vars: `HERMES_IROH_RELAY`, `HERMES_IROH_STATE_DIR`,
 `HERMES_IROH_SEND_TIMEOUT` (90s), `HERMES_IROH_FETCH_TIMEOUT` (600s),

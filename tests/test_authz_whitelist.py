@@ -181,3 +181,38 @@ def test_authz_helpers_do_not_read_identities_or_members(tmp_path):
     finally:
         _t.PoolService._require_owner = real_require_owner
         _t.PoolService._require_authorized = real_require_authorized
+
+
+# --- wrapper seam + freeze (migrated from deleted test_authz.py) -----------
+
+def test_unmapped_discord_user_refused_via_wrapper(tmp_path):
+    """An unmapped/uninvited Discord id is refused at the command wrapper."""
+    conn, svc, _f, _m, _fr = world(tmp_path)
+    import __init__ as plugin
+    orig = plugin._service_for
+    plugin._service_for = lambda ctx, source=None: svc
+    try:
+        class Ctx:
+            pass
+
+        wrapped = plugin._wrap_command(plugin._handle_task, Ctx())
+        out = wrapped("list --pool-id pool-1", source={"user_id": "unmapped-123"})
+        assert "not authorized" in out
+    finally:
+        plugin._service_for = orig
+
+
+def test_frozen_blocks_every_user_except_owner_unfreeze(tmp_path):
+    """While frozen, every verb from every user raises the exact frozen
+    message; only the owner's unfreeze runs."""
+    conn, svc, friend_svc, _m, _fr = world(tmp_path)
+    from ledger import FROZEN_MESSAGE
+    svc.freeze("pool-1", True, source=src(OWNER))
+    for user in (OWNER, FRIEND, STRANGER):
+        with pytest.raises(Exception) as exc:
+            svc.add_ticket("pool-1", "demo", "X", source=src(user))
+        assert str(exc.value) == FROZEN_MESSAGE
+    out = svc.freeze("pool-1", False, source=src(OWNER))
+    assert out["frozen"] is False
+    assert svc.add_ticket("pool-1", "demo", "After unfreeze",
+                          source=src(OWNER))["ticket_id"]

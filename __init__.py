@@ -174,7 +174,7 @@ def _service_for(ctx, source=None):
     conn = L.get_db()
     data_dir = L.default_db_path().parent
     identity = ensure_identity(data_dir)
-    transport_name = _cfg(ctx, "transport", "fake") if ctx else "fake"
+    transport_name = _cfg(ctx, "transport", "real") if ctx else "real"
     mode, relay_url, per_pool = _transport_config(ctx)
     # An empty relay_url in config means "unset" (env/CLI default apply);
     # a non-empty one beats the env var. A non-empty "off" is rejected by
