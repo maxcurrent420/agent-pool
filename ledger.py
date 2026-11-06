@@ -148,11 +148,20 @@ CREATE TABLE IF NOT EXISTS pool_gateways (
     added_at REAL,
     last_seen REAL
 );
+CREATE TABLE IF NOT EXISTS push_grants (
+    token TEXT PRIMARY KEY,
+    pool_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    key_id TEXT NOT NULL,
+    issued_at REAL NOT NULL,
+    consumed_at REAL
+);
 """
 
 TABLES = ("pools", "members", "identities", "repos", "repo_versions",
           "manifest_chain", "tickets", "claims", "file_claims", "audits",
-          "events", "pool_chats", "remote_repos", "pool_authorized", "pool_gateways")
+          "events", "pool_chats", "remote_repos", "pool_authorized", "pool_gateways",
+          "push_grants")
 
 
 def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -727,6 +736,41 @@ def get_active_claim(conn, ticket_id) -> dict | None:
     row = conn.execute(
         "SELECT * FROM claims WHERE ticket_id=? AND state='active'", (ticket_id,)).fetchone()
     return dict(row) if row else None
+
+
+# --- Phase 4: push grants (one-time, claimant-only capabilities) ------------
+# A grant is issued by /push repo on the pool gateway to the claimant of a
+# claimed ticket. It is consumed exactly once, on a successful deliver;
+# validity is computed from the ticket state (valid while the ticket is
+# still claimed by the grant's key), so a released/completed ticket makes
+# every outstanding grant for it refuse at deliver time.
+
+def create_push_grant(conn, token, pool_id, ticket_id, key_id) -> dict:
+    conn.execute(
+        "INSERT INTO push_grants (token, pool_id, ticket_id, key_id, issued_at, consumed_at)"
+        " VALUES (?,?,?,?,?,NULL)",
+        (str(token), pool_id, ticket_id, key_id, _now()))
+    conn.commit()
+    return get_push_grant(conn, token)
+
+
+def get_push_grant(conn, token) -> dict | None:
+    if not token:
+        return None
+    row = conn.execute("SELECT * FROM push_grants WHERE token=?", (str(token),)).fetchone()
+    return dict(row) if row else None
+
+
+def consume_push_grant(conn, token) -> dict | None:
+    """Consume the grant exactly once. Returns the grant row, or None when
+    the token is unknown or already consumed (replay)."""
+    cur = conn.execute(
+        "UPDATE push_grants SET consumed_at=? WHERE token=? AND consumed_at IS NULL",
+        (_now(), str(token)))
+    conn.commit()
+    if cur.rowcount != 1:
+        return None
+    return get_push_grant(conn, token)
 
 
 def get_latest_accepted_manifest(conn, repo_id) -> dict | None:

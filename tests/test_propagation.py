@@ -82,40 +82,16 @@ def world(tmp_path):
     }
 
 
-def _manual_pending_manifest(world):
-    """Build a signed pending manifest for contributor's repo, as if from /push repo.
+def _manual_push_manifest(world):
+    """Build a contributor push manifest via build_push_bundle (push path).
 
-    submit() is maintainer-only now, so pending submissions are built manually:
-    pack -> hash -> encrypt with fresh DEK -> wrap DEK per member -> transport
-    send -> build_manifest(state=pending) -> sign with contributor key.
+    The bundle is a transient contributor-signed body (state=submitted),
+    never persisted; the deliver gate verifies it at audit/accept time.
     """
-    from nacl.public import PublicKey
-
-    bundle = pack_bundle(world["src"])
-    content_hash = blake3_hash(bundle)
-    dek = secrets.token_bytes(32)
-    ciphertext = encrypt_bundle(bundle, dek)
-    wrapped_keys = {}
-    for member_id, member in world["prop"]._members.items():
-        if not member.box_pubkey_hex:
-            continue
-        pk = PublicKey(bytes.fromhex(member.box_pubkey_hex), encoder=RawEncoder)
-        wrapped_keys[member_id] = wrap_dek(pk, dek).hex()
-    cipher_file = world["tmp"] / "pending-cipher.enc"
-    cipher_file.write_bytes(ciphertext)
-    sent = world["transport"].send(cipher_file)
-    ticket = sent["ticket"]
-    body = build_manifest(
-        repo_id="demo", version=1,
-        signer_key_id=world["contrib_id"],
-        submitter_key_id=world["contrib_id"],
-        state="pending",
-        wrapped_keys=wrapped_keys,
-        transfer_ticket=ticket,
-        content_hash=content_hash,
-        size_bytes=len(bundle),
-    )
-    return sign_manifest(world["identities"]["a-contrib"].signing_key, body)
+    return world["prop"].build_push_bundle(
+        repo_path=world["src"], repo_id="demo", version=1,
+        pusher=world["members"][world["contrib_id"]],
+        pusher_signing_key=world["identities"]["a-contrib"].signing_key)["manifest"]
 
 
 def test_pack_hash_encrypt_manifest(world):
@@ -155,18 +131,19 @@ def test_contributor_submit_refused(world):
     assert world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0] == 0
 
 
-def test_contributor_pending_audit_accept_chain(world):
-    # Contributor submit is now maintainer-only; pending manifests come from /push repo.
+def test_contributor_push_audit_accept_chain(world):
+    # Contributor submit is maintainer-only; pushes go via build_push_bundle.
     with pytest.raises(PermissionError, match="maintainer-only"):
         world["prop"].submit(
             repo_path=world["src"], repo_id="demo", version=1,
             submitter=world["members"][world["contrib_id"]],
             submitter_signing_key=world["identities"]["a-contrib"].signing_key)
-    # Build the pending manifest manually (push-repo path).
-    manifest = _manual_pending_manifest(world)
-    assert manifest["state"] == "pending"
-    # chain NOT appended for pending submissions
+    # Build the push manifest (push-repo path).
+    manifest = _manual_push_manifest(world)
+    assert manifest["state"] == "submitted"
+    # chain NOT appended for push submissions (transient body, no ledger write)
     assert world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0] == 0
+    assert world["conn"].execute("SELECT COUNT(*) FROM repo_versions").fetchone()[0] == 0
 
     aud = world["prop"].audit(
         manifest=manifest, maintainer=world["members"][world["maint_id"]])
@@ -256,15 +233,6 @@ def test_contributor_signature_not_accepted(world):
         world["prop"].fetch(manifest=signed,
                              fetcher=world["members"][world["member_id"]],
                              dest=world["tmp"] / "forged")
-
-
-def test_rejection_leaves_chain_unchanged(world):
-    manifest = _manual_pending_manifest(world)
-    before = world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0]
-    rej = world["prop"].reject(manifest=manifest, reason="needs tests", maintainer=world["members"][world["maint_id"]])
-    assert "rejected" in rej["notice"]
-    after = world["conn"].execute("SELECT COUNT(*) FROM manifest_chain").fetchone()[0]
-    assert before == after == 0
 
 
 def test_chain_tamper_detected(world):

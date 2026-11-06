@@ -338,7 +338,7 @@ def test_register_wires_new_commands():
     plugin = _load_plugin()
     ctx = _FakeCtx()
     plugin.register(ctx)
-    assert {"pool", "fetch", "task", "claim", "release", "audit",
+    assert {"pool", "fetch", "task", "claim", "release", "push", "audit",
             "add-repo", "task_add", "task_list"} == set(ctx.commands)
 
 

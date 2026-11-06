@@ -468,8 +468,8 @@ class PoolService:
         Owner-only (whitelist model): requires ownership of every hosted
         pool. Sets the ledger ``meta`` flag (persists across restarts) and
         mirrors it into each pool's per-pool flag so ``is_frozen`` stays
-        truthful. While set, all pool-mutating and claim/work/integrate
-        actions raise (see ``_check_not_frozen``); only this command (to
+        truthful. While set, all pool-mutating, claim, and push actions
+        raise (see ``_check_not_frozen``); only this command (to
         unfreeze) and read-only queries are allowed. Notice posted to every
         pool channel.
         """
@@ -842,7 +842,165 @@ class PoolService:
         updated["notice"] = notice
         return updated
 
-    # -- Phase 4: agent execution --------------------------------------------
+    # -- Phase 4: push write path (grant -> push -> deliver -> complete) -----
+
+    def push_repo(self, repo_id, ticket_id, *, pool_id=None, source=None) -> dict:
+        """Issue a one-time push grant for a claimed task (the ``/push
+        repo <repo_id> --ticket <id>`` verb, on the POOL's gateway).
+
+        Claimant-only: the ticket must be ``claimed`` by the driving
+        user's invite-bound key. The grant token plus the gateway
+        addressing is the push link; the contributor's agent pushes the
+        diff over the configured transport and delivers the transfer
+        ticket + grant back (see :meth:`push_deliver`).
+        """
+        resolved = self._resolve_pool(pool_id, source=source)
+        self._check_not_frozen(resolved)
+        self._require_authorized(resolved, source)
+        ticket = self.show_ticket(ticket_id)
+        if ticket["pool_id"] != resolved:
+            raise PoolNotLocalError(
+                f"pool_not_local: ticket {ticket_id!r} belongs to pool "
+                f"{ticket['pool_id']!r}, not pool {resolved!r}",
+                pool_id=ticket["pool_id"])
+        if repo_id and ticket["repo_id"] != repo_id:
+            raise ValueError(
+                f"push refused: ticket {ticket_id!r} is on repo "
+                f"{ticket['repo_id']!r}, not {repo_id!r}")
+        key = self._invite_bound_key(source) or self._caller_key_id
+        if ticket["state"] != "claimed" or ticket.get("claimant_key_id") != key:
+            raise PermissionError(
+                f"push refused: ticket {ticket_id!r} is {ticket['state']!r} "
+                f"(claimant {ticket.get('claimant_key_id')!r}); only the "
+                f"claimant may push")
+        token = secrets.token_hex(16)
+        grant = L.create_push_grant(self._conn, token, resolved, ticket_id, key)
+        L.record_event(self._conn, resolved, "push_granted",
+                       {"ticket_id": ticket_id, "repo_id": ticket["repo_id"],
+                        "key_id": key})
+        gateway = self._gateway_addressing(resolved)
+        notice = (f"push link issued for ticket {ticket_id} "
+                  f"(repo {ticket['repo_id']}): token {token[:12]}…")
+        self._queue_notice(resolved, notice, kind="push_granted")
+        return {"ok": True, "pool_id": resolved, "repo_id": ticket["repo_id"],
+                "ticket_id": ticket_id, "token": token,
+                "push_link": {"token": token, "gateway": gateway,
+                              "repo_id": ticket["repo_id"],
+                              "ticket_id": ticket_id},
+                "gateway": gateway, "grant": grant, "notice": notice}
+
+    def push_build_bundle(self, repo_path, repo_id, *, version=None,
+                          pool_id=None, source=None) -> dict:
+        """Build a contributor push bundle on the contributor's own
+        gateway (the push step): pack -> hash -> DEK wrap -> encrypt ->
+        transport send -> contributor-signed manifest, with no ledger
+        write. Thin wrapper over the propagator so the contributor's
+        plugin drives it through the service; *version* defaults to the
+        next repo version."""
+        resolved = self._resolve_pool(pool_id, source=source)
+        prop = self._propagator(resolved)
+        pusher = prop._members.get(self._caller_key_id)
+        if pusher is None:
+            raise PermissionError(
+                f"push refused: caller {self._caller_key_id!r} is not a pool member")
+        if version is None:
+            version = L.next_repo_version(self._conn, repo_id)
+        return prop.build_push_bundle(
+            repo_path=Path(repo_path), repo_id=repo_id, version=int(version),
+            pusher=pusher, pusher_signing_key=self._caller_sk)
+
+    def push_deliver(self, transfer_ticket, token, manifest, *,
+                     pool_id=None, source=None) -> dict:
+        """Deliver a pushed bundle to the pool gateway (the ``/push repo
+        --deliver <ticket> --token <grant>`` verb).
+
+        The grant is verified one-time (consumed on success); the ticket
+        must still be claimed by the grant's key (released/completed ⇒
+        refused). The contributor signature, membership and claimant are
+        checked, the bytes are fetched over the configured transport,
+        decrypted with the maintainer's wrapped DEK, BLAKE3-verified and
+        sandbox-audited. Clean ⇒ :meth:`accept` appends the
+        maintainer-signed accepted version and the task completes;
+        flagged ⇒ the push is refused, the task stays claimed, and a
+        ``push_flagged`` event records the scan hits. This synchronous
+        audit is the only gate — there is no queue.
+        """
+        resolved = self._resolve_pool(pool_id, source=source)
+        self._check_not_frozen(resolved)
+        self._require_authorized(resolved, source)
+        grant = L.get_push_grant(self._conn, token)
+        if grant is None or grant.get("consumed_at") is not None:
+            raise PermissionError("push deliver refused: unknown or replayed grant token")
+        if grant["pool_id"] != resolved:
+            raise PermissionError(
+                "push deliver refused: grant is for a different pool")
+        ticket = self.show_ticket(grant["ticket_id"])
+        if ticket["state"] != "claimed" or ticket.get("claimant_key_id") != grant["key_id"]:
+            raise PermissionError(
+                f"push deliver refused: ticket {ticket['ticket_id']!r} is "
+                f"{ticket['state']!r} (grant expired — released or completed)")
+        if not manifest:
+            raise ValueError("push deliver needs the contributor-signed manifest (--manifest <json>)")
+        if manifest.get("transfer_ticket") != transfer_ticket:
+            raise PermissionError(
+                "push deliver refused: manifest transfer_ticket does not match the delivered ticket")
+        if manifest.get("repo_id") != ticket["repo_id"]:
+            raise PermissionError(
+                "push deliver refused: manifest repo does not match the claimed ticket")
+        if manifest.get("submitter_key_id") != grant["key_id"]:
+            raise PermissionError(
+                "push deliver refused: manifest submitter is not the grant claimant")
+        prop = self._propagator(resolved)
+        submitter = prop._members.get(manifest.get("submitter_key_id", ""))
+        if submitter is None:
+            raise PermissionError(
+                "push deliver refused: submitter is not a pool member")
+        from propagation import _verify_key
+        if not C.verify_manifest(_verify_key(submitter), manifest):
+            raise RuntimeError("push manifest signature does not verify")
+        maintainer = prop._members.get(prop._maintainer_key_id)
+        if maintainer is None:
+            raise RuntimeError(
+                f"maintainer {prop._maintainer_key_id!r} is not a pool member")
+        aud = prop.audit(manifest=manifest, maintainer=maintainer)
+        report = aud["report"]
+        if report.get("verdict") != "clean":
+            hits = report.get("hits", [])
+            L.record_event(self._conn, resolved, "push_flagged",
+                           {"ticket_id": ticket["ticket_id"],
+                            "repo_id": manifest["repo_id"],
+                            "version": manifest.get("version"),
+                            "report_hash": aud["report_hash"], "hits": hits})
+            notice = (f"push refused for ticket {ticket['ticket_id']}: "
+                      f"audit flagged {len(hits)} hit(s); task stays claimed")
+            self._queue_notice(resolved, notice, kind="push_flagged")
+            return {"ok": False, "error": notice, "ticket_id": ticket["ticket_id"],
+                    "state": ticket["state"], "verdict": report.get("verdict"),
+                    "report_hash": aud["report_hash"], "hits": hits,
+                    "notice": notice}
+        accepted = prop.accept(
+            manifest=manifest, report_hash=aud["report_hash"],
+            maintainer=maintainer,
+            maintainer_signing_key=self._caller_sk)
+        consumed = L.consume_push_grant(self._conn, token)
+        if consumed is None:
+            raise PermissionError(
+                "push deliver refused: grant was consumed concurrently (replay)")
+        updated = L.complete_ticket(self._conn, ticket["ticket_id"], grant["key_id"])
+        notice = (f"{STATE_MARKER.format(state='completed')} ticket "
+                  f"{updated['ticket_id']} completed by push of "
+                  f"{manifest['repo_id']} v{accepted['manifest']['version']} "
+                  f"({accepted['manifest_hash'][:12]})")
+        self._queue_notice(resolved, notice, kind="ticket_completed")
+        return {"ok": True, "pool_id": resolved, "ticket_id": updated["ticket_id"],
+                "state": updated["state"], "repo_id": manifest["repo_id"],
+                "version": accepted["manifest"]["version"],
+                "manifest_hash": accepted["manifest_hash"],
+                "manifest": accepted["manifest"],
+                "transfer_id": accepted.get("transfer_id", ""),
+                "dek_rotated": accepted.get("dek_rotated", False),
+                "report_hash": aud["report_hash"],
+                "audit_id": aud["audit_id"], "notice": notice}
 
     # -- pool stewardship ------------------------------------------
 
@@ -869,7 +1027,7 @@ class PoolService:
         """Build the propagator for a pool. Accepts a ticket dict (legacy)
         or a pool_id string (used by /add-repo, which has no ticket)."""
         if self._transport is None:
-            raise RuntimeError("work submit / integrate need a transport backend")
+            raise RuntimeError("push / submit need a transport backend")
         pool_id = (ticket_or_pool["pool_id"] if isinstance(ticket_or_pool, dict)
                    else str(ticket_or_pool))
         pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",

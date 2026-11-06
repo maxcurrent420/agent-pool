@@ -9,6 +9,9 @@ Slash commands: ``/pool register|invite|members|remove|freeze|list, status``,
 ``/fetch task list`` (tasks with claimed status), ``/fetch repo <id>``
 (latest accepted signed manifest), ``/fetch repo --manifest <json>``
 (download + decrypt + clone on the contributor's own gateway),
+``/push repo <repo_id> --ticket <id>`` (claimant-only push link),
+``/push repo --deliver <ticket> --token <grant> --manifest <json>``
+(the pool gateway audits the pushed bundle and completes the task),
 ``/audit show``. Every handler returns a string Hermes posts; the plugin
 never posts to Discord itself.
 
@@ -512,6 +515,48 @@ def _handle_fetch(ctx, raw: str, *, source=None, session_id="", session_key="", 
         return _error(exc)
 
 
+def _handle_push(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
+    """``/push repo <repo_id> --ticket <id>`` (claimant-only grant; returns
+    the push link) and ``/push repo --deliver <transfer_ticket> --token
+    <grant> --manifest <json>`` (the pool gateway audits and completes the
+    task). The bundle itself is built and sent by the contributor's own
+    gateway (``push_build_bundle``); only the ticket + grant + signed
+    manifest cross to the pool gateway."""
+    try:
+        svc = _service_for(ctx, source=source)
+        pos, opts, _flags = _parse_args(raw)
+        if not pos or pos[0] != "repo":
+            return _result({"ok": False,
+                            "error": "usage: /push repo <repo_id> --ticket <id> | "
+                                     "/push repo --deliver <transfer_ticket> --token <grant> --manifest <json>"})
+        pool_id = opts.get("pool") or opts.get("pool_id") or None
+        if opts.get("deliver") is not None or opts.get("token") is not None:
+            transfer_ticket = opts.get("deliver") or (pos[1] if len(pos) > 1 else "")
+            if not transfer_ticket or not opts.get("token"):
+                return _result({"ok": False,
+                                "error": "usage: /push repo --deliver <transfer_ticket> --token <grant> --manifest <json>"})
+            if not opts.get("manifest"):
+                return _result({"ok": False,
+                                "error": "push deliver needs --manifest <json> "
+                                         "(the contributor-signed push manifest)"})
+            try:
+                manifest = json.loads(opts["manifest"])
+            except Exception as exc:
+                return _result({"ok": False, "error": f"bad manifest JSON: {exc}"})
+            out = svc.push_deliver(transfer_ticket, opts["token"], manifest,
+                                   pool_id=pool_id, source=source)
+        else:
+            repo_id = pos[1] if len(pos) > 1 else opts.get("repo", "")
+            ticket_id = opts.get("ticket", "")
+            if not ticket_id:
+                return _result({"ok": False,
+                                "error": "usage: /push repo <repo_id> --ticket <id>"})
+            out = svc.push_repo(repo_id, ticket_id, pool_id=pool_id, source=source)
+        return _result(out, svc, source)
+    except Exception as exc:
+        return _error(exc)
+
+
 def _handle_audit(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
     try:
         svc = _service_for(ctx, source=source)
@@ -548,6 +593,8 @@ _COMMANDS = (
      "[ticket] [--paths <paths>] [--any-project --max-tasks N] [options]"),
     ("release", _handle_release, "Release a claimed ticket back to open",
      "[ticket]"),
+    ("push", _handle_push, "Push a diff for a claimed ticket: issue the push link (grant), or deliver a pushed bundle (audits and completes the task)",
+     "repo <repo_id> --ticket <id> | repo --deliver <transfer_ticket> --token <grant> --manifest <json>"),
     ("audit", _handle_audit, "Show the audit report for a ticket",
      "show [ticket]"),
 )

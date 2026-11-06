@@ -1,6 +1,7 @@
-"""Repo propagation: submit -> (audit) -> accept -> fetch over Iroh.
+"""Repo propagation: submit -> (audit) -> accept -> fetch over Iroh, and
+the push write path: build_push_bundle -> deliver (audit -> accept).
 
-Flow (Phase 2 of the Agent Pool plan):
+Flow (Phase 2 of the Agent Pool plan, Phase 4 push path):
 
 - submitter packs the repo with ``git bundle --all``, BLAKE3-hashes the
   plaintext bundle, generates a random DEK, wraps it per member
@@ -9,12 +10,15 @@ Flow (Phase 2 of the Agent Pool plan):
   wrapped keys) is the ONLY artefact that touches the gateway.
 - maintainer-origin submissions self-accept: the manifest is appended to
   the chain and posted to the gateway with a "latest accepted" pin.
-- contributor submissions land in the review queue (``repo_versions`` only,
-  state=pending). The maintainer fetches the ciphertext, decrypts,
-  BLAKE3-verifies, and runs a sandboxed static audit (network off via
-  bubblewrap when available). Acceptance produces a NEW maintainer-signed
-  manifest (state=accepted) appended to the chain. Rejection posts a
-  reason and leaves the chain untouched.
+- contributor pushes (``/push repo``) build a transient contributor-signed
+  manifest via :meth:`RepoPropagator.build_push_bundle` — pack, hash,
+  encrypt, wrap, send over the transport, sign — with NO ledger write and
+  NO chain append. The pool gateway's deliver step verifies the push
+  grant, fetches the ciphertext, decrypts, BLAKE3-verifies, and runs a
+  sandboxed static audit (network off via bubblewrap when available).
+  A clean audit produces a NEW maintainer-signed manifest (state=accepted)
+  appended to the chain and completes the task; a flagged push is refused
+  and the task stays claimed. There is no queue and no human decision.
 - members fetch the latest accepted manifest, verify the chain, unwrap
   their DEK, Iroh-fetch the ciphertext, decrypt, BLAKE3-verify (client
   side), and ``git clone`` the bundle into a worktree.
@@ -250,8 +254,7 @@ class RepoPropagator:
         rows = self._conn.execute(
             "SELECT manifest_json FROM repo_versions WHERE repo_id=? ORDER BY version",
             (repo_id,)).fetchall()
-        # Only accepted manifests belong to the chain; the ledger stores
-        # pending submissions in repo_versions too, so filter by state.
+        # Only accepted manifests belong to the chain; filter by state.
         out = []
         for row in rows:
             manifest = json.loads(row[0])
@@ -345,7 +348,59 @@ class RepoPropagator:
                 "transfer_id": transfer_id, "content_hash": content_hash,
                 "state": "accepted", "notice": _notice_emit.get("notice", "")}
 
-    # -- audit + accept/reject ----------------------------------------------
+    def build_push_bundle(self, *, repo_path: Path, repo_id: str, version: int,
+                          pusher: Member, pusher_signing_key) -> dict:
+        """Build a contributor push bundle (Phase 4, ``/push repo``).
+
+        Pack -> BLAKE3 -> DEK wrap per member -> encrypt -> transport
+        send -> contributor-signed manifest body. There is NO ledger
+        write and NO chain append: the manifest is a transient,
+        contributor-signed body that only the deliver step verifies
+        (signature, membership, claimant, audit) before :meth:`accept`
+        turns it into a maintainer-signed accepted version.
+
+        Any pool member may push (the grant + claim checks live in the
+        service layer); the pusher must be in the members map so the
+        bundle's DEK is wrapped for every current member.
+        """
+        if not self._is_member(pusher.key_id):
+            raise PermissionError(
+                f"push refused: {pusher.key_id!r} is not a pool member")
+
+        plaintext = pack_bundle(Path(repo_path))
+        content_hash = blake3_hash(plaintext)
+        dek = secrets.token_bytes(32)
+        ciphertext = encrypt_bundle(plaintext, dek)
+
+        wrapped_keys: dict[str, str] = {}
+        for member_id, member in self._members.items():
+            if not member.box_pubkey_hex:
+                continue
+            pk = PublicKey(bytes.fromhex(member.box_pubkey_hex), encoder=RawEncoder)
+            wrapped_keys[member_id] = wrap_dek(pk, dek).hex()
+
+        with tempfile.TemporaryDirectory(prefix="agentpool-push-") as tmp:
+            cipher_file = Path(tmp) / "bundle.enc"
+            cipher_file.write_bytes(ciphertext)
+            sent = self._transport.send(cipher_file)
+            ticket = sent["ticket"]
+            transfer_id = sent["transfer_id"]
+
+        body = build_manifest(
+            repo_id=repo_id, version=version, content_hash=content_hash,
+            size_bytes=len(plaintext),
+            signer_key_id=pusher.key_id, submitter_key_id=pusher.key_id,
+            wrapped_keys=wrapped_keys, transfer_ticket=ticket,
+            prev_manifest_hash=self._last_chain_hash(repo_id),
+            state="submitted",
+        )
+        signed = sign_manifest(pusher_signing_key, body)
+        return {**self._transport_info(),
+                "manifest": signed, "manifest_hash": manifest_hash(signed),
+                "transfer_id": transfer_id, "content_hash": content_hash,
+                "state": "submitted"}
+
+    # -- audit + accept ------------------------------------------------------
 
     def _decrypt_for_maintainer(self, manifest: dict, maintainer: Member) -> tuple[bytes, bytes]:
         """Fetch ciphertext via Iroh and decrypt with the maintainer's DEK."""
@@ -396,22 +451,22 @@ class RepoPropagator:
                maintainer_signing_key) -> dict:
         """Maintainer signs acceptance; appends the ACCEPTED manifest to the chain.
 
-        DEK ROTATION (Phase 6): the accepted version never reuses the pending
-        submission's DEK. The plaintext bundle is re-encrypted under a fresh
+        DEK ROTATION (Phase 6): the accepted version never reuses the push
+        bundle's DEK. The plaintext bundle is re-encrypted under a fresh
         random DEK, re-sent over the transport, and the new DEK is wrapped
         per CURRENT pool member (``self._members`` — a member removed before
         acceptance gets no entry). The accepted manifest therefore carries a
         new ``transfer_ticket`` and new ``wrapped_keys``; ``content_hash``
         (of the plaintext bundle) is unchanged. A member removed before
         acceptance cannot unwrap the accepted version even if they could
-        unwrap the pending one (forward separation).
+        unwrap the push bundle (forward separation).
         """
         if maintainer.key_id != self._maintainer_key_id:
             raise PermissionError("acceptance is maintainer-only")
-        pending_vk = _verify_key(self._members[manifest["submitter_key_id"]])
-        if not verify_manifest(pending_vk, manifest):
-            raise RuntimeError("pending manifest signature does not verify")
-        # Re-encrypt under a fresh DEK: fetch + decrypt the pending bundle.
+        push_vk = _verify_key(self._members[manifest["submitter_key_id"]])
+        if not verify_manifest(push_vk, manifest):
+            raise RuntimeError("push manifest signature does not verify")
+        # Re-encrypt under a fresh DEK: fetch + decrypt the push bundle.
         plaintext, _old_dek = self._decrypt_for_maintainer(manifest, maintainer)
         if blake3_hash(plaintext) != manifest["content_hash"]:
             raise RuntimeError("BLAKE3 mismatch on acceptance re-encryption")
@@ -440,7 +495,7 @@ class RepoPropagator:
             state="accepted",
         )
         accepted = sign_manifest(maintainer_signing_key, accepted_body)
-        # Update the stored pending row and append the accepted manifest.
+        # Drop any stale row for this version and append the accepted manifest.
         a_hash = manifest_hash(accepted)
         self._conn.execute(
             "DELETE FROM repo_versions WHERE repo_id=? AND version=?",
@@ -454,23 +509,11 @@ class RepoPropagator:
         record_event(self._conn, self._pool_id, "accepted",
                      {"repo_id": manifest["repo_id"], "version": manifest["version"],
                       "hash": a_hash, "dek_rotated": True,
-                      "pending_ticket": manifest.get("transfer_ticket", "")})
+                      "push_ticket": manifest.get("transfer_ticket", "")})
         return {**self._transport_info(),
                 "manifest": accepted, "manifest_hash": a_hash,
                 "transfer_id": sent["transfer_id"], "dek_rotated": True,
                 "notice": _n.get("notice", "")}
-
-    def reject(self, *, manifest: dict, reason: str, maintainer: Member) -> dict:
-        if maintainer.key_id != self._maintainer_key_id:
-            raise PermissionError("rejection is maintainer-only")
-        _n = self._emit("post_notice", {
-            "text": f"rejected: {manifest['repo_id']} v{manifest['version']} — {reason}",
-            "kind": "rejection",
-        })
-        record_event(self._conn, self._pool_id, "rejected",
-                     {"repo_id": manifest["repo_id"], "version": manifest["version"],
-                      "reason": reason})
-        return {"ok": True, "reason": reason, "notice": _n.get("notice", "")}
 
     # -- fetch ---------------------------------------------------------------
 
@@ -535,112 +578,3 @@ class RepoPropagator:
         return {"clone_dir": str(clone_dir), "bundle_file": str(bundle_file),
                 "content_hash": manifest["content_hash"]}
 
-    # -- pending-branch fetch (integration gate input; Phase 4 removes with the gate) --
-
-    def fetch_pending(self, *, manifest: dict, maintainer: Member, dest: Path) -> dict:
-        """Fetch a PENDING contributor branch bundle (integration gate input).
-
-        Unlike :meth:`fetch`, a pending manifest is NOT a chain tip, so there
-        is no chain check; instead the pending manifest's own submitter
-        signature is verified and the maintainer unwraps the DEK from
-        ``wrapped_keys``. The claimant's bundle is cloned into *dest* and its
-        HEAD branch ref is reported so the maintainer can merge it into the
-        canonical checkout. Network is not used beyond the transport fetch.
-        """
-        if maintainer.key_id != self._maintainer_key_id:
-            raise PermissionError("fetch_pending is maintainer-only")
-        if manifest.get("state") != "pending":
-            raise RuntimeError(
-                f"fetch_pending needs a pending manifest, got {manifest.get('state')!r}")
-        submitter = self._members.get(manifest.get("submitter_key_id", ""))
-        if submitter is None:
-            raise PermissionError("fetch_pending: submitter is not a pool member")
-        if not verify_manifest(_verify_key(submitter), manifest):
-            raise RuntimeError("pending manifest signature does not verify")
-        plaintext, _dek = self._decrypt_for_maintainer(manifest, maintainer)
-        dest = Path(dest)
-        dest.mkdir(parents=True, exist_ok=True)
-        bundle_file = dest / f"bundle-v{manifest['version']}.git"
-        bundle_file.write_bytes(plaintext)
-        clone_dir = dest / f"worktree-v{manifest['version']}"
-        if clone_dir.exists():
-            subprocess.run(["git", "-C", str(clone_dir), "worktree", "prune"],
-                           capture_output=True, text=True, timeout=60)
-        proc = subprocess.run(
-            ["git", "clone", "--quiet", str(bundle_file), str(clone_dir)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"git clone of branch bundle failed: {proc.stderr.strip()[:400]}")
-        branch = subprocess.run(
-            ["git", "-C", str(clone_dir), "branch", "--show-current"],
-            capture_output=True, text=True, timeout=60).stdout.strip()
-        head = subprocess.run(
-            ["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=60).stdout.strip()
-        record_event(self._conn, self._pool_id, "branch_fetched",
-                     {"repo_id": manifest["repo_id"], "version": manifest["version"],
-                      "branch": branch, "head": head})
-        return {"clone_dir": str(clone_dir), "bundle_file": str(bundle_file),
-                "branch": branch, "head": head,
-                "content_hash": manifest["content_hash"]}
-
-    def publish_merged(self, *, canonical_dir: Path, repo_id: str, version: int,
-                       maintainer: Member, maintainer_signing_key,
-                       prev_manifest_hash: str | None,
-                       audit_report_hash: str) -> dict:
-        """Pack the merged canonical repo into a NEW maintainer-signed accepted
-        manifest with a ROTATED DEK.
-
-        A fresh random DEK is generated for this version (forward separation:
-        members removed before this version get no ``wrapped_keys`` entry and
-        previous DEKs cannot decrypt this bundle). The merged bundle is
-        re-encrypted and re-sent over the transport; only CURRENT pool members
-        (``self._members``, built from the ledger member registry) receive a
-        wrapped key. The new manifest replaces the pending row for *version*
-        and is appended to the chain (``post_manifest`` + latest-accepted pin).
-        """
-        if maintainer.key_id != self._maintainer_key_id:
-            raise PermissionError("publish_merged is maintainer-only")
-        plaintext = pack_bundle(Path(canonical_dir))
-        content_hash = blake3_hash(plaintext)
-        dek = secrets.token_bytes(32)
-        ciphertext = encrypt_bundle(plaintext, dek)
-        wrapped_keys: dict[str, str] = {}
-        for member_id, member in self._members.items():
-            if not member.box_pubkey_hex:
-                continue
-            pk = PublicKey(bytes.fromhex(member.box_pubkey_hex), encoder=RawEncoder)
-            wrapped_keys[member_id] = wrap_dek(pk, dek).hex()
-        with tempfile.TemporaryDirectory(prefix="agentpool-merged-") as tmp:
-            cipher_file = Path(tmp) / "bundle.enc"
-            cipher_file.write_bytes(ciphertext)
-            sent = self._transport.send(cipher_file)
-            ticket = sent["ticket"]
-        body = build_manifest(
-            repo_id=repo_id, version=version, content_hash=content_hash,
-            size_bytes=len(plaintext), signer_key_id=maintainer.key_id,
-            submitter_key_id=maintainer.key_id, wrapped_keys=wrapped_keys,
-            transfer_ticket=ticket, audit_report_hash=audit_report_hash,
-            prev_manifest_hash=prev_manifest_hash, state="accepted",
-        )
-        signed = sign_manifest(maintainer_signing_key, body)
-        m_hash = manifest_hash(signed)
-        self._conn.execute(
-            "DELETE FROM repo_versions WHERE repo_id=? AND version=? AND state='pending'",
-            (repo_id, version))
-        self._conn.commit()
-        append_manifest(self._conn, repo_id, signed, m_hash)
-        _n = self._emit("post_notice", {
-            "text": f"latest accepted: {repo_id} v{version} ({m_hash[:12]}) merged",
-            "kind": "latest_accepted",
-        })
-        record_event(self._conn, self._pool_id, "merged_published",
-                     {"repo_id": repo_id, "version": version, "hash": m_hash,
-                      "content_hash": content_hash})
-        return {**self._transport_info(),
-                "manifest": signed, "manifest_hash": m_hash,
-                "transfer_id": sent["transfer_id"],
-                "content_hash": content_hash, "state": "accepted",
-                "notice": _n.get("notice", "")}

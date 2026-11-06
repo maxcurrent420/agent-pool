@@ -281,7 +281,7 @@ def test_register_wires_all_commands():
     ctx = _FakeCtx()
     plugin.register(ctx)
     assert set(ctx.commands) == {"pool", "fetch", "task", "claim", "release",
-                                 "audit", "add-repo", "task_add", "task_list"}
+                                 "push", "audit", "add-repo", "task_add", "task_list"}
     out = json.loads(ctx.tools["pool_status"]({}))
     assert out["ok"] is True and out["phase"] == 3
 
