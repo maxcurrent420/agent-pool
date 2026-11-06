@@ -2,11 +2,11 @@
 # This file does NOT belong to the agent-pool plugin repo's source tree —
 # it must be added as plugin-catalog/agent-pool.yaml in the hermes-agent
 # repository via PR (human-merged gate). It is kept here so the owner can
-# copy it verbatim. The sha pins the docs commit (03bf367); bump it
+# copy it verbatim. The sha pins the docs commit (73a4a8f); bump it
 # in the hermes-agent PR whenever the plugin advances.
 name: agent-pool
 repo: https://github.com/maxcurrent420/agent-pool
-sha: 241e58f372eb335bf5997a6df318b77a05f16840
+sha: 73a4a8ff1f96444246d5f0041554690dfae4a99a
 description: >-
   Agent Pool — friends form an agent team: repos propagate via Iroh (QUIC,
   BLAKE3-verified bearer tickets via send_hermes), coordination only via
