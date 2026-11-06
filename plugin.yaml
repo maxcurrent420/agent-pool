@@ -21,7 +21,19 @@ config_schema:
   transport_mode:
     type: str
     default: "relay"
-    description: "Repo-byte transport privacy. Fixed to 'relay': transfers are always relay-only on BOTH sender and receiver (relay-only ticket + relay-only endpoint policy, so the peer learns no IP; the relay still sees both peers' IPs + metadata, never plaintext). There is no direct mode and no way to opt into one; 'direct' or any other value is rejected. The key exists only for forward-compatibility with 'tor' (unavailable on this host: fails closed with instructions to use relay). Per-pool: pools.<pool_id>.transport_mode/_relay_url overrides this. HERMES_IROH_RELAY=off is a no-op in every mode."
+    description: "Repo-byte transport privacy. 'relay': transfers are always relay-only on BOTH sender and receiver (relay-only ticket + relay-only endpoint policy, so the peer learns no IP; the relay still sees both peers' IPs + metadata, never plaintext). This is the explicit fallback mode. 'tor' (opt-in): Iroh Tor custom transport via the tor-enabled send_hermes sidecar (option (A), scripts/install-tor.sh) — connection paths onion-routed, neither peer learns the other's IP, no relay in the connection path. Both endpoints must enable Tor; tor-ready probe fails closed (systemctl start agent-pool-tor) and never falls back to relay. There is no direct mode and no way to opt into one; 'direct' or any other value is rejected. Per-pool: pools.<pool_id>.transport_mode/_relay_url overrides this. HERMES_IROH_RELAY=off is a no-op in relay mode and irrelevant in tor mode (no relay flags are emitted)."
+  tor_control_port:
+    type: int
+    default: 9051
+    description: "Tor control port (127.0.0.1 only, CookieAuthentication 0, ops/torrc). Probed by tor_ready() before every tor-mode transfer; failure names 'systemctl start agent-pool-tor' and fails closed."
+  tor_socks_port:
+    type: int
+    default: 9055
+    description: "Tor SOCKS port (127.0.0.1 only) for operator tooling; the Iroh Tor transport manages its own circuits via the control port."
+  tor_binary:
+    type: str
+    default: ""
+    description: "Tor sidecar binary path (option (B): standalone agent-pool-iroh). Empty = tor-enabled send_hermes on PATH (option (A), the chosen default)."
   max_turns:
     type: int
     default: 25

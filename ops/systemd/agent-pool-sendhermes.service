@@ -1,0 +1,24 @@
+[Unit]
+Description=Agent Pool tor-enabled send_hermes sidecar (long-lived follow-up, Q5)
+After=network-online.target agent-pool-tor.service
+Wants=network-online.target agent-pool-tor.service
+
+[Service]
+Type=simple
+# DELIVERABLE NOTE (Q5): Phase 3 ships per-transfer spawning (the
+# send_hermes provider is spawned per send/receive, exactly as relay
+# mode does today). This unit is for the long-lived follow-up: a
+# sidecar that owns its Iroh endpoint (and its Tor hidden service)
+# across transfers and serves send/receive over a local socket,
+# instead of rebuilding an onion service per transfer.
+#
+# Enable it ONLY after the follow-up lands; until then the per-transfer
+# path needs no sendhermes unit — only agent-pool-tor.
+ExecStart=/home/maxcurrent/.local/bin/send_hermes serve --transport tor
+Restart=always
+RestartSec=5
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -15,21 +15,26 @@ Two backends:
 
 Privacy modes (``transport_mode`` config, default ``relay``):
 
-Transfers are ALWAYS relay-only, on both ends. There is no direct mode
-and no way to opt into one: the send argv always uses
-``--ticket-type relay`` and never emits ``--relay disabled``; the
-installed ``send_hermes`` endpoint is built with
-``clear_ip_transports()`` + ``addr_filter(AddrFilter::relay_only())`` so
-neither endpoint publishes or accepts direct IP addresses. The peer
-learns no IP. The relay still sees both IPs + metadata (never plaintext
-— QUIC/TLS + NaCl SecretBox); an operator can point both ends at a
-self-hosted/trusted relay via ``relay_url`` (global or per-pool) for a
-stronger anonymity layer.
+- ``relay`` — relay-only ticket on both ends (``--ticket-type relay``);
+  the peer learns no IP, but the Iroh relay sees both endpoints' IPs +
+  metadata (never plaintext: QUIC/TLS + NaCl SecretBox). An operator can
+  point both ends at a self-hosted/trusted relay via ``relay_url``
+  (global or per-pool). This is the explicit fallback mode.
+- ``tor`` — real: the ``send_hermes`` sidecar (option (A), rebuilt with
+  iroh's Tor custom transport, ``iroh-tor-transport``) routes the Iroh
+  connection through Tor hidden services. The send/receive argv gains
+  ``--transport tor`` and emits NO relay flags — there is no relay in
+  the tor-mode connection path, and neither peer learns the other's IP.
+  Both endpoints must run a tor-enabled sidecar (every gateway in a
+  pool); a mixed pool fails closed, never a silent downgrade to relay.
+  ``tor_ready()`` probes the Tor control port (``127.0.0.1:<tor_control_port>``,
+  cookie auth off) and the sidecar binary before every transfer.
 
-- ``relay`` — the only working mode: relay-only ticket, peer learns no IP.
-- ``tor`` — accepted as a config value but fails closed: no Tor daemon on
-  this host and Iroh's ``proxy_url`` carries HTTP(S) only, so it cannot
-  carry QUIC/UDP. Never a half-working path.
+There is no direct mode and no way to opt into one: the send argv never
+emits ``--relay disabled`` and never emits an addresses ticket in relay
+mode. The installed ``send_hermes`` endpoint is built with
+``clear_ip_transports()`` + ``addr_filter(AddrFilter::relay_only())`` so
+neither endpoint publishes or accepts direct IP addresses in relay mode.
 """
 from __future__ import annotations
 
@@ -38,6 +43,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -60,25 +66,94 @@ class TransportConfigError(ValueError):
         super().__init__(detail)
 
 
-class TorTransportUnavailable(RuntimeError):
-    """``tor`` mode selected but Tor transport is not available — fail closed.
+_TOR_UNIT = "agent-pool-tor"
+_TOR_SENDHERMES_UNIT = "agent-pool-sendhermes"
+_TOR_CONTROL_PORT = 9051
+_TOR_SOCKS_PORT = 9055
 
-    Tor is not installed on this host and Iroh's ``proxy_url`` carries
-    HTTP(S) only (never QUIC/UDP), so a Tor transfer cannot be honoured
-    honestly. The error tells the operator to use ``relay`` instead.
+
+class TorNotReady(RuntimeError):
+    """``tor`` mode selected but the Tor anonymity layer is not ready.
+
+    Fail closed: tor mode never silently falls back to relay. Carries
+    ``detail`` naming the unit/binary to fix (e.g. ``systemctl start
+    agent-pool-tor``).
     """
 
-    MESSAGE = (
-        "tor transport unavailable: no Tor daemon is installed on this host "
-        "and Iroh's proxy_url carries HTTP(S) only, so it cannot carry "
-        "QUIC/UDP Iroh transfers. Configure transport_mode=relay (the "
-        "supported privacy mode: relay-only ticket, peer learns no IP) "
-        "instead — tor mode fails closed rather than giving false confidence."
-    )
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(detail)
 
-    def __init__(self):
-        self.detail = self.MESSAGE
-        super().__init__(self.MESSAGE)
+
+def tor_ready(*, control_port: int = _TOR_CONTROL_PORT,
+              socks_port: int = _TOR_SOCKS_PORT,
+              binary: str | None = None,
+              timeout: float = 2.0) -> dict:
+    """Probe the Tor anonymity layer; raise TorNotReady with an actionable
+    fix if it is not usable. Never falls back to relay.
+
+    Checks, in order:
+    1. The sidecar binary resolves (``tor_binary`` config or ``send_hermes``
+       on PATH) and supports ``--transport tor`` (``send --help``).
+    2. The Tor control port answers on 127.0.0.1 with cookie auth off
+       (``AUTHENTICATE`` -> ``250 OK``).
+
+    The hidden service itself is created per transfer by the sidecar, so
+    there is no long-lived onion identity to check here (Q5 per-transfer
+    default). Returns a readiness dict on success.
+    """
+    resolved = (str(binary).strip() if binary else "") or shutil.which("send_hermes")
+    if not resolved or not Path(resolved).is_file():
+        raise TorNotReady(
+            "tor transport unavailable: no tor-enabled send_hermes sidecar "
+            f"found (tor_binary={binary!r}, PATH lookup failed). Build it "
+            "with scripts/install-tor.sh (option (A): send_hermes rebuilt "
+            "with iroh-tor-transport) and set tor_binary if it is not on "
+            "PATH. Start the units: systemctl start "
+            f"{_TOR_UNIT}. tor mode fails closed — it never falls back "
+            "to relay; configure transport_mode=relay to use the relay "
+            "instead.")
+    try:
+        help_out = subprocess.run(
+            [resolved, "send", "--help"], capture_output=True, text=True,
+            timeout=max(5.0, float(timeout)))
+        help_text = (help_out.stdout or "") + "\n" + (help_out.stderr or "")
+    except Exception as exc:
+        raise TorNotReady(
+            f"tor transport unavailable: sidecar {resolved!r} did not "
+            f"answer 'send --help' ({exc}). Rebuild it with "
+            "scripts/install-tor.sh and check systemctl status "
+            f"{_TOR_SENDHERMES_UNIT}.")
+    if "--transport" not in help_text:
+        raise TorNotReady(
+            f"tor transport unavailable: sidecar {resolved!r} does not "
+            "support '--transport tor' (this send_hermes was built "
+            "without iroh-tor-transport). Rebuild it with "
+            "scripts/install-tor.sh (option (A)) or point tor_binary at "
+            "a tor-enabled sidecar (option (B): agent-pool-iroh). tor "
+            "mode fails closed — it never falls back to relay.")
+    try:
+        with socket.create_connection(("127.0.0.1", int(control_port)),
+                                      timeout=float(timeout)) as sock:
+            sock.sendall(b"AUTHENTICATE\r\n")
+            reply = sock.recv(1024).decode("utf-8", errors="replace")
+    except OSError as exc:
+        raise TorNotReady(
+            f"tor transport unavailable: Tor control port "
+            f"127.0.0.1:{control_port} is not reachable ({exc}). Start "
+            f"the Tor daemon: systemctl start {_TOR_UNIT} (torrc: "
+            "ops/torrc, ControlPort 127.0.0.1:9051, CookieAuthentication "
+            "0). tor mode fails closed — it never falls back to relay.")
+    if "250" not in reply:
+        raise TorNotReady(
+            f"tor transport unavailable: Tor control port "
+            f"127.0.0.1:{control_port} refused AUTHENTICATE "
+            f"({reply.strip()[:120]!r}); torrc must set "
+            "'CookieAuthentication 0' and bind ControlPort to 127.0.0.1 "
+            f"only (ops/torrc). Restart: systemctl restart {_TOR_UNIT}.")
+    return {"ok": True, "control_port": int(control_port),
+            "socks_port": int(socks_port), "binary": resolved,
+            "hidden_service": "per-transfer (created by the sidecar)"}
 
 
 MODE_RELAY = "relay"
@@ -107,8 +182,9 @@ def mode_note(mode: str) -> str:
         return ("relay-only: peer IP not disclosed on either end; "
                 "relay sees connection metadata (not plaintext)")
     if mode == MODE_TOR:
-        return ("tor: unavailable on this host (fails closed); "
-                "use relay for peer-IP privacy")
+        return ("tor: onion-routed via Iroh Tor custom transport "
+                "(sidecar + tor daemon); peer learns no IP, no relay "
+                "in the connection path; both endpoints must enable Tor")
     return f"transport_mode={mode}"
 
 
@@ -192,7 +268,12 @@ class TransportBackend(ABC):
 
 class FakeTransport(TransportBackend):
     """In-memory transport for tests. Provider lifetime is tracked so tests
-    can assert the sender stayed alive until the fetch completed."""
+    can assert the sender stayed alive until the fetch completed.
+
+    Tor-mode passthrough: accepts ``tor`` like relay so tests can drive
+    the tor code path in-memory (the Fake never probes a real tor daemon
+    or sidecar — tor_ready() is only called by the real backend).
+    """
 
     def __init__(self, transport_mode: str = MODE_RELAY):
         self.transport_mode = normalize_mode(transport_mode)
@@ -232,21 +313,31 @@ class RealSendHermesTransport(TransportBackend):
     """Real ``send_hermes`` CLI backend (same mechanics as the iroh plugin's
     ``iroh_send_file``/``iroh_fetch_file``).
 
-    ``transport_mode`` is ``relay`` (the only working mode: relay-only
-    ticket on the sender side — the peer learns no IP — and the
-    installed ``send_hermes`` endpoint is relay-only on the receiver
-    side too) or ``tor`` (fails closed). ``relay_url`` (explicit, from
-    plugin/per-pool config) wins over the ``HERMES_IROH_RELAY`` env var;
-    unset → env applies. An explicit relay of ``off``/``disabled``/
-    ``none`` is a contradictory config and is rejected in every mode; an
-    env ``off`` is a no-op (privacy cannot be silently stripped — see
-    ``_pool_status`` warning).
+    ``transport_mode`` is ``relay`` (relay-only ticket on the sender side
+    — the peer learns no IP — and the installed ``send_hermes`` endpoint
+    is relay-only on the receiver side too) or ``tor`` (``--transport tor``
+    argv; the tor-enabled sidecar routes the Iroh connection through Tor
+    hidden services, no relay in the connection path, neither peer learns
+    the other's IP; probed by :func:`tor_ready` before every transfer,
+    fail closed, never a silent downgrade to relay). ``relay_url``
+    (explicit, from plugin/per-pool config) wins over the
+    ``HERMES_IROH_RELAY`` env var; unset → env applies. An explicit
+    relay of ``off``/``disabled``/``none`` is a contradictory config and
+    is rejected in every mode; an env ``off`` is a no-op (privacy cannot
+    be silently stripped — see ``_pool_status`` warning). In tor mode
+    relay flags are never emitted at all.
     """
 
     def __init__(self, state_dir: str | Path | None = None, *,
                  transport_mode: str = MODE_RELAY,
-                 relay_url: str | None = None):
+                 relay_url: str | None = None,
+                 tor_control_port: int = _TOR_CONTROL_PORT,
+                 tor_socks_port: int = _TOR_SOCKS_PORT,
+                 tor_binary: str | None = None):
         self.transport_mode = normalize_mode(transport_mode)
+        self.tor_control_port = int(tor_control_port)
+        self.tor_socks_port = int(tor_socks_port)
+        self.tor_binary = (str(tor_binary).strip() if tor_binary else "") or None
         self._explicit_relay = (None if relay_url is None
                                 else str(relay_url).strip())
         if (self._explicit_relay is not None
@@ -271,9 +362,15 @@ class RealSendHermesTransport(TransportBackend):
         return os.environ.get("HERMES_IROH_RELAY", "").strip()
 
     def _send_cmd(self, binary: str, path: Path) -> list[str]:
-        """Build the send argv (pure — unit-testable without spawning)."""
+        """Build the send argv (pure — unit-testable without spawning).
+
+        Tor mode: ``--transport tor``, no relay flags at all — the
+        sidecar's Tor custom transport is the connection path, so a
+        relay ticket would be wrong. Relay mode: relay-only ticket.
+        """
         if self.transport_mode == MODE_TOR:
-            raise TorTransportUnavailable()
+            return [binary, "send", "--no-progress", "--transport", "tor",
+                    str(path)]
         cmd = [binary, "send", "--no-progress", str(path)]
         cmd += _relay_flag(self.relay_url)
         # Always a relay-only ticket: the peer learns no IP. There is no
@@ -284,7 +381,8 @@ class RealSendHermesTransport(TransportBackend):
     def _fetch_cmd(self, binary: str, ticket: str) -> list[str]:
         """Build the receive argv (pure — unit-testable without spawning)."""
         if self.transport_mode == MODE_TOR:
-            raise TorTransportUnavailable()
+            return [binary, "receive", ticket, "--no-progress",
+                    "--transport", "tor"]
         cmd = [binary, "receive", ticket, "--no-progress"]
         cmd += _relay_flag(self.relay_url)
         return cmd
@@ -293,10 +391,24 @@ class RealSendHermesTransport(TransportBackend):
     def binary() -> str | None:
         return shutil.which("send_hermes")
 
+    def _resolve_binary(self) -> str | None:
+        """Tor mode: ``tor_binary`` config (option (B) sidecar) wins over
+        PATH; relay mode: PATH ``send_hermes`` only."""
+        if self.transport_mode == MODE_TOR and self.tor_binary:
+            return self.tor_binary
+        return self.binary()
+
+    def _require_tor_ready(self) -> None:
+        """Fail closed before any tor transfer spawns (no silent relay
+        fallback: this raises TorNotReady naming the unit to start)."""
+        tor_ready(control_port=self.tor_control_port,
+                  socks_port=self.tor_socks_port,
+                  binary=self._resolve_binary())
+
     def send(self, path: Path) -> dict:
         if self.transport_mode == MODE_TOR:
-            raise TorTransportUnavailable()
-        binary = self.binary()
+            self._require_tor_ready()
+        binary = self._resolve_binary()
         if binary is None:
             raise RuntimeError("send_hermes binary not found on PATH")
         path = Path(path)
@@ -347,8 +459,8 @@ class RealSendHermesTransport(TransportBackend):
 
     def fetch(self, ticket: str, dest: Path) -> Path:
         if self.transport_mode == MODE_TOR:
-            raise TorTransportUnavailable()
-        binary = self.binary()
+            self._require_tor_ready()
+        binary = self._resolve_binary()
         if binary is None:
             raise RuntimeError("send_hermes binary not found on PATH")
         dest = Path(dest)

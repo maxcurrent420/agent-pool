@@ -60,6 +60,27 @@ def _transport_config(ctx):
     return base_mode, base_relay, per_pool
 
 
+def _tor_config(ctx):
+    """Resolve tor settings (control_port, socks_port, tor_binary).
+
+    Defaults match ops/torrc: ControlPort 9051, SocksPort 9055, both on
+    127.0.0.1. ``tor_binary`` empty = tor-enabled send_hermes on PATH
+    (option (A)); non-empty = option (B) standalone sidecar binary.
+    """
+    control = _cfg(ctx, "tor_control_port", 9051) if ctx else 9051
+    socks = _cfg(ctx, "tor_socks_port", 9055) if ctx else 9055
+    binary = _cfg(ctx, "tor_binary", "") if ctx else ""
+    try:
+        control = int(control)
+    except (TypeError, ValueError):
+        control = 9051
+    try:
+        socks = int(socks)
+    except (TypeError, ValueError):
+        socks = 9055
+    return control, socks, (str(binary).strip() or None)
+
+
 def _pool_status(args=None, **kwargs):
     """Report plugin config + ledger/identity readiness. Always returns JSON."""
     ctx = kwargs.get("ctx")
@@ -73,6 +94,11 @@ def _pool_status(args=None, **kwargs):
         status = {"ok": True, "plugin": "agent-pool", "phase": 3,
                   "relay_url": relay_url, "transport_mode": mode,
                   "transport_privacy": (
+                      "tor: onion-routed via Iroh Tor custom transport "
+                      "(sidecar + tor daemon); peer learns no IP, no "
+                      "relay in the connection path; both endpoints "
+                      "must enable Tor"
+                      if mode == "tor" else
                       "relay-only on both sender and receiver: the peer "
                       "learns no IP; the relay sees both peers' IPs and "
                       "transfer metadata but never plaintext; there is "
@@ -81,7 +107,27 @@ def _pool_status(args=None, **kwargs):
                   "budgets": budgets,
                   "ledger": "ready", "identity": "ready",
                   "queued_notices": []}
-        if env_relay.lower() in {"off", "disabled", "none"}:
+        if mode == "tor":
+            # Surface tor readiness (probe is bounded, never raises).
+            control, socks, tor_binary = _tor_config(ctx)
+            status["tor"] = {"control_port": control, "socks_port": socks,
+                             "binary": tor_binary or "send_hermes (PATH)"}
+            try:
+                try:
+                    from .transport import tor_ready as _tor_ready
+                except ImportError:
+                    from transport import tor_ready as _tor_ready
+                status["tor"]["ready"] = _tor_ready(
+                    control_port=control, socks_port=socks,
+                    binary=tor_binary)
+            except Exception as exc:
+                status["tor"]["ready"] = {"ok": False,
+                                          "error": str(exc)[:300]}
+                status["transport_warning"] = (
+                    f"transport_mode=tor but the Tor anonymity layer is "
+                    f"not ready: {str(exc)[:200]} — tor transfers fail "
+                    "closed; tor mode never falls back to relay.")
+        if mode != "tor" and env_relay.lower() in {"off", "disabled", "none"}:
             status["transport_warning"] = (
                 f"HERMES_IROH_RELAY={env_relay} is set but it is a no-op: "
                 "transfers are relay-only on both ends and the env var "
@@ -135,7 +181,11 @@ def _service_for(ctx, source=None):
     def _make(m, r):
         if transport_name == "fake":
             return FakeTransport(transport_mode=m)
-        return RealSendHermesTransport(transport_mode=m, relay_url=r)
+        control, socks, tor_binary = _tor_config(ctx)
+        return RealSendHermesTransport(
+            transport_mode=m, relay_url=r,
+            tor_control_port=control, tor_socks_port=socks,
+            tor_binary=tor_binary)
 
     transport = _make(mode, relay_arg)
     overrides = {pid: _make(cfg["transport_mode"],

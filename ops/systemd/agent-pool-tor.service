@@ -1,0 +1,22 @@
+[Unit]
+Description=Agent Pool Tor daemon (Iroh Tor transport anonymity layer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# torrc: ops/torrc — ControlPort 127.0.0.1:9051, CookieAuthentication 0,
+# SocksPort 127.0.0.1:9055, DataDirectory under the plugin data dir.
+# No automatic recovery if tor crashes is a known Iroh-Tor limitation;
+# Restart=always is the mitigation (see ops/tor-build.md).
+ExecStart=/usr/sbin/tor -f /etc/tor/torrc
+Restart=always
+RestartSec=5
+# ControlPort is localhost-only with cookie auth OFF: only local
+# processes may command the daemon. Do not expose it.
+ProtectSystem=strict
+ProtectHome=no
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+# agent-pool Tor daemon config (ops/torrc)
+#
+# Install: sudo install -m 644 ops/torrc /etc/tor/torrc
+#          sudo systemctl enable --now agent-pool-tor
+# (scripts/install-tor.sh does this for you.)
+#
+# Security contract (also in docs/threat-model.md):
+# - ControlPort binds 127.0.0.1 ONLY. CookieAuthentication is 0, so
+#   anything that can reach the control port can command the daemon.
+#   Binding localhost-only is what makes that acceptable.
+# - SocksPort binds 127.0.0.1 only (operator tooling; the Iroh Tor
+#   transport manages its own circuits via the control port).
+# - DataDirectory lives under the plugin data dir, not /var/lib/tor.
+
+DataDirectory /home/maxcurrent/.hermes/plugin-data/agent-pool/tor-data
+Log notice file /home/maxcurrent/.hermes/plugin-data/agent-pool/tor-data/notice.log
+
+ControlPort 127.0.0.1:9051
+CookieAuthentication 0
+SocksPort 127.0.0.1:9055
