@@ -120,31 +120,22 @@ class PoolService:
         return None
 
     def _resolve_pool(self, pool_id=None, source=None) -> str:
-        """D2 precedence: explicit --pool -> chat binding -> single local."""
+        """Hosted pools only: explicit --pool -> the hosted pool -> refusal.
+
+        Platform routes cross-gateway commands; plugin selects among pools
+        it hosts. No chat binding, no peer/anchor fallback (2109 P2).
+        """
         if pool_id:
             pool_id = str(pool_id).strip()
             if pool_id:
                 row = self._conn.execute("SELECT pool_id FROM pools WHERE pool_id=?",
                                          (pool_id,)).fetchone()
                 if row is None:
-                    # Remote pool view: only a pinned trust anchor resolves.
-                    if L.get_trust_anchor(self._conn, pool_id) is not None:
-                        return pool_id
+                    hosts = L.list_local_pools(self._conn)
                     raise PoolNotLocalError(
-                        f"pool_not_local: pool {pool_id!r} is not hosted by this agent"
-                        f" (host identity {self._caller_key_id or 'unknown'});"
-                        " use an Iroh ticket against the owning agent",
+                        f"pool {pool_id} is not hosted by this gateway (hosts: {', '.join(hosts) or 'none'})",
                         pool_id=pool_id)
                 return pool_id
-        src = self._source_from(source)
-        chat_id = self._source_field(src, "chat_id", "parent_chat_id")
-        guild_id = self._source_field(src, "guild_id", "scope_id")
-        thread_id = self._source_field(src, "thread_id")
-        if chat_id is not None:
-            bound = L.get_pool_for_chat(self._conn, chat_id,
-                                        guild_id=guild_id, thread_id=thread_id)
-            if bound:
-                return bound
         pools = L.list_local_pools(self._conn)
         if len(pools) == 1:
             return pools[0]
@@ -154,7 +145,8 @@ class PoolService:
 
     def _assert_local_owned(self, pool_id=None, *, require_maintainer=False,
                             source=None) -> str:
-        """D3: pool must exist locally; optionally caller must be maintainer."""
+        """Hosted-only: pool must exist locally. Owner checks are whitelist
+        helpers; no key-based authz remains."""
         resolved = self._resolve_pool(pool_id, source=source)
         row = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
                                  (resolved,)).fetchone()
@@ -162,145 +154,116 @@ class PoolService:
             raise PoolNotLocalError(
                 f"pool_not_local: pool {resolved!r} is not hosted by this agent",
                 pool_id=resolved)
-        if require_maintainer:
-            if self._caller_key_id and row["maintainer_key_id"] != self._caller_key_id:
-                raise PoolNotLocalError(
-                    f"pool_not_local: pool {resolved!r} is not hosted by this agent"
-                    f" (maintainer {row['maintainer_key_id']!r} != caller "
-                    f"{self._caller_key_id!r}); use an Iroh ticket against the owning agent",
-                    pool_id=resolved)
-        else:
-            # Member check: a non-member has no business touching this local
-            # pool through the gateway (remote trigger refused). Members and
-            # maintainers may act; pure-existence is enforced above. Pools
-            # with no member rows (bare test fixtures) are exempt.
-            if self._caller_key_id:
-                n = self._conn.execute(
-                    "SELECT COUNT(*) FROM members WHERE pool_id=?",
-                    (resolved,)).fetchone()[0]
-                if n:
-                    is_member = self._conn.execute(
-                        "SELECT 1 FROM members WHERE pool_id=? AND key_id=?",
-                        (resolved, self._caller_key_id)).fetchone() is not None
-                    if not is_member:
-                        raise PoolNotLocalError(
-                            f"pool_not_local: caller {self._caller_key_id!r} is not a"
-                            f" member of pool {resolved!r}; remote pools are reached"
-                            " only via Iroh",
-                            pool_id=resolved)
         return resolved
 
-    def _is_remote(self, pool_id) -> bool:
-        if pool_id is None:
-            return False
-        if self._conn.execute("SELECT 1 FROM pools WHERE pool_id=?", (pool_id,)).fetchone():
-            return False
-        return L.get_trust_anchor(self._conn, pool_id) is not None
+    def pool_fetch(self, repo_id=None, *, projects=False, tasks=False, pool_id=None, source=None) -> dict:
+        """Hosted-pool fetch: projects/tickets/manifest (2109 P2).
 
-    def _can_access(self, pool_id, key_id=None) -> bool:
-        """Fail-closed read/claim access (Phase 1 + OD4).
+        Returns accepted project list, open/claimed ticket list (never
+        pending), and for a repo the latest accepted manifest. The manifest
+        is carried ONCE, as ``manifest_json`` — the canonical serialization
+        the signature covers and ``/work fetch --manifest`` consumes
+        verbatim (OD3: no chunking in 2.5.0; see below).
 
-        Local pool: caller key must be the maintainer or a member row of
-        that pool. Zero members or no key → False.
-        Remote pool: a pinned trust anchor must exist; reads are allowed
-        after pinning. Claims/fetch additionally require the caller key in
-        the latest imported manifest's ``wrapped_keys`` when that set is
-        non-empty (legacy test fixtures carry empty sets and rely on the
-        anchor alone).
+        OD3 decision: manifest size is bounded by fixed fields + ~190 bytes
+        per invited agent (one ``wrapped_keys`` entry) + one Iroh transfer
+        ticket. Pools with a handful of agents stay well under the 4 KB
+        reply guard. If the reply would breach the guard, the fetch fails
+        with a determinate error naming the manifest hash instead of a
+        silently-truncated reply; hash-addressed retrieval
+        (``/work fetch --hash``) is the deferred milestone if membership
+        ever approaches the ceiling.
         """
-        if pool_id is None:
-            return False
-        key = key_id or self._caller_key_id
-        row = self._conn.execute("SELECT * FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
-        if row is not None:
-            if not key:
-                return False
-            if row["maintainer_key_id"] == key:
-                return True
-            return self._conn.execute(
-                "SELECT 1 FROM members WHERE pool_id=? AND key_id=?",
-                (pool_id, key)).fetchone() is not None
-        anchor = L.get_trust_anchor(self._conn, pool_id)
-        if anchor is None:
-            return False
-        # OD4: reads after pinning; claims/fetch need wrapped_keys membership
-        # when the manifest carries a wrapped set.
-        manifest = None
-        try:
-            row = self._conn.execute(
-                "SELECT manifest_json FROM imported_versions WHERE pool_id=? AND state='accepted'"
-                " ORDER BY version DESC LIMIT 1", (pool_id,)).fetchone()
-            if row is not None:
-                manifest = json.loads(row[0])
-        except Exception:
-            manifest = None
-        if manifest is None:
-            # No imported manifest yet: anchor alone grants read of empty view.
-            return True
-        wrapped = manifest.get("wrapped_keys") or {}
-        if not wrapped:
-            return True
-        if not key:
-            return False
-        return key in wrapped
-
-    def pool_trust(self, pool_id, maintainer_key_id, verify_key_hex, agent_key_id="anchor"):
-        if not pool_id or not maintainer_key_id or not verify_key_hex:
-            raise ValueError("/pool trust needs <pool_id> <maintainer_key_id> --verify-key <hex>")
-        anchor = L.pin_trust_anchor(self._conn, pool_id, maintainer_key_id, verify_key_hex, agent_key_id)
-        L.record_event(self._conn, pool_id, "trust_pinned",
-                       {"maintainer_key_id": maintainer_key_id})
-        return {"ok": True, "pool_id": pool_id, "maintainer_key_id": maintainer_key_id,
-                "trust_state": "pinned", "anchor": anchor}
-
-    def pool_trust_list(self, pool_id=None):
-        return {"ok": True, "anchors": L.list_trust_anchors(self._conn, pool_id)}
-
-    def pool_trust_revoke(self, pool_id):
-        anchor = L.revoke_trust_anchor(self._conn, pool_id)
-        L.record_event(self._conn, pool_id, "trust_revoked", {})
-        return {"ok": True, "pool_id": pool_id, "trust_state": "revoked",
-                "note": "existing local copies remain; future imports/fetches blocked until re-pinned"}
-
-    def import_canonical(self, pool_id, manifests, verify_keys, tickets=None, maintainer_key_id=None):
-        """Verify a maintainer chain, then store copies in the remote view.
-
-        Import IS the trust operation: requires a verify key (or an existing
-        pinned anchor) — no-verify-key import is refused. Success pins the
-        anchor to ``pinned``.
-        """
-        verify_keys = dict(verify_keys or {})
-        existing = L.get_trust_anchor(self._conn, pool_id) if pool_id else None
-        if not verify_keys and existing is None:
-            raise ValueError(
-                "import requires --verify-key <hex> (maintainer verification key) "
-                "or an existing pinned anchor (/pool trust)")
-        if verify_keys and existing is None and not maintainer_key_id:
-            raise ValueError(
-                "import requires --maintainer <key_id> (no pinned anchor: "
-                "the verify key must bind to an operator-named maintainer, not the manifest's self-declared signer)")
-        ok, reason = C.verify_chain(list(manifests or []), verify_keys)
-        if not ok:
-            raise ValueError(f"import rejected: {reason}")
-        maintainer = maintainer_key_id or existing["maintainer_key_id"]
-        # Determine the verify key hex from verify_keys (first value).
-        vk_hex = ""
-        for vk in verify_keys.values():
+        resolved = self._resolve_pool(pool_id, source=source)
+        self._require_authorized(resolved, source)
+        out = {"ok": True, "pool_id": resolved}
+        if projects:
+            out["projects"] = self._project_rows(resolved)
+        if tasks:
+            out["tickets"] = [dict(t) for t in L.list_tickets(self._conn, pool_id=resolved, state="open")]
+            out["tickets"] += [dict(t) for t in L.list_tickets(self._conn, pool_id=resolved, state="claimed")]
+        if repo_id:
+            manifest = L.get_latest_accepted_manifest(self._conn, repo_id)
+            if manifest is None:
+                raise ValueError(f"no ACCEPTED version for repo {repo_id!r} to fetch")
+            out["repo_id"] = repo_id
+            out["manifest_json"] = json.dumps(manifest, sort_keys=True)
             try:
-                vk_hex = vk.encode().hex()
-                break
+                from crypto import manifest_hash as _manifest_hash
             except Exception:
-                continue
-        L.upsert_peer(self._conn, pool_id, "anchor", maintainer, trust_state="pinned", verify_pubkey_hex=vk_hex)
-        for m in manifests or []:
-            L.upsert_remote_repo(self._conn, m["repo_id"], pool_id, remote_repo_id=m["repo_id"])
-            L.import_version(self._conn, m, C.manifest_hash(m), pool_id=pool_id)
-        for t in tickets or []:
-            L.import_ticket(self._conn, t)
-        L.record_event(self._conn, pool_id, "canonical_imported",
-                       {"versions": len(manifests or []), "tickets": len(tickets or [])})
-        return {"ok": True, "pool_id": pool_id, "imported_versions": len(manifests or []),
-                "imported_tickets": len(tickets or []), "trust_state": "pinned"}
+                from .crypto import manifest_hash as _manifest_hash
+            out["manifest_hash"] = _manifest_hash(manifest)
+            out["transfer_ticket"] = manifest.get("transfer_ticket", "")
+        if not (projects or tasks or repo_id):
+            out["projects"] = self._project_rows(resolved)
+            out["tickets"] = [dict(t) for t in L.list_tickets(self._conn, pool_id=resolved, state="open")]
+        # OD3: fail loudly rather than let format_result silently truncate a
+        # manifest (which would corrupt the /work fetch round-trip).
+        try:
+            from replies import MAX_CONTENT_BYTES
+        except Exception:
+            MAX_CONTENT_BYTES = 4096
+        size = len(json.dumps(out, indent=2, sort_keys=True).encode("utf-8"))
+        if size > MAX_CONTENT_BYTES:
+            raise ValueError(
+                f"fetch reply {size} bytes exceeds the {MAX_CONTENT_BYTES}-byte "
+                f"gateway limit (manifest {out.get('manifest_hash','?')});"
+                f" hash-addressed retrieval is not built in 2.5.0")
+        return out
+
+    def work_fetch(self, manifest, *, dest, source=None) -> dict:
+        """Fetch one repo from a fetched manifest using own box key.
+
+        Unwraps DEK with the caller's box private key, BLAKE3-verifies,
+        clones. Manifest comes from /pool fetch on the pool gateway.
+        """
+        if not manifest:
+            raise ValueError("work fetch needs --manifest <json>")
+        if not self._caller_box_sk:
+            raise PermissionError("work fetch needs the agent's own box key for DEK unwrap")
+        # Build a temporary propagator for verification/clone. The manifest
+        # carries signer_key_id + wrapped_keys; verify chain against signer.
+        repo_id = manifest.get("repo_id", "repo")
+        # If this gateway hosts the pool, use the real propagator so the
+        # chain check is real (defense-in-depth — the wrapped-key ACL is
+        # the byte boundary). A contributor gateway that hosts no pool
+        # still fetches by manifest with its own box key.
+        try:
+            pool_id = self._resolve_pool(None, source=source)
+        except Exception:
+            pool_id = None
+        # Membership keyed by any trusted signer in manifest.
+        from propagation import Member as _M
+        members = {self._caller_key_id: _M(key_id=self._caller_key_id, role="member",
+                                           box_pubkey_hex="", box_sk=self._caller_box_sk)}
+        signer = manifest.get("signer_key_id", "")
+        if signer and signer not in members:
+            members[signer] = _M(key_id=signer, role="maintainer",
+                                 verify_key_hex="", box_pubkey_hex="", box_sk=None)
+        # If the pool is hosted locally, use the real propagator for verify.
+        try:
+            prop = self._propagator(repo_id if pool_id is None else pool_id) if pool_id else None
+        except Exception:
+            prop = None
+        if prop is not None:
+            fetcher = prop._members.get(self._caller_key_id) or members[self._caller_key_id]
+            return prop.fetch(manifest=manifest, fetcher=fetcher, dest=Path(dest))
+        # Non-hosted fetch context (contributor gateway): verify against
+        # wrapped keys by direct fetch through the service transport.
+        # Authorized if the caller's key appears in wrapped_keys.
+        wrapped = manifest.get("wrapped_keys") or {}
+        if self._caller_key_id not in wrapped:
+            raise PermissionError(
+                "work fetch refused: caller key not in manifest wrapped_keys (only invited agents can decrypt)")
+        from propagation import RepoPropagator as _RP
+        prop = _RP(self._conn, self._transport, pool_id=pool_id or "fetch",
+                   maintainer_key_id=signer, maintainer_signing_key=None, members=members)
+        fetcher = members[self._caller_key_id]
+        # No local chain to verify against on a gateway that hosts no pool:
+        # the wrapped-key ACL (checked in fetch) is the authorization
+        # boundary, and BLAKE3 still pins the bytes to this manifest.
+        return prop.fetch(manifest=manifest, fetcher=fetcher, dest=Path(dest),
+                          verify_chain=False)
 
     def propose(self, kind, payload):
         if self._caller_sk is None:
@@ -327,7 +290,7 @@ class PoolService:
                     continue
         return keys
 
-    def accept_proposal(self, packet, proposer_verify_key=None, verify_keys=None):
+    def accept_proposal(self, packet, proposer_verify_key=None, verify_keys=None, *, source=None):
         if isinstance(packet, str):
             packet = C.parse_proposal(packet)
         payload = packet.get("payload") or {}
@@ -341,9 +304,14 @@ class PoolService:
             if row is not None:
                 resolved_pool = pool_id
             else:
-                # Remote pools never mint locally — maintainer must import first.
                 raise ValueError(f"proposal pool {pool_id!r} is not hosted by this agent; "
-                                 "import the pool manifest first (/pool import ...)")
+                                 "write it on the pool's own gateway (writes are maintainer-only "
+                                 "on the owning ledger)")
+        # Packet mint is owner-only (whitelist model). A non-owner's packet
+        # is relayed to the owner for minting, never minted here.
+        if resolved_pool:
+            self._check_not_frozen(resolved_pool)
+            self._require_owner(resolved_pool, source)
         # Collect candidate verify keys: explicit > member table > passed single.
         candidates = dict(verify_keys or {})
         if resolved_pool:
@@ -383,15 +351,16 @@ class PoolService:
         if kind == "ticket_proposal":
             ticket = self.add_ticket(payload.get("pool_id", ""), payload.get("repo_id", ""),
                                      payload.get("title", ""), brief=payload.get("brief", ""),
-                                     budget=payload.get("budget"), source=None)
+                                     budget=payload.get("budget"), source=source)
         elif kind == "repo_proposal":
             ticket = self.add_repo(payload.get("pool_id", ""), payload.get("repo_id", ""),
                                    payload.get("path", ""), display_name=payload.get("display_name", ""),
-                                   repo_link=payload.get("link") or payload.get("repo_link") or None)
+                                   repo_link=payload.get("link") or payload.get("repo_link") or None,
+                                   source=source)
         elif kind == "claim_proposal":
             ticket = self.claim(payload.get("ticket_id", ""), key_id=proposer,
                                 declared_paths=payload.get("declared_paths") or [],
-                                budget=payload.get("budget"))
+                                budget=payload.get("budget"), source=source)
         elif kind == "work_proposal":
             raise ValueError("work_proposal minting is gated on the Phase 4b transport spike")
         else:
@@ -427,10 +396,12 @@ class PoolService:
                       source=None, discord_user_id=None) -> dict:
         if L.is_global_frozen(self._conn):
             raise L.ClaimRefused(L.FROZEN_MESSAGE)
+        if not discord_user_id:
+            raise ValueError("register needs --discord-user <id>: the whitelist is the auth")
         maintainer = key_id or self._caller_key_id
         if not maintainer:
             raise ValueError("register needs a maintainer key_id")
-        L.create_pool(self._conn, pool_id, name, maintainer, relay_url=relay_url)
+        L.create_pool(self._conn, pool_id, name, maintainer, relay_url=relay_url, owner_discord_user_id=discord_user_id)
         # Record the maintainer's box pubkey so submit wraps the DEK for the
         # maintainer too (fixes "maintainer has no wrapped DEK" at audit).
         _irow = self._conn.execute(
@@ -444,59 +415,62 @@ class PoolService:
                 _box = ""
         L.add_member(self._conn, pool_id, maintainer, role="maintainer", box_pubkey_hex=_box or "",
                      verify_pubkey_hex=_vhex or "")
+        L.authorize_user(self._conn, pool_id, discord_user_id)
         L.record_event(self._conn, pool_id, "pool_registered",
-                       {"pool_id": pool_id, "maintainer": maintainer})
-        # Record chat binding from source (D2/D4).
-        src = self._source_from(source)
-        if src is not None:
-            chat_id = self._source_field(src, "chat_id", "parent_chat_id")
-            if chat_id is not None:
-                guild_id = self._source_field(src, "guild_id", "scope_id")
-                thread_id = self._source_field(src, "thread_id")
-                L.bind_pool_chat(self._conn, chat_id, guild_id, thread_id, pool_id)
-        if discord_user_id:
-            L.bind_discord_user(self._conn, maintainer, discord_user_id)
+                       {"pool_id": pool_id, "maintainer": maintainer,
+                        "owner_discord_user_id": str(discord_user_id)})
+        # Attribution only: the invite-bound key for the owner's Discord id.
+        # (No chat binding — the platform routes commands across gateways;
+        # the plugin only selects among pools it hosts, 2109 Phase 2.)
+        L.bind_discord_user(self._conn, maintainer, discord_user_id)
         return {"ok": True, "pool_id": pool_id, "name": name, "maintainer": maintainer,
-                "chat_id": chat_id if src is not None else None}
+                "owner_discord_user_id": str(discord_user_id)}
 
     def invite(self, pool_id, key_id, role="member", box_pubkey_hex="",
                source=None, discord_user_id=None, verify_pubkey_hex="") -> dict:
         pool_id = self._assert_local_owned(pool_id, source=source)
+        # Owner-only (whitelist model): the whitelist IS the authorization.
+        self._require_owner(pool_id, source)
+        # Freeze is absolute: a frozen pool refuses every other verb from
+        # every user with the exact message, before argument validation.
         self._check_not_frozen(pool_id)
         if role not in ("member", "maintainer"):
             raise ValueError(f"role must be member|maintainer, got {role!r}")
+        if not discord_user_id:
+            raise ValueError("invite needs --discord-user <id>: the whitelist is the auth")
         L.add_member(self._conn, pool_id, key_id, role=role, box_pubkey_hex=box_pubkey_hex,
                      verify_pubkey_hex=verify_pubkey_hex or "")
-        if discord_user_id:
-            L.bind_discord_user(self._conn, key_id, discord_user_id)
+        L.bind_discord_user(self._conn, key_id, discord_user_id)
+        L.authorize_user(self._conn, pool_id, discord_user_id)
         L.record_event(self._conn, pool_id, "invited",
                        {"key_id": key_id, "role": role})
         return {"ok": True, "pool_id": pool_id, "key_id": key_id, "role": role}
 
     def members(self, pool_id, source=None) -> list:
         pool_id = self._resolve_pool(pool_id, source=source)
+        # Authorized-only read verb (whitelist model).
+        self._require_pool_authorized(pool_id, source)
         return L.list_members(self._conn, pool_id)
 
-    def set_auto_approve(self, pool_id, enabled, *, actor_key_id=None) -> dict:
-        """Maintainer-only auto-approve toggle (Phase 1)."""
-        pool_id = self._assert_local_owned(pool_id, require_maintainer=False)
+    def set_auto_approve(self, pool_id, enabled, *, source=None) -> dict:
+        """Owner-only auto-approve toggle (whitelist model)."""
+        pool_id = self._assert_local_owned(pool_id, require_maintainer=False, source=source)
+        # Freeze is absolute for every other verb from every user.
         self._check_not_frozen(pool_id)
-        pool = self._conn.execute("SELECT maintainer_key_id FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
-        actor = actor_key_id or self._caller_key_id
-        if pool is None or actor != pool[0]:
-            raise PermissionError("only the pool maintainer may change auto-approve")
+        self._require_owner(pool_id, source)
         L.set_auto_approve(self._conn, pool_id, bool(enabled))
         L.record_event(self._conn, pool_id, "auto_approve_changed", {"enabled": bool(enabled)})
         return {"ok": True, "pool_id": pool_id, "auto_approve": bool(enabled)}
 
 
-    def freeze(self, pool_id, frozen: bool) -> dict:
+    def freeze(self, pool_id, frozen: bool, *, source=None) -> dict:
+        self._require_owner(pool_id, source)
         L.set_frozen(self._conn, pool_id, frozen)
         notice = f"pool {pool_id} {'frozen' if frozen else 'unfrozen'}"
         self._queue_notice(pool_id, notice, kind="freeze")
         return {"ok": True, "pool_id": pool_id, "frozen": frozen, "notice": notice}
 
-    def remove_member(self, pool_id, key_id, *, actor_key_id=None) -> dict:
+    def remove_member(self, pool_id, key_id, *, source=None) -> dict:
         """Revoke a member: registry removal + forward-separation notice.
 
         Future manifests omit the removed member's wrapped key (fresh DEK per
@@ -504,14 +478,19 @@ class PoolService:
         retroactively — the limitation is stated in the thread notice.
         """
         self._check_not_frozen(pool_id)
-        actor = actor_key_id or self._caller_key_id
+        self._require_owner(pool_id, source)
         pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
                                   (pool_id,)).fetchone()
         if pool is None:
             raise ValueError(f"unknown pool: {pool_id!r}")
-        if pool["maintainer_key_id"] != actor:
-            raise PermissionError("only the pool maintainer may remove members")
         removed = L.remove_member(self._conn, pool_id, key_id)
+        # Drop the whitelist row if the invite-bound Discord id is known.
+        try:
+            _row = self._conn.execute("SELECT discord_user_id FROM identities WHERE key_id=?", (key_id,)).fetchone()
+            if _row and _row[0]:
+                L.deauthorize_user(self._conn, pool_id, _row[0])
+        except Exception:
+            pass
         notice = (f"member removed: {key_id} (forward separation only: "
                   f"{L.REVOCATION_LIMITATION})")
         self._queue_notice(pool_id, notice, kind="member_removed")
@@ -529,17 +508,22 @@ class PoolService:
         """Global kill-switch first, then per-pool freeze (Phase 6)."""
         L.check_not_frozen(self._conn, pool_id)
 
-    def freeze_global(self, frozen: bool) -> dict:
+    def freeze_global(self, frozen: bool, *, source=None) -> dict:
         """GLOBAL kill-switch: freeze/unfreeze EVERY pool in the process.
 
-        Sets the ledger ``meta`` flag (persists across restarts) and mirrors
-        it into each pool's per-pool flag so ``is_frozen`` stays truthful.
-        While set, all pool-mutating and claim/work/integrate actions raise
-        (see ``_check_not_frozen``); only this command (to unfreeze) and
-        read-only queries are allowed. Notice posted to every pool channel.
+        Owner-only (whitelist model): requires ownership of every hosted
+        pool. Sets the ledger ``meta`` flag (persists across restarts) and
+        mirrors it into each pool's per-pool flag so ``is_frozen`` stays
+        truthful. While set, all pool-mutating and claim/work/integrate
+        actions raise (see ``_check_not_frozen``); only this command (to
+        unfreeze) and read-only queries are allowed. Notice posted to every
+        pool channel.
         """
+        hosts = [r[0] for r in self._conn.execute("SELECT pool_id FROM pools")]
+        for _h in hosts:
+            self._require_owner(_h, source)
         L.set_global_frozen(self._conn, frozen)
-        pools = [r[0] for r in self._conn.execute("SELECT pool_id FROM pools")]
+        pools = hosts
         notices = []
         for pool_id in pools:
             L.set_frozen(self._conn, pool_id, frozen)
@@ -557,13 +541,9 @@ class PoolService:
         if not title.strip():
             raise ValueError("ticket title is required")
         pool_id = self._resolve_pool(pool_id, source=source)
-        if self._is_remote(pool_id):
-            if not self._can_access(pool_id):
-                raise PoolNotLocalError(f"pool_not_local: no verified access to remote pool {pool_id!r}", pool_id=pool_id)
-            return self.propose("ticket_proposal", {"pool_id": pool_id, "repo_id": repo_id,
-                                                   "title": title.strip(), "brief": brief, "budget": budget})
-        self._assert_local_owned(pool_id, source=source)
         self._check_not_frozen(pool_id)
+        self._require_owner(pool_id, source)
+        self._assert_local_owned(pool_id, source=source)
         L.ensure_repo(self._conn, repo_id, pool_id)
         full_budget = L.normalize_budget(budget, self._budget_defaults)
         ticket_id = f"t-{secrets.token_hex(4)}"
@@ -586,65 +566,108 @@ class PoolService:
         return ticket
 
     def list_tickets(self, pool_id=None, state=None, source=None, repo_id=None) -> list:
-        # Remote pool: return imported copies.
-        try:
-            _pid = self._resolve_pool(pool_id, source=source) if pool_id else None
-        except PoolNotLocalError:
-            _pid = None
-        if _pid and self._is_remote(_pid):
-            if not self._can_access(_pid):
-                raise PoolNotLocalError(f"pool_not_local: no verified access to remote pool {_pid!r}", pool_id=_pid)
-            return L.list_imported_tickets(self._conn, pool_id=_pid, state=state, repo_id=repo_id)
         if repo_id:
             repo = L.get_repo(self._conn, repo_id)
             if repo is None:
-                # Remote repo?
-                rr = L.get_remote_repo(self._conn, repo_id)
-                if rr is not None:
-                    return L.list_imported_tickets(self._conn, pool_id=rr["pool_id"], state=state, repo_id=repo_id)
                 raise ValueError(f"unknown repo: {repo_id!r}")
             if pool_id:
                 pool_id = self._resolve_pool(pool_id, source=source)
                 if repo["pool_id"] != pool_id:
                     raise PoolNotLocalError(
                         f"pool_not_local: repo {repo_id!r} belongs to pool "
-                        f"{repo['pool_id']!r}, not pool {pool_id!r}; remote pools "
-                        "are reached only via Iroh",
+                        f"{repo['pool_id']!r}, not pool {pool_id!r}",
                         pool_id=repo["pool_id"])
-                self._assert_local_owned(pool_id, source=source)
             else:
                 pool_id = repo["pool_id"]
-                self._assert_local_owned(pool_id, source=source)
         elif pool_id:
             pool_id = self._resolve_pool(pool_id, source=source)
         else:
-            # If source binds a pool, scope to it.
-            src = self._source_from(source)
-            if src is not None:
-                try:
-                    pool_id = self._resolve_pool(None, source=src)
-                except PoolNotLocalError:
-                    pool_id = None
-        return self._filter_pending(L.list_tickets(self._conn, pool_id=pool_id, state=state, repo_id=repo_id), state=state, pool_id=pool_id)
+            try:
+                pool_id = self._resolve_pool(None, source=source)
+            except PoolNotLocalError:
+                pool_id = None
+        # Authorized-only read verb (whitelist model).
+        self._require_pool_authorized(pool_id, source)
+        return self._filter_pending(L.list_tickets(self._conn, pool_id=pool_id, state=state, repo_id=repo_id), state=state, pool_id=pool_id, source=source)
 
-    def _is_bound_maintainer(self, pool_id) -> bool:
-        if not pool_id or not self._caller_key_id:
+    def _require_pool_authorized(self, pool_id, source) -> None:
+        """Authorized-only read verb (2109): `/task list|show`,
+        `/pool list|members`, `/audit show` are not public."""
+        if not pool_id:
+            return
+        self._require_authorized(pool_id, source)
+
+    def _is_bound_maintainer(self, pool_id, source=None) -> bool:
+        # Whitelist model: pending visibility is owner-only, checked by
+        # Discord id, not gateway key. Kept name for pending-filter callers.
+        if not pool_id:
             return False
-        row = self._conn.execute("SELECT maintainer_key_id FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
-        return bool(row) and row[0] == self._caller_key_id
+        src = self._source_from(source)
+        user_id = self._source_field(src, "user_id", "discord_user_id")
+        if user_id is None:
+            return False
+        return L.is_owner(self._conn, pool_id, str(user_id))
 
-    def _filter_pending(self, rows, state=None, pool_id=None):
+    def _discord_user(self, source) -> str | None:
+        src = self._source_from(source)
+        user_id = self._source_field(src, "user_id", "discord_user_id")
+        return str(user_id) if user_id is not None else None
+
+    def _invite_bound_key(self, source) -> str | None:
+        """Invite-bound agent key for the driving Discord user (OD1).
+
+        Attribution only — crypto records WHO acted (overlap checks,
+        manifests, notices). The Discord id is the authorization; this
+        lookup never decides access.
+        """
+        user_id = self._discord_user(source)
+        if user_id is None:
+            return None
+        try:
+            return L.lookup_key_by_discord_user(self._conn, user_id)
+        except Exception:
+            return None
+
+    def _require_owner(self, pool_id, source) -> None:
+        # Legacy bare fixtures (no owner/whitelist rows) skip the check;
+        # whitelisted pools are strict (production path).
+        try:
+            _pool = self._conn.execute("SELECT owner_discord_user_id FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
+            _has = _pool is not None and _pool[0]
+            _n = self._conn.execute("SELECT COUNT(*) FROM pool_authorized WHERE pool_id=?", (pool_id,)).fetchone()[0]
+        except Exception:
+            _has, _n = False, 0
+        if not _has and not _n:
+            return
+        user_id = self._discord_user(source)
+        if user_id is None or not L.is_owner(self._conn, pool_id, user_id):
+            raise PermissionError(f"not authorized for pool {pool_id} — ask the maintainer")
+
+    def _require_authorized(self, pool_id, source) -> None:
+        try:
+            _pool = self._conn.execute("SELECT owner_discord_user_id FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
+            _has = _pool is not None and _pool[0]
+            _n = self._conn.execute("SELECT COUNT(*) FROM pool_authorized WHERE pool_id=?", (pool_id,)).fetchone()[0]
+        except Exception:
+            _has, _n = False, 0
+        if not _has and not _n:
+            return
+        user_id = self._discord_user(source)
+        if user_id is None or not L.is_authorized(self._conn, pool_id, user_id):
+            raise PermissionError(f"not authorized for pool {pool_id} — ask the maintainer")
+
+    def _filter_pending(self, rows, state=None, pool_id=None, source=None):
         """Pending hidden from non-maintainers unless explicitly requested."""
         if state is not None:
             return rows
-        if pool_id and self._is_bound_maintainer(pool_id):
+        if pool_id and self._is_bound_maintainer(pool_id, source=source):
             return rows
         # If the caller is maintainer of any pool in the result set, keep.
         tickets = [r for r in rows if r.get("state") != "pending"]
-        if pool_id is None and rows and self._caller_key_id:
+        if pool_id is None and rows:
             # Check if caller is maintainer of every pool present.
             pools = {r.get("pool_id") for r in rows if r.get("pool_id")}
-            if pools and all(self._is_bound_maintainer(p) for p in pools):
+            if pools and all(self._is_bound_maintainer(p, source=source) for p in pools):
                 return rows
         return tickets
 
@@ -652,15 +675,13 @@ class PoolService:
         pool_id = self._resolve_pool(pool_id, source=source) if pool_id else None
         return L.list_tickets(self._conn, pool_id=pool_id, state="pending")
 
-    def approve_ticket(self, ticket_id, decision, *, key_id=None, edit_files=None, edit_patch=None, reason="") -> dict:
-        """Maintainer decision on a pending ticket (Phase 4)."""
+    def approve_ticket(self, ticket_id, decision, *, source=None, edit_files=None, edit_patch=None, reason="") -> dict:
+        """Owner decision on a pending ticket (whitelist model)."""
         decision = str(decision).strip().lower()
         ticket = self.show_ticket(ticket_id)
+        # Freeze is absolute: the exact message for every user.
         self._check_not_frozen(ticket["pool_id"])
-        key = key_id or self._caller_key_id
-        pool = self._conn.execute("SELECT maintainer_key_id FROM pools WHERE pool_id=?", (ticket["pool_id"],)).fetchone()
-        if pool is None or pool[0] != key:
-            raise PermissionError("only the pool maintainer may decide pending tickets")
+        self._require_owner(ticket["pool_id"], source)
         if ticket["state"] != "pending":
             raise ValueError(f"approve/deny needs a pending ticket, got {ticket['state']!r}")
         if decision == "approve":
@@ -722,11 +743,7 @@ class PoolService:
             if not str(repo_link).strip():
                 raise ValueError("add-repo --link needs a non-empty URL")
             pool_id = self._resolve_pool(pool_id, source=source)
-            if self._is_remote(pool_id):
-                if not self._can_access(pool_id):
-                    raise PoolNotLocalError(f"pool_not_local: no verified access to remote pool {pool_id!r}", pool_id=pool_id)
-                return self.propose("repo_proposal", {"pool_id": pool_id, "repo_id": repo_id,
-                                                     "link": repo_link, "display_name": display_name})
+            self._require_owner(pool_id, source)
             self._assert_local_owned(pool_id, source=source)
             self._check_not_frozen(pool_id)
             if not repo_id:
@@ -749,13 +766,9 @@ class PoolService:
         if not repo_id:
             raise ValueError("add-repo needs a repo_id (or --path to derive one)")
         pool_id = self._resolve_pool(pool_id, source=source)
-        if self._is_remote(pool_id):
-            if not self._can_access(pool_id):
-                raise PoolNotLocalError(f"pool_not_local: no verified access to remote pool {pool_id!r}", pool_id=pool_id)
-            return self.propose("repo_proposal", {"pool_id": pool_id, "repo_id": repo_id,
-                                                 "path": path, "display_name": display_name})
-        self._assert_local_owned(pool_id, source=source)
         self._check_not_frozen(pool_id)
+        self._require_owner(pool_id, source)
+        self._assert_local_owned(pool_id, source=source)
         repo_path = Path(path)
         if not repo_path.is_dir():
             raise ValueError(f"repo path is not a directory: {path!r}")
@@ -802,47 +815,44 @@ class PoolService:
                 "notice": notice}
 
     def list_projects(self, pool_id=None, source=None) -> list:
-        """Local-ledger-only project listing for /pool list.
+        """Hosted-pool-only project listing for /pool list.
 
-        With --pool (or a chat binding): that pool's projects, after the
-        usual membership check. Otherwise: every local pool the caller is
-        a member of (pools with no member rows are exempt, the bare-fixture
-        rule). Repos with no accepted version are included and marked via
-        ``accepted_version=None`` with a ``note``, not hidden.
+        Authorized-only read verb (whitelist model); when no pool is
+        named and the gateway hosts several, every hosted pool the
+        caller is authorized for is listed.
         """
         if pool_id:
             resolved = self._resolve_pool(pool_id, source=source)
-            if self._is_remote(resolved):
-                if not self._can_access(resolved):
-                    raise PoolNotLocalError(f"pool_not_local: no verified access to remote pool {resolved!r}", pool_id=resolved)
-                rows = []
-                seen = {}
-                for v in L.list_imported(self._conn, pool_id=resolved):
-                    seen[v["repo_id"]] = v
-                for repo_id, v in sorted(seen.items()):
-                    rows.append({"repo_id": repo_id, "pool_id": resolved, "display_name": repo_id,
-                                 "name": repo_id, "accepted_version": v["version"],
-                                 "open_tickets": 0, "claimed_tickets": 0, "total_tickets": 0,
-                                 "submitter_key_id": ""})
-                return rows
-            self._assert_local_owned(resolved, source=source)
+            self._require_pool_authorized(resolved, source)
             return self._project_rows(resolved)
-        src = self._source_from(source)
-        if src is not None:
-            try:
-                bound = self._resolve_pool(None, source=src)
-                self._assert_local_owned(bound, source=source)
-                return self._project_rows(bound)
-            except PoolNotLocalError:
-                pass
+        try:
+            bound = self._resolve_pool(None, source=source)
+            self._require_pool_authorized(bound, source)
+            return self._project_rows(bound)
+        except PoolNotLocalError:
+            pass
         projects: list = []
         for pid in L.list_local_pools(self._conn):
-            try:
-                self._assert_local_owned(pid, source=source)
-            except PoolNotLocalError:
-                continue
-            projects.extend(self._project_rows(pid))
+            if self._is_authorized_or_legacy(pid, source):
+                projects.extend(self._project_rows(pid))
         return projects
+
+    def _is_authorized_or_legacy(self, pool_id, source) -> bool:
+        """True when the caller may read *pool_id*: authorized, or the
+        pool is a legacy bare fixture with no whitelist rows."""
+        try:
+            _pool = self._conn.execute(
+                "SELECT owner_discord_user_id FROM pools WHERE pool_id=?",
+                (pool_id,)).fetchone()
+            _n = self._conn.execute(
+                "SELECT COUNT(*) FROM pool_authorized WHERE pool_id=?",
+                (pool_id,)).fetchone()[0]
+        except Exception:
+            return False
+        if not (_pool is not None and _pool[0]) and not _n:
+            return True
+        user_id = self._discord_user(source)
+        return user_id is not None and L.is_authorized(self._conn, pool_id, user_id)
 
     def _project_rows(self, pool_id) -> list:
         rows = []
@@ -865,9 +875,6 @@ class PoolService:
         t = L.get_ticket(self._conn, ticket_id)
         if t is not None:
             return t
-        it = L.get_imported_ticket(self._conn, ticket_id)
-        if it is not None:
-            return it
         raise ValueError(f"unknown ticket: {ticket_id!r}")
 
     def _set_state_and_notify(self, ticket, state) -> dict:
@@ -882,48 +889,18 @@ class PoolService:
     # -- claims ---------------------------------------------------------------
 
     def claim(self, ticket_id, key_id=None, declared_paths=None, budget=None,
-              maintainer_override=False) -> dict:
-        key = key_id or self._caller_key_id
+              maintainer_override=False, *, source=None) -> dict:
+        ticket = self.show_ticket(ticket_id)
+        # Freeze is absolute: the exact message for every user.
+        self._check_not_frozen(ticket["pool_id"])
+        # Whitelist: only authorized users may claim (OD1: claimant stored as
+        # invite-bound agent key; the lookup is attribution, not authz).
+        self._require_authorized(ticket["pool_id"], source)
+        # Resolve claimant key: explicit > invite-bound (attribution) >
+        # gateway identity for bare fixtures / CLI.
+        key = key_id or self._invite_bound_key(source) or self._caller_key_id
         if not key:
             raise ValueError("claim needs a claimant key_id")
-        # Remote (imported) ticket: record claim locally in imported_claims
-        # AND mint a claim_proposal packet for the maintainer to relay (Phase 4).
-        if L.get_ticket(self._conn, ticket_id) is None:
-            it = L.get_imported_ticket(self._conn, ticket_id)
-            if it is not None:
-                if not self._can_access(it["pool_id"], key):
-                    raise PoolNotLocalError(f"pool_not_local: no verified access to remote pool {it['pool_id']!r}", pool_id=it["pool_id"])
-                self._check_not_frozen(it["pool_id"])
-                if it.get("state") not in ("open", None):
-                    raise L.ClaimRefused(f"claim refused: ticket {ticket_id!r} is {it.get('state')!r}, not open")
-                active = self._conn.execute("SELECT 1 FROM imported_claims WHERE ticket_id=? AND state='active'", (ticket_id,)).fetchone()
-                if active:
-                    raise L.ClaimRefused(f"claim refused: ticket {ticket_id!r} already claimed")
-                claim_id = f"c-{secrets.token_hex(4)}"
-                full = L.normalize_budget(budget, self._budget_defaults)
-                self._conn.execute("INSERT INTO imported_claims (claim_id, ticket_id, key_id, state, declared_paths_json, budget_json, created_at) VALUES (?,?,?,'active',?,?,?)",
-                                   (claim_id, ticket_id, key, json.dumps(list(declared_paths or [])), json.dumps(full), __import__("time").time()))
-                self._conn.execute("UPDATE imported_tickets SET state='claimed', claimant_key_id=?, updated_at=? WHERE ticket_id=?",
-                                   (key, __import__("time").time(), ticket_id))
-                self._conn.commit()
-                notice = f"{STATE_MARKER.format(state='claimed')} ticket {ticket_id} claimed by {key} (remote)"
-                proposal = None
-                packet = None
-                if self._caller_sk is not None:
-                    try:
-                        proposal = self.propose("claim_proposal", {"ticket_id": ticket_id, "pool_id": it["pool_id"],
-                                                                    "declared_paths": list(declared_paths or []),
-                                                                    "budget": full})
-                        packet = proposal.get("packet")
-                    except Exception:
-                        proposal, packet = None, None
-                out = {"claim_id": claim_id, "ticket_id": ticket_id, "key_id": key, "state": "active",
-                        "notice": notice, "state_word": "claimed", "whole_ticket": not declared_paths,
-                        "remote": True}
-                if proposal is not None:
-                    out["proposal"] = proposal
-                    out["packet"] = packet
-                return out
         claim = L.claim_ticket_enforced(
             self._conn, f"c-{secrets.token_hex(4)}", ticket_id, key,
             declared_paths=declared_paths, budget=budget,
@@ -964,7 +941,7 @@ class PoolService:
             try:
                 c = self.claim(ticket["ticket_id"], key_id=key,
                                declared_paths=[], budget=budget,
-                               maintainer_override=maintainer_override)
+                               maintainer_override=maintainer_override, source=source)
                 claimed.append({"ticket_id": ticket["ticket_id"],
                                 "title": ticket["title"],
                                 "repo_id": ticket["repo_id"],
@@ -977,19 +954,13 @@ class PoolService:
         return {"ok": True, "claimed": claimed, "skipped": skipped,
                 "count": len(claimed), "notice": notice}
 
-    def release(self, ticket_id, key_id=None) -> dict:
-        key = key_id or self._caller_key_id
-        if L.get_ticket(self._conn, ticket_id) is None:
-            it = L.get_imported_ticket(self._conn, ticket_id)
-            if it is not None:
-                if it.get("claimant_key_id") != key:
-                    raise L.ClaimRefused("release refused: only the claimant may release the ticket")
-                self._conn.execute("UPDATE imported_claims SET state='released' WHERE ticket_id=? AND state='active'", (ticket_id,))
-                self._conn.execute("UPDATE imported_tickets SET state='open', claimant_key_id=NULL, updated_at=? WHERE ticket_id=?", (__import__("time").time(), ticket_id))
-                self._conn.commit()
-                updated = L.get_imported_ticket(self._conn, ticket_id)
-                updated = dict(updated); updated["notice"] = f"{STATE_MARKER.format(state='open')} ticket {ticket_id} released"
-                return updated
+    def release(self, ticket_id, key_id=None, *, source=None) -> dict:
+        ticket = self.show_ticket(ticket_id)
+        # Freeze is absolute: the exact message for every user.
+        self._check_not_frozen(ticket["pool_id"])
+        # Whitelist: authorized-level verb.
+        self._require_authorized(ticket["pool_id"], source)
+        key = key_id or self._invite_bound_key(source) or self._caller_key_id
         updated = L.release_ticket(self._conn, ticket_id, key)
         notice = f"{STATE_MARKER.format(state='open')} ticket {ticket_id} released"
         self._queue_notice(updated["pool_id"], notice, kind="ticket_release")
@@ -1047,18 +1018,10 @@ class PoolService:
             raise ValueError(f"a worker is already running for ticket {ticket_id!r}")
         claim = L.get_active_claim(self._conn, ticket_id)
         if claim is None:
-            row = self._conn.execute("SELECT * FROM imported_claims WHERE ticket_id=? AND state='active'", (ticket_id,)).fetchone()
-            claim = dict(row) if row else None
-        if claim is None:
             raise ValueError(f"no active claim for ticket {ticket_id!r}")
         budget = json.loads(claim["budget_json"] or "{}")
-        manifest = L.get_latest_accepted_manifest(self._conn, ticket["repo_id"]) or L.get_latest_imported_manifest(self._conn, ticket["repo_id"], pool_id=ticket["pool_id"])
+        manifest = L.get_latest_accepted_manifest(self._conn, ticket["repo_id"])
         if manifest is None:
-            rr = L.get_remote_repo(self._conn, ticket["repo_id"], pool_id=ticket["pool_id"])
-            if rr and (rr.get("link") or "").strip():
-                raise ValueError(
-                    f"no imported manifest for {ticket['repo_id']!r} — import the pool manifest first "
-                    f"(/pool import <manifest-json> --pool {ticket['pool_id']} --verify-key <hex>)")
             raise ValueError(f"no ACCEPTED version for repo {ticket['repo_id']!r} to fetch")
 
         prop = self._propagator(ticket)
@@ -1180,36 +1143,7 @@ class PoolService:
         pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
                                   (pool_id,)).fetchone()
         if pool is None:
-            anchor = L.get_trust_anchor(self._conn, pool_id)
-            if anchor is None:
-                raise RuntimeError(f"unknown pool: {pool_id!r}")
-            maintainer_id = anchor["maintainer_key_id"]
-            pinned = (anchor.get("verify_pubkey_hex") or "").strip()
-            members = self._members_for_propagator(pool_id)
-            # Imported members: wrapped_keys keys from imported manifests.
-            for v in L.list_imported(self._conn, pool_id=pool_id):
-                try:
-                    m = json.loads(v["manifest_json"])
-                except Exception:
-                    continue
-                for kid in (m.get("wrapped_keys") or {}):
-                    if kid not in members:
-                        members[kid] = Member(key_id=kid, role="member", box_pubkey_hex="",
-                                              verify_key_hex=pinned if kid == maintainer_id else "",
-                                              box_sk=self._caller_box_sk if kid == self._caller_key_id else None)
-            if maintainer_id not in members:
-                members[maintainer_id] = Member(key_id=maintainer_id, role="maintainer", box_pubkey_hex="",
-                                                verify_key_hex=pinned, box_sk=None)
-            else:
-                # Ensure the pinned verify key is present for chain verification.
-                existing = members[maintainer_id]
-                if not existing.verify_key_hex and pinned:
-                    members[maintainer_id] = Member(key_id=existing.key_id, role=existing.role,
-                                                    verify_key_hex=pinned, box_pubkey_hex=existing.box_pubkey_hex,
-                                                    box_sk=existing.box_sk)
-            return RepoPropagator(self._conn, self._transport_overrides.get(pool_id, self._transport),
-                                  pool_id=pool_id, maintainer_key_id=maintainer_id,
-                                  maintainer_signing_key=self._caller_sk, members=members)
+            raise RuntimeError(f"unknown pool: {pool_id!r}")
         maintainer_id = pool["maintainer_key_id"]
         members = self._members_for_propagator(pool_id)
         if maintainer_id not in members:
@@ -1224,10 +1158,13 @@ class PoolService:
             maintainer_key_id=maintainer_id, maintainer_signing_key=maintainer_sk,
             members=members)
 
-    def work_submit(self, ticket_id, repo_path, version, key_id=None) -> dict:
+    def work_submit(self, ticket_id, repo_path, version, key_id=None, *, source=None) -> dict:
         ticket = self.show_ticket(ticket_id)
+        # Freeze is absolute: the exact message for every user.
         self._check_not_frozen(ticket["pool_id"])
-        key = key_id or self._caller_key_id
+        # Whitelist: authorized-level verb (attribution via invite-bound key).
+        self._require_authorized(ticket["pool_id"], source)
+        key = key_id or self._invite_bound_key(source) or self._caller_key_id
         if ticket["state"] != "claimed":
             raise ValueError(f"work submit needs a claimed ticket, got {ticket['state']!r}")
         if ticket["claimant_key_id"] != key:
@@ -1266,7 +1203,7 @@ class PoolService:
             return ctx
         return None
 
-    def integrate(self, ticket_id, key_id=None, *, work_dir=None) -> dict:
+    def integrate(self, ticket_id, key_id=None, *, work_dir=None, source=None) -> dict:
         """Phase 5 full gate: fetch branch -> dialog scan -> audit -> buttons.
 
         Steps (all real, network-off scan):
@@ -1281,12 +1218,15 @@ class PoolService:
            the ticket goes to ``blocked`` and canonical is never touched.
         """
         ticket = self.show_ticket(ticket_id)
+        # Freeze is absolute: the exact message for every user.
         self._check_not_frozen(ticket["pool_id"])
+        self._require_owner(ticket["pool_id"], source)
         key = key_id or self._caller_key_id
-        pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
+        pool = self._conn.execute("SELECT maintainer_key_id FROM pools WHERE pool_id=?",
                                   (ticket["pool_id"],)).fetchone()
-        if pool["maintainer_key_id"] != key:
-            raise PermissionError("integrate is maintainer-only")
+        if pool is None:
+            raise ValueError(f"unknown pool: {ticket['pool_id']!r}")
+        key = pool[0]
         pending = L.get_pending_manifest(self._conn, ticket["repo_id"])
         if pending is None:
             raise ValueError(f"no pending submission for repo {ticket['repo_id']!r}")
@@ -1424,9 +1364,9 @@ class PoolService:
                 "branch_ref": branch["head"],
                 "diff_files": ctx["diff_files"], "notice": decision_notice}
 
-    def resolve_integration(self, ticket_id, decision, *, key_id=None,
+    def resolve_integration(self, ticket_id, decision, *, source=None,
                             work_dir=None, edit_files=None, edit_patch=None,
-                            reason="") -> dict:
+                            reason="", key_id=None) -> dict:
         """Human decision handler for the approve/edit/discard buttons.
 
         approve: merge branch -> canonical bundle -> NEW accepted manifest
@@ -1438,12 +1378,18 @@ class PoolService:
         ticket bounced to ``blocked`` with ``rebase needed`` + both refs.
         """
         ticket = self.show_ticket(ticket_id)
+        # Freeze is absolute: the exact message for every user.
         self._check_not_frozen(ticket["pool_id"])
-        key = key_id or self._caller_key_id
-        pool = self._conn.execute("SELECT * FROM pools WHERE pool_id=?",
+        self._require_owner(ticket["pool_id"], source)
+        # Member map key for maintainer (crypto only): the pool's
+        # maintainer key from the ledger. ``key_id`` from a button click is
+        # attribution only (OD1) and is never an authorization decision.
+        key = self._caller_key_id
+        pool = self._conn.execute("SELECT maintainer_key_id FROM pools WHERE pool_id=?",
                                   (ticket["pool_id"],)).fetchone()
-        if pool["maintainer_key_id"] != key:
-            raise PermissionError("integration decisions are maintainer-only")
+        if pool is None:
+            raise ValueError(f"unknown pool: {ticket['pool_id']!r}")
+        key = pool[0]
         decision = str(decision).strip().lower()
         if decision not in ("approve", "edit", "discard"):
             raise ValueError(f"decision must be approve|edit|discard, got {decision!r}")

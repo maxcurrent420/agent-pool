@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS pools (
     pool_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     maintainer_key_id TEXT NOT NULL,
+    owner_discord_user_id TEXT,
     relay_url TEXT NOT NULL DEFAULT '',
     settings_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL
@@ -119,14 +120,14 @@ CREATE TABLE IF NOT EXISTS pool_chats (
     pool_id TEXT NOT NULL REFERENCES pools(pool_id),
     PRIMARY KEY (chat_id, guild_id, thread_id)
 );
-CREATE TABLE IF NOT EXISTS peers (
-    pool_id TEXT NOT NULL,
-    agent_key_id TEXT NOT NULL,
-    maintainer_key_id TEXT NOT NULL,
-    trust_state TEXT NOT NULL DEFAULT 'unverified',
-    verify_pubkey_hex TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (pool_id, agent_key_id)
-);
+-- NOTE (2109 Phase 2): the peers / imported_* / trust-anchor tables are
+-- GONE — no import, no peer trust, no anchors. Reads are fetch commands
+-- on the pool's own gateway (/pool fetch + /work fetch). Existing DBs keep
+-- the old tables on disk and they are simply never read again (no
+-- destructive migration); new DBs never create them.
+--
+-- remote_repos SURVIVES only as the human-readable --link operator note
+-- (OD5): a link is never a fetch source. /pool fetch is the real path.
 CREATE TABLE IF NOT EXISTS remote_repos (
     pool_id TEXT NOT NULL,
     repo_id TEXT NOT NULL,
@@ -134,54 +135,16 @@ CREATE TABLE IF NOT EXISTS remote_repos (
     link TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (pool_id, repo_id)
 );
-CREATE TABLE IF NOT EXISTS imported_versions (
-    pool_id TEXT NOT NULL,
-    repo_id TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    manifest_json TEXT NOT NULL,
-    manifest_hash TEXT NOT NULL,
-    state TEXT NOT NULL DEFAULT 'accepted',
-    PRIMARY KEY (pool_id, repo_id, version)
-);
-CREATE TABLE IF NOT EXISTS imported_chain (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    pool_id TEXT NOT NULL,
-    repo_id TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    manifest_hash TEXT NOT NULL,
-    prev_manifest_hash TEXT,
-    signer_key_id TEXT NOT NULL,
-    signature TEXT NOT NULL,
-    UNIQUE (pool_id, repo_id, version)
-);
-CREATE TABLE IF NOT EXISTS imported_tickets (
-    ticket_id TEXT PRIMARY KEY,
-    pool_id TEXT NOT NULL,
-    repo_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    brief TEXT NOT NULL DEFAULT '',
-    state TEXT NOT NULL DEFAULT 'open',
-    claimant_key_id TEXT,
-    budget_json TEXT NOT NULL DEFAULT '{}',
-    thread_ref TEXT,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS imported_claims (
-    claim_id TEXT PRIMARY KEY,
-    ticket_id TEXT NOT NULL,
-    key_id TEXT NOT NULL,
-    state TEXT NOT NULL DEFAULT 'active',
-    declared_paths_json TEXT NOT NULL DEFAULT '[]',
-    budget_json TEXT NOT NULL DEFAULT '{}',
-    created_at REAL NOT NULL
+CREATE TABLE IF NOT EXISTS pool_authorized (
+    pool_id TEXT NOT NULL REFERENCES pools(pool_id),
+    discord_user_id TEXT NOT NULL,
+    PRIMARY KEY (pool_id, discord_user_id)
 );
 """
 
 TABLES = ("pools", "members", "identities", "repos", "repo_versions",
           "manifest_chain", "tickets", "claims", "file_claims", "audits",
-          "events", "pool_chats", "peers", "remote_repos", "imported_versions",
-          "imported_chain", "imported_tickets", "imported_claims")
+          "events", "pool_chats", "remote_repos", "pool_authorized")
 
 
 def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -199,71 +162,29 @@ def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
          "ALTER TABLE repos ADD COLUMN submitter_key_id TEXT"),
         ("members", "verify_pubkey_hex",
          "ALTER TABLE members ADD COLUMN verify_pubkey_hex TEXT NOT NULL DEFAULT ''"),
-        ("peers", "verify_pubkey_hex",
-         "ALTER TABLE peers ADD COLUMN verify_pubkey_hex TEXT NOT NULL DEFAULT ''"),
     ):
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if col not in cols:
             conn.execute(ddl)
             conn.commit()
-    # Pool-scoped imports migration (Phase 3): old imported_versions /
-    # imported_chain / remote_repos lack pool_id or have repo-only PKs.
-    # Rebuild via table-copy when the old shape is detected; recorded in
-    # meta schema_version so it runs once per DB.
-    for old, ddl in (
-        ("imported_versions",
-         "CREATE TABLE imported_versions_new (pool_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
-         " version INTEGER NOT NULL, manifest_json TEXT NOT NULL, manifest_hash TEXT NOT NULL,"
-         " state TEXT NOT NULL DEFAULT 'accepted', PRIMARY KEY (pool_id, repo_id, version))"),
-        ("imported_chain",
-         "CREATE TABLE imported_chain_new (seq INTEGER PRIMARY KEY AUTOINCREMENT, pool_id TEXT NOT NULL,"
-         " repo_id TEXT NOT NULL, version INTEGER NOT NULL, manifest_hash TEXT NOT NULL,"
-         " prev_manifest_hash TEXT, signer_key_id TEXT NOT NULL, signature TEXT NOT NULL,"
-         " UNIQUE (pool_id, repo_id, version))"),
-        ("remote_repos",
-         "CREATE TABLE remote_repos_new (pool_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
-         " remote_repo_id TEXT NOT NULL, link TEXT NOT NULL DEFAULT '',"
-         " PRIMARY KEY (pool_id, repo_id))"),
-    ):
-        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({old})")}
-        sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (old,)).fetchone()
-        sql = (sql_row[0] or "") if sql_row else ""
-        # Legacy remote_repos has repo_id as PRIMARY KEY (single col).
-        needs_rebuild = ("pool_id" not in cols) or (
-            old == "remote_repos" and "PRIMARY KEY (pool_id" not in sql.upper()
-            and "PRIMARY KEY" in sql.upper())
-        needs_rebuild = needs_rebuild or (
-            old != "remote_repos" and "pool_id" in cols
-            and "pool_id" in sql and "PRIMARY KEY (pool_id" not in sql.replace(" ", ""))
-        if needs_rebuild:
-            new = f"{old}_new"
-            conn.execute(ddl)
-            if old == "remote_repos":
-                conn.execute(
-                    f"INSERT OR IGNORE INTO {new} (pool_id, repo_id, remote_repo_id, link) "
-                    f"SELECT pool_id, repo_id, remote_repo_id, link FROM {old}")
-            elif old == "imported_versions":
-                conn.execute(
-                    f"INSERT OR IGNORE INTO {new} (pool_id, repo_id, version, manifest_json, manifest_hash, state) "
-                    f"SELECT rr.pool_id, iv.repo_id, iv.version, iv.manifest_json, iv.manifest_hash, iv.state "
-                    f"FROM {old} iv LEFT JOIN remote_repos rr ON rr.repo_id = iv.repo_id")
-                # Rows with no remote_repos mapping get pool_id fallback '' —
-                # they remain queryable only with explicit pool scoping.
-                conn.execute(
-                    f"UPDATE {new} SET pool_id='' WHERE pool_id IS NULL OR pool_id=''")
-            else:
-                conn.execute(
-                    f"INSERT OR IGNORE INTO {new} (pool_id, repo_id, version, manifest_hash, prev_manifest_hash, signer_key_id, signature) "
-                    f"SELECT rr.pool_id, ic.repo_id, ic.version, ic.manifest_hash, ic.prev_manifest_hash, ic.signer_key_id, ic.signature "
-                    f"FROM {old} ic LEFT JOIN remote_repos rr ON rr.repo_id = ic.repo_id")
-                conn.execute(
-                    f"UPDATE {new} SET pool_id='' WHERE pool_id IS NULL OR pool_id=''")
-            conn.execute(f"DROP TABLE {old}")
-            conn.execute(f"ALTER TABLE {new} RENAME TO {old}")
-            conn.commit()
     try:
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version','4')")
+        conn.commit()
+    except Exception:
+        pass
+    # Whitelist migration (2109 Phase 1): pools.owner_discord_user_id +
+    # pool_authorized. Backfill pool_authorized from identities bindings.
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(pools)")}
+        if "owner_discord_user_id" not in cols:
+            conn.execute("ALTER TABLE pools ADD COLUMN owner_discord_user_id TEXT")
+            conn.commit()
+        conn.execute(
+            "INSERT OR IGNORE INTO pool_authorized (pool_id, discord_user_id) "
+            "SELECT pool_id, owner_discord_user_id FROM pools "
+            "WHERE owner_discord_user_id IS NOT NULL AND owner_discord_user_id != ''")
+        conn.commit()
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version','5')")
         conn.commit()
     except Exception:
         pass
@@ -300,12 +221,15 @@ def record_event(conn, pool_id, kind, payload=None) -> None:
     conn.commit()
 
 
-def create_pool(conn, pool_id, name, maintainer_key_id, relay_url="", settings=None) -> None:
+def create_pool(conn, pool_id, name, maintainer_key_id, relay_url="", settings=None, owner_discord_user_id=None) -> None:
     conn.execute(
-        "INSERT INTO pools (pool_id, name, maintainer_key_id, relay_url, settings_json, created_at)"
-        " VALUES (?,?,?,?,?,?)",
-        (pool_id, name, maintainer_key_id, relay_url,
+        "INSERT INTO pools (pool_id, name, maintainer_key_id, owner_discord_user_id, relay_url, settings_json, created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (pool_id, name, maintainer_key_id, str(owner_discord_user_id) if owner_discord_user_id else None, relay_url,
          json.dumps(settings or {}), _now()))
+    if owner_discord_user_id:
+        conn.execute("INSERT OR IGNORE INTO pool_authorized (pool_id, discord_user_id) VALUES (?,?)",
+                     (pool_id, str(owner_discord_user_id)))
     conn.commit()
 
 
@@ -870,6 +794,46 @@ def bind_discord_user(conn, key_id, user_id) -> None:
     conn.commit()
 
 
+def authorize_user(conn, pool_id, discord_user_id) -> None:
+    if discord_user_id is None:
+        raise ValueError("authorize needs a discord_user_id")
+    conn.execute("INSERT OR IGNORE INTO pool_authorized (pool_id, discord_user_id) VALUES (?,?)",
+                 (pool_id, str(discord_user_id)))
+    conn.commit()
+
+
+def deauthorize_user(conn, pool_id, discord_user_id) -> None:
+    conn.execute("DELETE FROM pool_authorized WHERE pool_id=? AND discord_user_id=?",
+                 (pool_id, str(discord_user_id)))
+    conn.commit()
+
+
+def is_authorized(conn, pool_id, discord_user_id) -> bool:
+    if discord_user_id is None:
+        return False
+    try:
+        pool = conn.execute("SELECT owner_discord_user_id FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
+        if pool is not None and pool[0] is not None and str(pool[0]) == str(discord_user_id):
+            return True
+        row = conn.execute("SELECT 1 FROM pool_authorized WHERE pool_id=? AND discord_user_id=?",
+                           (pool_id, str(discord_user_id))).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def is_owner(conn, pool_id, discord_user_id) -> bool:
+    if discord_user_id is None:
+        return False
+    try:
+        pool = conn.execute("SELECT owner_discord_user_id FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
+        if pool is None or pool[0] is None:
+            return False
+        return str(pool[0]) == str(discord_user_id)
+    except Exception:
+        return False
+
+
 def list_local_pools(conn):
     rows = conn.execute("SELECT pool_id FROM pools ORDER BY pool_id").fetchall()
     return [r[0] for r in rows]
@@ -936,88 +900,10 @@ def peek_notices(conn, pool_id=None):
     return out
 
 
-# --- Remote pool view (passive plumbing) -------------------------------------
-# Copies of canonical state imported via gateway reply strings. The plugin
-# never writes another agent's ledger; these tables hold only verified
-# imports. Canonical writes stay maintainer-only on the owning ledger.
-
-def upsert_peer(conn, pool_id, agent_key_id, maintainer_key_id, trust_state="unverified", verify_pubkey_hex="") -> dict:
-    conn.execute(
-        "INSERT INTO peers (pool_id, agent_key_id, maintainer_key_id, trust_state, verify_pubkey_hex)"
-        " VALUES (?,?,?,?,?) ON CONFLICT(pool_id, agent_key_id) DO UPDATE SET"
-        " maintainer_key_id=excluded.maintainer_key_id, trust_state=excluded.trust_state,"
-        " verify_pubkey_hex=excluded.verify_pubkey_hex",
-        (pool_id, agent_key_id, maintainer_key_id, trust_state, verify_pubkey_hex or ""))
-    conn.commit()
-    return get_peer(conn, pool_id, agent_key_id)
-
-
-def get_peer(conn, pool_id, agent_key_id=None):
-    if agent_key_id:
-        row = conn.execute("SELECT * FROM peers WHERE pool_id=? AND agent_key_id=?",
-                           (pool_id, agent_key_id)).fetchone()
-        return dict(row) if row else None
-    row = conn.execute("SELECT * FROM peers WHERE pool_id=? ORDER BY agent_key_id LIMIT 1",
-                       (pool_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def list_peers(conn, pool_id=None):
-    if pool_id:
-        return [dict(r) for r in conn.execute("SELECT * FROM peers WHERE pool_id=? ORDER BY agent_key_id", (pool_id,))]
-    return [dict(r) for r in conn.execute("SELECT * FROM peers ORDER BY pool_id, agent_key_id")]
-
-
-def set_peer_trust(conn, pool_id, agent_key_id, trust_state, verify_pubkey_hex=None):
-    if trust_state not in ("unverified", "verified", "pinned", "revoked"):
-        raise ValueError(f"unknown trust_state: {trust_state!r}")
-    if verify_pubkey_hex is not None:
-        conn.execute("UPDATE peers SET trust_state=?, verify_pubkey_hex=? WHERE pool_id=? AND agent_key_id=?",
-                     (trust_state, verify_pubkey_hex, pool_id, agent_key_id))
-    else:
-        conn.execute("UPDATE peers SET trust_state=? WHERE pool_id=? AND agent_key_id=?",
-                     (trust_state, pool_id, agent_key_id))
-    conn.commit()
-    return get_peer(conn, pool_id, agent_key_id)
-
-
-# --- Trust anchors (Phase 3) -------------------------------------------------
-# "peers" rows double as operator-pinned trust anchors: a local record of
-# "this remote pool's maintainer verification key". No peer ever creates or
-# upgrades its own trust; only an operator pin (--verify-key) sets "pinned".
-
-def get_trust_anchor(conn, pool_id):
-    """Pinned trust anchor for pool_id, or None (revoked/unverified → None)."""
-    rows = conn.execute("SELECT * FROM peers WHERE pool_id=? ORDER BY agent_key_id", (pool_id,)).fetchall()
-    for r in rows:
-        d = dict(r)
-        if d.get("trust_state") in ("pinned", "verified"):
-            return d
-    return None
-
-
-def list_trust_anchors(conn, pool_id=None):
-    if pool_id:
-        return [dict(r) for r in conn.execute("SELECT * FROM peers WHERE pool_id=? ORDER BY agent_key_id", (pool_id,))]
-    return [dict(r) for r in conn.execute("SELECT * FROM peers ORDER BY pool_id, agent_key_id")]
-
-
-def pin_trust_anchor(conn, pool_id, maintainer_key_id, verify_pubkey_hex, agent_key_id="anchor"):
-    if conn.execute("SELECT 1 FROM pools WHERE pool_id=?", (pool_id,)).fetchone():
-        raise ValueError(f"cannot pin trust for own local pool {pool_id!r}")
-    return upsert_peer(conn, pool_id, agent_key_id or "anchor", maintainer_key_id,
-                       trust_state="pinned", verify_pubkey_hex=verify_pubkey_hex or "")
-
-
-def revoke_trust_anchor(conn, pool_id, agent_key_id=None):
-    rows = conn.execute("SELECT agent_key_id FROM peers WHERE pool_id=?", (pool_id,)).fetchall()
-    if not rows:
-        raise ValueError(f"no trust anchor for pool {pool_id!r}")
-    for (ak,) in rows:
-        conn.execute("UPDATE peers SET trust_state='revoked' WHERE pool_id=? AND agent_key_id=?", (pool_id, ak))
-    conn.commit()
-    return get_peer(conn, pool_id)
-
+# --- Operator link note (OD5, survives 2109 Phase 2) -------------------------
+# remote_repos holds ONLY the human-readable --link pointer recorded at
+# /add-repo --link. It is NEVER a fetch source: /pool fetch is the real
+# read path. A link is a note for a human, nothing more.
 
 def upsert_remote_repo(conn, repo_id, pool_id, remote_repo_id=None, link=""):
     repo_id = str(repo_id)
@@ -1035,74 +921,6 @@ def get_remote_repo(conn, repo_id, pool_id=None):
         return dict(row) if row else None
     row = conn.execute("SELECT * FROM remote_repos WHERE repo_id=? ORDER BY pool_id LIMIT 1", (repo_id,)).fetchone()
     return dict(row) if row else None
-
-
-def list_imported(conn, pool_id=None, repo_id=None):
-    q, p = "SELECT * FROM imported_versions WHERE 1=1", []
-    if pool_id: q += " AND pool_id=?"; p.append(pool_id)
-    if repo_id: q += " AND repo_id=?"; p.append(repo_id)
-    q += " ORDER BY pool_id, repo_id, version"
-    return [dict(r) for r in conn.execute(q, p)]
-
-
-def import_version(conn, signed_manifest, manifest_hash_value, pool_id=None):
-    repo_id = signed_manifest["repo_id"]
-    if pool_id is None:
-        rr = get_remote_repo(conn, repo_id)
-        pool_id = rr["pool_id"] if rr else ""
-    conn.execute(
-        "INSERT OR REPLACE INTO imported_versions (pool_id, repo_id, version, manifest_json, manifest_hash, state)"
-        " VALUES (?,?,?,?,?,?)",
-        (pool_id, repo_id, signed_manifest["version"], json.dumps(signed_manifest),
-         manifest_hash_value, signed_manifest.get("state", "accepted")))
-    conn.execute(
-        "INSERT OR REPLACE INTO imported_chain (pool_id, repo_id, version, manifest_hash, prev_manifest_hash, signer_key_id, signature)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (pool_id, repo_id, signed_manifest["version"], manifest_hash_value,
-         signed_manifest.get("prev_manifest_hash"), signed_manifest["signer_key_id"],
-         signed_manifest.get("signature", "")))
-    conn.commit()
-
-
-def import_ticket(conn, ticket):
-    conn.execute(
-        "INSERT OR REPLACE INTO imported_tickets (ticket_id, pool_id, repo_id, title, brief, state,"
-        " claimant_key_id, budget_json, thread_ref, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (ticket["ticket_id"], ticket["pool_id"], ticket.get("repo_id", ""),
-         ticket.get("title", ""), ticket.get("brief", ""), ticket.get("state", "open"),
-         ticket.get("claimant_key_id"), json.dumps(ticket.get("budget") or ticket.get("budget_json") and json.loads(ticket["budget_json"]) or {}),
-         ticket.get("thread_ref"), ticket.get("created_at", _now()), ticket.get("updated_at", _now())))
-    conn.commit()
-
-
-def get_imported_ticket(conn, ticket_id):
-    row = conn.execute("SELECT * FROM imported_tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def list_imported_tickets(conn, pool_id=None, state=None, repo_id=None):
-    q, p = "SELECT * FROM imported_tickets WHERE 1=1", []
-    if pool_id: q += " AND pool_id=?"; p.append(pool_id)
-    if repo_id: q += " AND repo_id=?"; p.append(repo_id)
-    if state: q += " AND state=?"; p.append(state)
-    q += " ORDER BY created_at, ticket_id"
-    return [dict(r) for r in conn.execute(q, p)]
-
-
-def get_latest_imported_manifest(conn, repo_id, pool_id=None):
-    if pool_id:
-        row = conn.execute("SELECT manifest_json FROM imported_versions WHERE pool_id=? AND repo_id=? AND state='accepted' ORDER BY version DESC LIMIT 1", (pool_id, repo_id)).fetchone()
-    else:
-        row = conn.execute("SELECT manifest_json FROM imported_versions WHERE repo_id=? AND state='accepted' ORDER BY version DESC LIMIT 1", (repo_id,)).fetchone()
-    return json.loads(row[0]) if row else None
-
-
-def list_imported_chain(conn, repo_id, pool_id=None):
-    if pool_id:
-        rows = conn.execute("SELECT manifest_json FROM imported_versions WHERE pool_id=? AND repo_id=? AND state='accepted' ORDER BY version", (pool_id, repo_id)).fetchall()
-    else:
-        rows = conn.execute("SELECT manifest_json FROM imported_versions WHERE repo_id=? AND state='accepted' ORDER BY version", (repo_id,)).fetchall()
-    return [json.loads(r[0]) for r in rows]
 
 
 def get_auto_approve(conn, pool_id) -> bool:

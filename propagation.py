@@ -238,18 +238,13 @@ class RepoPropagator:
                 "transport_note": mode_note(mode)}
 
     def _last_chain_hash(self, repo_id: str) -> str | None:
+        # 2109 Phase 2: hosted-pool chain only. There is no imported chain —
+        # a foreign repo is fetched by manifest over the transport, never
+        # copied into this ledger.
         row = self._conn.execute(
             "SELECT manifest_hash FROM manifest_chain WHERE repo_id=? ORDER BY seq DESC LIMIT 1",
             (repo_id,)).fetchone()
-        if row:
-            return row[0]
-        try:
-            row = self._conn.execute(
-                "SELECT manifest_hash FROM imported_chain WHERE repo_id=? ORDER BY seq DESC LIMIT 1",
-                (repo_id,)).fetchone()
-            return row[0] if row else None
-        except Exception:
-            return None
+        return row[0] if row else None
 
     def _chain_manifests(self, repo_id: str) -> list[dict]:
         rows = self._conn.execute(
@@ -262,18 +257,6 @@ class RepoPropagator:
             manifest = json.loads(row[0])
             if manifest.get("state") == "accepted":
                 out.append(manifest)
-        if out:
-            return out
-        # Remote pool: fall back to imported chain.
-        try:
-            from ledger import list_imported_chain
-        except ImportError:
-            try:
-                from .ledger import list_imported_chain
-            except Exception:
-                list_imported_chain = None
-        if list_imported_chain is not None:
-            return list_imported_chain(self._conn, repo_id, pool_id=self._pool_id)
         return out
 
     def _verify_keys(self) -> dict:
@@ -500,23 +483,34 @@ class RepoPropagator:
 
     # -- fetch ---------------------------------------------------------------
 
-    def fetch(self, *, manifest: dict, fetcher: Member, dest: Path) -> dict:
-        """Verify chain -> ACL -> Iroh-fetch -> decrypt -> BLAKE3 -> git clone."""
+    def fetch(self, *, manifest: dict, fetcher: Member, dest: Path,
+              verify_chain: bool = True) -> dict:
+        """Verify chain -> ACL -> Iroh-fetch -> decrypt -> BLAKE3 -> git clone.
+
+        ``verify_chain=False`` is the cross-gateway ``/work fetch`` case: the
+        manifest came from ``/pool fetch`` on the pool's own gateway and
+        there is no local chain to compare against. The chain check is
+        defense-in-depth on that path — the **wrapped-key ACL is the
+        authorization boundary** (only an invited agent's key can unwrap
+        the DEK), and the BLAKE3 check against the manifest still pins the
+        bytes. Chain verification stays mandatory for pool-gateway fetches.
+        """
         dest = Path(dest)
         dest.mkdir(parents=True, exist_ok=True)
 
-        chain = self._chain_manifests(manifest["repo_id"])
-        if not chain or chain[-1]["version"] != manifest["version"]:
-            raise RuntimeError("manifest is not the latest accepted chain tip")
-        # Chain must carry only maintainer-signed accepted manifests (a
-        # contributor-signed 'accepted' manifest must never verify here).
-        maintainer_vk = _verify_key(self._members[self._maintainer_key_id])
-        for entry in chain:
-            if entry["signer_key_id"] != self._maintainer_key_id:
-                raise RuntimeError(
-                    "chain contains a non-maintainer-signed accepted manifest")
-            if not verify_manifest(maintainer_vk, entry):
-                raise RuntimeError("maintainer signature on chain manifest does not verify")
+        if verify_chain:
+            chain = self._chain_manifests(manifest["repo_id"])
+            if not chain or chain[-1]["version"] != manifest["version"]:
+                raise RuntimeError("manifest is not the latest accepted chain tip")
+            # Chain must carry only maintainer-signed accepted manifests (a
+            # contributor-signed 'accepted' manifest must never verify here).
+            maintainer_vk = _verify_key(self._members[self._maintainer_key_id])
+            for entry in chain:
+                if entry["signer_key_id"] != self._maintainer_key_id:
+                    raise RuntimeError(
+                        "chain contains a non-maintainer-signed accepted manifest")
+                if not verify_manifest(maintainer_vk, entry):
+                    raise RuntimeError("maintainer signature on chain manifest does not verify")
 
         if not self._is_member(fetcher.key_id):
             raise PermissionError(f"fetch refused: {fetcher.key_id!r} is not a pool member")

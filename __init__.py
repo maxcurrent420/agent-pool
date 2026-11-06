@@ -1,12 +1,18 @@
 """Agent Pool plugin — gateway-native: Hermes posts, plugin returns content.
 
-Slash commands: ``/pool register|invite|members|remove|freeze|list``,
+Slash commands: ``/pool register|invite|members|remove|freeze|list|fetch``,
 ``/task add|list|show`` (flat aliases ``/task_add`` / ``/task_list``),
 ``/add-repo`` (register a project + submit its bytes as a new version),
 ``/claim`` (paths optional — omit ``--paths`` for a whole-ticket claim;
 ``--any-project --max-tasks N`` takes up to N open tickets), ``/release``,
+``/work fetch`` (download a pool project from a fetched manifest),
 ``/work submit``, ``/integrate``, ``/audit show``. Every handler returns a
 string Hermes posts; the plugin never posts to Discord itself.
+
+Authorization is the whitelisted Discord user id ONLY (owner or
+pool_authorized). Keys are crypto-only: an ed25519 signing key proves
+authorship of an artifact, a box keypair wraps per-version DEKs. No key
+ever decides who may act.
 """
 import json
 import logging
@@ -237,31 +243,29 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
                              discord_user_id=opts.get("discord_user", ""),
                              verify_pubkey_hex=opts.get("verify_key", ""))
         elif sub == "auto-approve":
-            # `/pool auto-approve <on|off> [--pool <id>]` — maintainer-only.
+            # `/pool auto-approve <on|off> [--pool <id>]` — owner-only.
             pool_id = opts.get("pool", "") or opts.get("pool_id", "")
             arg = (rest[0] if rest else opts.get("state", "") or "").strip().lower()
             if arg not in ("on", "off", "true", "false"):
                 return _result({"ok": False, "error": "usage: /pool auto-approve <on|off> [--pool <id>]"})
             resolved = svc._resolve_pool(pool_id or None, source=source)
-            out = svc.set_auto_approve(resolved, arg in ("on", "true"))
+            out = svc.set_auto_approve(resolved, arg in ("on", "true"), source=source)
         elif sub == "members":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             out = {"ok": True, "pool_id": pool_id, "members": svc.members(pool_id, source=source)}
         elif sub == "freeze":
             # `/pool freeze` (no pool id, or --global) = GLOBAL kill-switch
-            # across every pool; `/pool freeze <pool_id>` = per-pool only.
-            # `--unfreeze` clears it. The freeze command itself is never
-            # blocked by the freeze (it must be able to unfreeze).
+            # across every hosted pool; `/pool freeze <pool_id>` = per-pool.
             frozen = "unfreeze" not in flags
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             if not pool_id or "global" in flags or pool_id in ("all", "*"):
-                out = svc.freeze_global(frozen)
+                out = svc.freeze_global(frozen, source=source)
             else:
-                out = svc.freeze(pool_id, frozen=frozen)
+                out = svc.freeze(pool_id, frozen=frozen, source=source)
         elif sub == "remove":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             key_id = rest[1] if len(rest) > 1 else opts.get("key_id", "")
-            out = svc.remove_member(pool_id, key_id)
+            out = svc.remove_member(pool_id, key_id, source=source)
         elif sub == "list":
             projects = svc.list_projects(pool_id=opts.get("pool_id") or None,
                                          source=source)
@@ -273,50 +277,20 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
                                   "submitter_key_id") if k in p}
                                 | ({"note": p["note"]} if "note" in p else {})
                                 for p in projects]}
-        elif sub == "import":
-            # Read-only bootstrap: import canonical manifest string(s) into
-            # the remote view. No new command family; plugin stays passive.
-            # Requires --verify-key (or an existing pinned anchor); no TOFU.
-            pool_id = opts.get("pool_id") or opts.get("pool", "")
-            manifest_raw = opts.get("manifest", "")
-            if not manifest_raw and rest:
-                # positional: /pool import <pool_id> <json>
-                pool_id = rest[0] if rest else pool_id
-                manifest_raw = rest[1] if len(rest) > 1 else ""
-            try:
-                manifest = json.loads(manifest_raw) if manifest_raw else {}
-            except Exception as exc:
-                return _result({"ok": False, "error": f"bad manifest JSON: {exc}"})
-            manifests = [manifest] if isinstance(manifest, dict) and "repo_id" in manifest else manifest.get("manifests", []) if isinstance(manifest, dict) else []
-            vk_hex = opts.get("verify_key", "")
-            maintainer = opts.get("maintainer", "")
-            verify_keys = {}
-            if vk_hex:
-                from nacl.signing import VerifyKey
-                from nacl.encoding import RawEncoder
-                signer = maintainer
-                if signer:
-                    verify_keys = {signer: VerifyKey(bytes.fromhex(vk_hex), encoder=RawEncoder)}
-            out = svc.import_canonical(pool_id, manifests, verify_keys,
-                                       tickets=manifest.get("tickets") if isinstance(manifest, dict) else None,
-                                       maintainer_key_id=maintainer or None) if manifests else {"ok": False, "error": "no manifests to import"}
-        elif sub == "trust":
-            # `/pool trust <pool_id> <maintainer_key_id> --verify-key <hex>` (pin)
-            # `/pool trust --list [pool_id]` / `/pool trust --revoke <pool_id>`
-            if "list" in flags:
-                out = svc.pool_trust_list(rest[0] if rest and rest[0] else opts.get("pool_id") or None)
-            elif "revoke" in flags:
-                out = svc.pool_trust_revoke(rest[0] if rest else opts.get("pool_id", ""))
-            else:
-                pool_id = rest[0] if rest else opts.get("pool_id", "")
-                maintainer = rest[1] if len(rest) > 1 else opts.get("maintainer", "")
-                out = svc.pool_trust(pool_id, maintainer, opts.get("verify_key", ""))
-        elif sub in ("peer", "confirm"):
-            return _result({"ok": False, "error": "peer/confirm removed: use /pool trust to pin a trust anchor"})
+        elif sub == "fetch":
+            # `/pool fetch <repo_id> | --projects | --tasks [--pool <id>]`
+            # Hosted pool only. Returns artifacts for /work fetch.
+            repo_id = rest[0] if rest else opts.get("repo", "")
+            out = svc.pool_fetch(repo_id or None,
+                                 projects="projects" in flags or (not repo_id and "tasks" not in flags),
+                                 tasks="tasks" in flags, pool_id=opts.get("pool") or opts.get("pool_id") or None,
+                                 source=source)
+        elif sub in ("import", "trust", "peer", "confirm"):
+            return _result({"ok": False, "error": "import/trust/peers removed: use /pool fetch (reads are fetch commands on the pool gateway)"})
         else:
             return _result({"ok": False,
                             "error": f"unknown /pool subcommand: {sub}",
-                            "usage": "/pool register|invite|members|remove|freeze|list|import|trust|auto-approve"})
+                            "usage": "/pool register|invite|members|remove|freeze|list|fetch|auto-approve"})
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -332,8 +306,9 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
         if sub == "add":
             if opts.get("packet"):
                 try:
-                    # Handler passes the pool's member verify keys (Phase 2).
-                    ticket = svc.accept_proposal(opts["packet"])
+                    # Whitelist model: the driving user is forwarded as source
+                    # (the wrapper is the gate; the service is defense-in-depth).
+                    ticket = svc.accept_proposal(opts["packet"], source=source)
                 except Exception as exc:
                     return _result({"ok": False, "error": str(exc)})
                 out = {"ok": True, "ticket_id": ticket.get("ticket_id", ""), "state": ticket.get("state", ""), "via": "proposal"}
@@ -366,7 +341,7 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
                             resolved = pid
                     else:
                         resolved = None
-                    if resolved and svc._is_bound_maintainer(resolved):
+                    if resolved and svc._is_bound_maintainer(resolved, source=source):
                         pending = [t for t in svc.list_pending(resolved) if t["ticket_id"] not in {r["ticket_id"] for r in rows}]
                         for t in pending:
                             choice = ctx.ask_choice(
@@ -389,6 +364,7 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
         elif sub in ("approve", "deny", "modify"):
             ticket_id = rest[0] if rest else opts.get("ticket", "")
             out = svc.approve_ticket(ticket_id, sub if sub != "deny" else "deny",
+                                     source=source,
                                      edit_files={opts["edit_file"]: opts["edit_content"]} if opts.get("edit_file") and opts.get("edit_content") is not None else None,
                                      reason=opts.get("reason", ""))
         else:
@@ -488,7 +464,7 @@ def _handle_claim(ctx, raw: str, *, source=None, session_id="", session_key="", 
         paths = [p.strip() for p in opts.get("paths", "").split(",") if p.strip()]
         claim = svc.claim(ticket_id, key_id=opts.get("as") or None,
                           declared_paths=paths, budget=_budget_from_opts(opts),
-                          maintainer_override="override" in flags)
+                          maintainer_override="override" in flags, source=source)
         # Phase 4: on successful claim, start the worker (fetch accepted
         # version over Iroh -> worktree -> worker session) when a lifecycle
         # or work root is configured. Failure here never rolls back the claim.
@@ -515,7 +491,7 @@ def _handle_release(ctx, raw: str, *, source=None, session_id="", session_key=""
         svc = _service_for(ctx, source=source)
         pos, opts, _flags = _parse_args(raw)
         ticket_id = pos[0] if pos else opts.get("ticket", "")
-        updated = svc.release(ticket_id, key_id=opts.get("as") or None)
+        updated = svc.release(ticket_id, key_id=opts.get("as") or None, source=source)
         return _result({"ok": True, "ticket_id": ticket_id, "state": updated["state"], "notice": updated.get("notice", "")}, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -526,6 +502,19 @@ def _handle_work(ctx, raw: str, *, source=None, session_id="", session_key="", p
         pos, _opts, _flags = _parse_args(raw)
     except ValueError as exc:
         return _error(exc)
+    if pos and pos[0] == "fetch":
+        try:
+            svc = _service_for(ctx, source=source)
+            _pos, opts, _flags = _parse_args(raw)
+            manifest_raw = opts.get("manifest", "")
+            try:
+                manifest = json.loads(manifest_raw) if manifest_raw else {}
+            except Exception as exc:
+                return _result({"ok": False, "error": f"bad manifest JSON: {exc}"})
+            out = svc.work_fetch(manifest, dest=opts.get("dest", "/tmp/fetch"), source=source)
+            return _result(out, svc, source)
+        except Exception as exc:
+            return _error(exc)
     if not pos or pos[0] != "submit":
         if "_handle_work_exec" in globals():
             return globals()["_handle_work_exec"](ctx, raw)
@@ -538,7 +527,7 @@ def _handle_work(ctx, raw: str, *, source=None, session_id="", session_key="", p
                             "--repo-path PATH --version N"})
         ticket_id = pos[1] if len(pos) > 1 else opts.get("ticket", "")
         out = svc.work_submit(ticket_id, opts.get("repo_path", ""),
-                              opts.get("version", "1"))
+                              opts.get("version", "1"), source=source)
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -561,13 +550,13 @@ def _handle_integrate(ctx, raw: str, *, source=None, session_id="", session_key=
                 ticket_id, decision, work_dir=_work_root_for(ctx) / "integrate"
                 if "_work_root_for" in globals() else None,
                 edit_files=edit_files, edit_patch=edit_patch,
-                reason=opts.get("reason", ""))
+                reason=opts.get("reason", ""), source=source)
             return _result(out, svc, source)
         # Gate path: run /integrate audit, then ask_choice instant fallback (D1c).
         ticket_id = pos[0] if pos else opts.get("ticket", "")
         gate = svc.integrate(
             ticket_id, work_dir=_work_root_for(ctx) / "integrate"
-            if "_work_root_for" in globals() else None)
+            if "_work_root_for" in globals() else None, source=source)
         gate["queued_notices"] = svc.drain_notices() if svc else []
         try:
             ask = getattr(ctx, "ask_choice", None)
@@ -582,7 +571,7 @@ def _handle_integrate(ctx, raw: str, *, source=None, session_id="", session_key=
                         ticket_id, decision,
                         work_dir=_work_root_for(ctx) / "integrate"
                         if "_work_root_for" in globals() else None,
-                        reason=opts.get("reason", ""))
+                        reason=opts.get("reason", ""), source=source)
                     out["via"] = "ask_choice"
                     return _result(out, svc, source)
         except Exception:
@@ -612,8 +601,8 @@ _POOL_STATUS_SCHEMA = {
 }
 
 _COMMANDS = (
-    ("pool", _handle_pool, "Agent Pool: register|invite|members|remove|freeze|list|import|trust|auto-approve, status",
-     "register|invite|members|remove|freeze|list|import|trust|auto-approve [options]"),
+    ("pool", _handle_pool, "Agent Pool: register|invite|members|remove|freeze|list|fetch|auto-approve, status",
+     "register|invite|members|remove|freeze|list|fetch|auto-approve [options]"),
     ("task", _handle_task, "Agent Pool tickets: add|list|show|approve|deny|modify",
      "add|list|show|approve|deny|modify [options]"),
     ("add-repo", _handle_add_repo, "Register a project and submit its repo bytes as a new version",
@@ -627,8 +616,8 @@ _COMMANDS = (
     ("release", _handle_release, "Release a claimed ticket back to open",
      "[ticket]"),
     ("work", _handle_work, "Submit finished work for a claimed ticket",
-     "submit|start|complete|cancel|progress [options]"),
-    ("integrate", _handle_integrate, "Maintainer: audit a submitted ticket",
+     "submit|start|complete|cancel|progress|fetch [options]"),
+    ("integrate", _handle_integrate, "Owner: audit a submitted ticket",
      "approve|edit|discard [ticket] [options]"),
     ("audit", _handle_audit, "Show the audit report for a ticket",
      "show [ticket]"),
@@ -636,7 +625,11 @@ _COMMANDS = (
 
 
 def _wrap_command(handler, ctx):
-    """Dispatch seam: absolute freeze guard (Phase 1) + user binding check."""
+    """Dispatch seam: freeze guard + Discord-whitelist authz (2109 P1).
+
+    Authorization is the whitelisted Discord user id only (owner or
+    pool_authorized). Keys never decide access.
+    """
     def wrapped(raw="", *, source=None, session_id="", session_key="", platform=""):
         try:
             from . import ledger as _L
@@ -650,40 +643,83 @@ def _wrap_command(handler, ctx):
                 svc = _service_for(ctx, source=source)
                 pos, opts, flags = _parse_args(raw or "")
                 sub = pos[0] if pos else ""
-                # Freeze control itself must run to unfreeze.
-                is_freeze_ctl = (sub == "freeze")
-                if not is_freeze_ctl:
-                    # Resolve pool best-effort from raw args.
-                    pool_id = (opts.get("pool") or opts.get("pool_id") or opts.get("pool-id") or ""
-                               or (pos[1] if len(pos) > 1 and handler.__name__ in ("_handle_pool",) else ""))
-                    # Also honor source-bound pool and ticket's pool.
+                # Freeze control is owner-only (see _require_owner below);
+                # unfreeze runs while frozen, freeze/unfreeze never bypass authz.
+                is_freeze_ctl = (handler.__name__ == "_handle_pool" and sub == "freeze")
+                # Resolve pool best-effort from raw args.
+                pool_id = (opts.get("pool") or opts.get("pool_id") or opts.get("pool-id") or "")
+                resolved = None
+                try:
+                    if pool_id:
+                        resolved = svc._resolve_pool(pool_id, source=source)
+                    elif handler.__name__ == "_handle_work":
+                        tid = pos[1] if len(pos) > 1 else opts.get("ticket", "")
+                        if tid:
+                            resolved = svc.show_ticket(tid)["pool_id"]
+                    elif handler.__name__ in ("_handle_claim", "_handle_release", "_handle_integrate", "_handle_audit"):
+                        tid = pos[0] if pos else opts.get("ticket", "")
+                        if tid:
+                            resolved = svc.show_ticket(tid)["pool_id"]
+                    elif handler.__name__ == "_handle_task":
+                        tid = pos[1] if len(pos) > 1 and pos[0] == "show" else opts.get("ticket", "")
+                        if tid:
+                            resolved = svc.show_ticket(tid)["pool_id"]
+                    elif handler.__name__ == "_handle_task_add":
+                        pass
+                    else:
+                        try:
+                            resolved = svc._resolve_pool(None, source=source)
+                        except Exception:
+                            resolved = None
+                except Exception:
                     resolved = None
-                    try:
-                        if pool_id:
-                            resolved = svc._resolve_pool(pool_id, source=source)
-                        elif handler.__name__ == "_handle_work":
-                            tid = pos[1] if len(pos) > 1 else opts.get("ticket", "")
-                            if tid:
-                                resolved = svc.show_ticket(tid)["pool_id"]
-                        elif handler.__name__ in ("_handle_claim", "_handle_release", "_handle_integrate", "_handle_audit"):
-                            tid = pos[0] if pos else opts.get("ticket", "")
-                            if tid:
-                                resolved = svc.show_ticket(tid)["pool_id"]
-                        elif handler.__name__ == "_handle_task":
-                            tid = pos[1] if len(pos) > 1 and pos[0] == "show" else opts.get("ticket", "")
-                            if tid:
-                                resolved = svc.show_ticket(tid)["pool_id"]
-                        elif handler.__name__ == "_handle_task_add":
-                            pass
+                # Extract driving user id (Discord whitelist is the auth).
+                user_id = None
+                if isinstance(source, dict):
+                    user_id = source.get("user_id") or source.get("discord_user_id")
+                elif source is not None:
+                    user_id = getattr(source, "user_id", None) or getattr(source, "discord_user_id", None)
+                    if callable(user_id):
+                        user_id = None
+                # Freeze/unfreeze: owner-only on every path.
+                if is_freeze_ctl:
+                    # Need pool context to check ownership; global freeze
+                    # requires ownership of every hosted pool (or the single one).
+                    _mp = None
+                    if pool_id:
+                        try:
+                            _mp = svc._resolve_pool(pool_id, source=source)
+                        except Exception:
+                            _mp = None
+                    elif resolved:
+                        _mp = resolved
+                    else:
+                        try:
+                            _mp = svc._resolve_pool(None, source=source)
+                        except Exception:
+                            _mp = None
+                    if _mp is None:
+                        # Global freeze with no resolvable pool: require
+                        # ownership of all local pools (fail-closed).
+                        hosts = _L.list_local_pools(svc._conn)
+                        if not hosts or user_id is None or not all(
+                                _L.is_owner(svc._conn, h, str(user_id)) for h in hosts):
+                            return _result({"ok": False, "error_code": "unauthorized",
+                                            "error": f"not authorized for pool {_mp or ''} — ask the maintainer"})
+                    elif user_id is None or not _L.is_owner(svc._conn, _mp, str(user_id)):
+                        # Also allow global-freeze owner check below; per-pool
+                        # owner-only.
+                        if sub == "freeze" and ("global" in flags or not pool_id):
+                            hosts = _L.list_local_pools(svc._conn)
+                            if not hosts or not all(_L.is_owner(svc._conn, h, str(user_id)) for h in hosts):
+                                return _result({"ok": False, "error_code": "unauthorized",
+                                                "error": f"not authorized for pool {_mp} — ask the maintainer"})
                         else:
-                            src = svc._source_from(source)
-                            if src is not None:
-                                try:
-                                    resolved = svc._resolve_pool(None, source=src)
-                                except Exception:
-                                    resolved = None
-                    except Exception:
-                        resolved = None
+                            return _result({"ok": False, "error_code": "unauthorized",
+                                            "error": f"not authorized for pool {_mp} — ask the maintainer"})
+                    # Owner passed; freeze/unfreeze proceeds (never blocked by freeze).
+                else:
+                    # Absolute freeze: every other verb from every user.
                     frozen = False
                     try:
                         if _L.is_global_frozen(svc._conn):
@@ -700,41 +736,39 @@ def _wrap_command(handler, ctx):
                             pass
                         return _result({"ok": False, "error_code": "frozen",
                                         "error": "pool frozen — contact the maintainer"})
-                    # Per-command user check (Phase 1 step 3): resolve Discord
-                    # user to a key; unbound users are refused on every verb.
-                    user_id = None
-                    if isinstance(source, dict):
-                        user_id = source.get("user_id") or source.get("discord_user_id")
-                    elif source is not None:
-                        user_id = getattr(source, "user_id", None) or getattr(source, "discord_user_id", None)
-                        if callable(user_id):
-                            user_id = None
+                    # Whitelist checks: unauthorized refused on every verb;
+                    # authorized non-owner refused on owner-only verbs.
                     if user_id is not None:
-                        key = _L.lookup_key_by_discord_user(svc._conn, str(user_id))
-                        if key is None:
-                            return _result({"ok": False, "error_code": "unauthorized",
-                                            "error": f"not authorized for pool {resolved or ''} — ask the maintainer"})
-                        # Canonical writes require the maintainer binding (F1):
-                        # the gateway agent key alone must never satisfy
-                        # maintainer checks — compare Discord binding to
-                        # pools.maintainer_key_id for every mutating handler.
-                        _canonical = {"_handle_pool": ("register", "invite", "remove", "freeze", "auto-approve", "trust", "import"),
-                                      "_handle_task": ("add", "approve", "deny", "modify"), "_handle_add_repo": ("",), "_handle_task_add": ("",)}
-                        verb = sub
-                        if ((handler.__name__ == "_handle_pool" and verb in ("register", "invite", "remove", "trust", "import", "auto-approve"))
-                                or (handler.__name__ == "_handle_task" and verb in ("add", "approve", "deny", "modify"))
-                                or handler.__name__ in ("_handle_add_repo", "_handle_task_add")):
-                            # Resolve pool for maintainer comparison.
-                            _mp = resolved
-                            if _mp is None and handler.__name__ in ("_handle_add_repo", "_handle_task_add"):
-                                try:
-                                    _mp = svc._resolve_pool(opts.get("pool") or opts.get("pool_id") or "", source=source)
-                                except Exception:
-                                    _mp = None
-                            row = svc._conn.execute("SELECT maintainer_key_id FROM pools WHERE pool_id=?", (_mp or "",)).fetchone()
-                            if row is not None and row[0] != key:
+                        if resolved is not None:
+                            if not _L.is_authorized(svc._conn, resolved, str(user_id)):
                                 return _result({"ok": False, "error_code": "unauthorized",
-                                                "error": f"not authorized for pool {_mp or ''} — ask the maintainer"})
+                                                "error": f"not authorized for pool {resolved} — ask the maintainer"})
+                            _owner_only = False
+                            if handler.__name__ == "_handle_pool" and sub in ("invite", "remove", "auto-approve", "register", "fetch"):
+                                # register has no resolved pool yet (creation);
+                                # treated as owner-only only when resolved.
+                                # fetch is authorized-only (reads), handled below.
+                                if sub != "register":
+                                    _owner_only = True
+                                if sub == "fetch":
+                                    _owner_only = False
+                            elif handler.__name__ == "_handle_task" and sub in ("add", "approve", "deny", "modify"):
+                                _owner_only = True
+                            elif handler.__name__ in ("_handle_add_repo", "_handle_task_add"):
+                                _owner_only = True
+                            elif handler.__name__ == "_handle_integrate":
+                                _owner_only = True
+                            elif handler.__name__ == "_handle_pool" and sub in ("list", "members"):
+                                _owner_only = False
+                            if _owner_only and not _L.is_owner(svc._conn, resolved, str(user_id)):
+                                return _result({"ok": False, "error_code": "unauthorized",
+                                                "error": f"not authorized for pool {resolved} — ask the maintainer"})
+                        # user_id present but no resolvable pool: fail-closed
+                        # for owner-only verbs, else let handler run (it will
+                        # refuse pool resolution itself).
+                        elif handler.__name__ == "_handle_pool" and sub in ("invite", "remove", "auto-approve"):
+                            return _result({"ok": False, "error_code": "unauthorized",
+                                            "error": "not authorized — ask the maintainer"})
             except Exception:
                 pass  # Freeze guard is best-effort; handler still runs.
         return handler(ctx, raw, source=source, session_id=session_id,
@@ -770,20 +804,17 @@ def register(ctx):
                 from . import ledger as _L
             except ImportError:
                 import ledger as _L
-            key = _L.lookup_key_by_discord_user(svc._conn, discord_user_id)
-            if key is None:
-                raise PermissionError(
-                    "button click refused: Discord user not bound to a pool key_id")
+            # Whitelist: button click must be the pool owner (Discord id).
             ticket = svc.show_ticket(ticket_id)
-            pool = svc._conn.execute(
-                "SELECT maintainer_key_id FROM pools WHERE pool_id=?",
-                (ticket["pool_id"],)).fetchone()
-            maintainer = pool[0] if pool else None
-            if maintainer and key != maintainer:
+            if not _L.is_owner(svc._conn, ticket["pool_id"], str(discord_user_id)):
                 raise PermissionError(
-                    "button click refused: only the pool maintainer may decide integration")
+                    "button click refused: only the pool owner may decide integration")
+            # Attribution only (OD1): the invite-bound key for the record.
+            attribution_key = _L.lookup_key_by_discord_user(
+                svc._conn, str(discord_user_id))
             return svc.resolve_integration(
-                ticket_id, decision, key_id=key,
+                ticket_id, decision, source={"user_id": str(discord_user_id)},
+                key_id=attribution_key,
                 work_dir=_work_root_for(ctx) / "integrate")
         try:
             ctx.register_platform_handler("discord",

@@ -13,11 +13,10 @@ is delivered by two paths that both land on the Hermes bot:
 
 This module is the shared parsing/dispatch core both paths use:
 ``parse_button_event`` (custom_id / value / text shapes, ``agent-pool:``
-prefix optional) and ``dispatch_button_event`` (clicker → ``key_id`` via the
-ledger ``identities.discord_user_id`` binding recorded at ``/pool invite
---discord-user <id>``, maintainer check, dispatch to
-``PoolService.resolve_integration``). Unmapped or non-maintainer clickers
-are refused, never dispatched.
+prefix optional) and ``dispatch_button_event`` (clicker → owner check via
+the whitelisted Discord id, then dispatch to
+``PoolService.resolve_integration`` with that id as ``source``). Unmapped or
+non-owner clickers are refused, never dispatched.
 
 The ``gateway_platform_event`` hook (registered for compatibility) only
 carries normalized events in Hermes v0.22.7 — Discord button interactions
@@ -101,8 +100,11 @@ def dispatch_button_event(service, platform, event_type, payload, *,
 
     ``identity_map`` maps platform user ids to agent-pool ``key_id``s and
     is supplied by the host (the plugin cannot know platform user ids).
-    The clicker must resolve to the ticket's pool maintainer; anything
-    else is refused with ``PermissionError``. ``resolve_kwargs`` (e.g.
+    Authorization is the whitelisted Discord user id only: the clicker's
+    id must be the pool owner (``PoolService._require_owner``), and that
+    id is forwarded as ``source``. ``identity_map`` is attribution only —
+    crypto records WHO acted, it never decides access. Anything else is
+    refused with ``PermissionError``. ``resolve_kwargs`` (e.g.
     ``work_dir``, ``edit_files``) are forwarded to ``resolve_integration``.
     """
     parsed = parse_button_event(payload)
@@ -112,35 +114,24 @@ def dispatch_button_event(service, platform, event_type, payload, *,
     ticket_id, decision = parsed["ticket_id"], parsed["decision"]
     ticket = service.show_ticket(ticket_id)
     pool_id = ticket["pool_id"]
-    maintainer = None
-    for pool in service._conn.execute(
-            "SELECT maintainer_key_id FROM pools WHERE pool_id=?", (pool_id,)):
-        maintainer = pool[0]
-    clicker_key = None
+    clicker_discord_id = None
     if isinstance(payload, dict):
         for author_id in _author_ids(payload):
-            if identity_map and author_id in identity_map:
-                clicker_key = identity_map[author_id]
+            if str(author_id).strip():
+                clicker_discord_id = str(author_id)
                 break
-            # Fallback: ledger identities.discord_user_id binding.
-            try:
-                from . import ledger as _L
-                clicker_key = _L.lookup_key_by_discord_user(service._conn, author_id)
-            except ImportError:
-                import ledger as _L
-                clicker_key = _L.lookup_key_by_discord_user(service._conn, author_id)
-            if clicker_key:
-                break
-    if clicker_key is None:
+    if clicker_discord_id is None:
         raise PermissionError(
             "button click refused: clicking author could not be resolved "
-            "to a pool key_id (host must supply identity_map)")
-    if maintainer is not None and clicker_key != maintainer:
-        raise PermissionError(
-            "button click refused: only the pool maintainer may decide "
-            f"integration (clicker {clicker_key!r} is not the maintainer)")
+            "to a Discord user id (host must supply identity_map)")
+    # Owner check is the whitelist's: the Discord id must be the pool
+    # owner. Raises PermissionError otherwise (fail closed, unmapped too).
+    service._require_owner(pool_id, {"user_id": clicker_discord_id})
+    # Attribution only: invite-bound key for the event record.
+    clicker_key = (identity_map or {}).get(clicker_discord_id)
     result = service.resolve_integration(
-        ticket_id, decision, key_id=clicker_key, **resolve_kwargs)
+        ticket_id, decision, source={"user_id": clicker_discord_id},
+        key_id=clicker_key, **resolve_kwargs)
     result = dict(result)
     result.update({"dispatched": True, "via": "button_bridge",
                    "platform": platform, "event_type": event_type,
