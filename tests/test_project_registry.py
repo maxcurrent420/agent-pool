@@ -18,7 +18,7 @@ from nacl.encoding import RawEncoder
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ledger import (ClaimRefused, add_member, create_pool, create_ticket,
+from ledger import (set_auto_approve,ClaimRefused, add_member, create_pool, create_ticket,
                     get_repo, init_ledger, list_repos, set_global_frozen)
 from tickets import PoolService, PoolNotLocalError
 from transport import FakeTransport
@@ -49,6 +49,7 @@ def _world(tmp_path):
     maint = ensure_identity(tmp_path / "m")
     member = ensure_identity(tmp_path / "a")
     create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
+    set_auto_approve(conn, "pool-1", True)
     for ident, role in ((maint, "maintainer"), (member, "member")):
         conn.execute(
             "INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, created_at)"
@@ -166,6 +167,7 @@ def test_pool_list_excludes_non_member_pools(tmp_path):
     # A second pool where the caller is NOT a member.
     other = ensure_identity(tmp_path / "o")
     create_pool(conn, "pool-2", "Other", other.key_id, relay_url="off")
+    set_auto_approve(conn, "pool-2", True)
     conn.execute("INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex,"
                  " created_at) VALUES (?,?,?,0)",
                  (other.key_id, other.verify_key.encode(RawEncoder).hex(),
@@ -189,6 +191,7 @@ def test_task_list_repo_filter_and_cross_pool_refusal(tmp_path):
     assert [t["title"] for t in rows] == ["Demo task"]
     other = ensure_identity(tmp_path / "o")
     create_pool(conn, "pool-2", "Other", other.key_id, relay_url="off")
+    set_auto_approve(conn, "pool-2", True)
     conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
                  " VALUES ('far','pool-2','Far',0)")
     conn.commit()

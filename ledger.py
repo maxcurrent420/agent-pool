@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS members (
     key_id TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'member',
     box_pubkey_hex TEXT NOT NULL DEFAULT '',
+    verify_pubkey_hex TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (pool_id, key_id)
 );
 CREATE TABLE IF NOT EXISTS identities (
@@ -123,31 +124,35 @@ CREATE TABLE IF NOT EXISTS peers (
     agent_key_id TEXT NOT NULL,
     maintainer_key_id TEXT NOT NULL,
     trust_state TEXT NOT NULL DEFAULT 'unverified',
+    verify_pubkey_hex TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (pool_id, agent_key_id)
 );
 CREATE TABLE IF NOT EXISTS remote_repos (
-    repo_id TEXT PRIMARY KEY,
     pool_id TEXT NOT NULL,
+    repo_id TEXT NOT NULL,
     remote_repo_id TEXT NOT NULL,
-    link TEXT NOT NULL DEFAULT ''
+    link TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (pool_id, repo_id)
 );
 CREATE TABLE IF NOT EXISTS imported_versions (
+    pool_id TEXT NOT NULL,
     repo_id TEXT NOT NULL,
     version INTEGER NOT NULL,
     manifest_json TEXT NOT NULL,
     manifest_hash TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'accepted',
-    PRIMARY KEY (repo_id, version)
+    PRIMARY KEY (pool_id, repo_id, version)
 );
 CREATE TABLE IF NOT EXISTS imported_chain (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    pool_id TEXT NOT NULL,
     repo_id TEXT NOT NULL,
     version INTEGER NOT NULL,
     manifest_hash TEXT NOT NULL,
     prev_manifest_hash TEXT,
     signer_key_id TEXT NOT NULL,
     signature TEXT NOT NULL,
-    UNIQUE (repo_id, version)
+    UNIQUE (pool_id, repo_id, version)
 );
 CREATE TABLE IF NOT EXISTS imported_tickets (
     ticket_id TEXT PRIMARY KEY,
@@ -192,11 +197,76 @@ def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
          "ALTER TABLE repos ADD COLUMN display_name TEXT"),
         ("repos", "submitter_key_id",
          "ALTER TABLE repos ADD COLUMN submitter_key_id TEXT"),
+        ("members", "verify_pubkey_hex",
+         "ALTER TABLE members ADD COLUMN verify_pubkey_hex TEXT NOT NULL DEFAULT ''"),
+        ("peers", "verify_pubkey_hex",
+         "ALTER TABLE peers ADD COLUMN verify_pubkey_hex TEXT NOT NULL DEFAULT ''"),
     ):
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if col not in cols:
             conn.execute(ddl)
             conn.commit()
+    # Pool-scoped imports migration (Phase 3): old imported_versions /
+    # imported_chain / remote_repos lack pool_id or have repo-only PKs.
+    # Rebuild via table-copy when the old shape is detected; recorded in
+    # meta schema_version so it runs once per DB.
+    for old, ddl in (
+        ("imported_versions",
+         "CREATE TABLE imported_versions_new (pool_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
+         " version INTEGER NOT NULL, manifest_json TEXT NOT NULL, manifest_hash TEXT NOT NULL,"
+         " state TEXT NOT NULL DEFAULT 'accepted', PRIMARY KEY (pool_id, repo_id, version))"),
+        ("imported_chain",
+         "CREATE TABLE imported_chain_new (seq INTEGER PRIMARY KEY AUTOINCREMENT, pool_id TEXT NOT NULL,"
+         " repo_id TEXT NOT NULL, version INTEGER NOT NULL, manifest_hash TEXT NOT NULL,"
+         " prev_manifest_hash TEXT, signer_key_id TEXT NOT NULL, signature TEXT NOT NULL,"
+         " UNIQUE (pool_id, repo_id, version))"),
+        ("remote_repos",
+         "CREATE TABLE remote_repos_new (pool_id TEXT NOT NULL, repo_id TEXT NOT NULL,"
+         " remote_repo_id TEXT NOT NULL, link TEXT NOT NULL DEFAULT '',"
+         " PRIMARY KEY (pool_id, repo_id))"),
+    ):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({old})")}
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (old,)).fetchone()
+        sql = (sql_row[0] or "") if sql_row else ""
+        # Legacy remote_repos has repo_id as PRIMARY KEY (single col).
+        needs_rebuild = ("pool_id" not in cols) or (
+            old == "remote_repos" and "PRIMARY KEY (pool_id" not in sql.upper()
+            and "PRIMARY KEY" in sql.upper())
+        needs_rebuild = needs_rebuild or (
+            old != "remote_repos" and "pool_id" in cols
+            and "pool_id" in sql and "PRIMARY KEY (pool_id" not in sql.replace(" ", ""))
+        if needs_rebuild:
+            new = f"{old}_new"
+            conn.execute(ddl)
+            if old == "remote_repos":
+                conn.execute(
+                    f"INSERT OR IGNORE INTO {new} (pool_id, repo_id, remote_repo_id, link) "
+                    f"SELECT pool_id, repo_id, remote_repo_id, link FROM {old}")
+            elif old == "imported_versions":
+                conn.execute(
+                    f"INSERT OR IGNORE INTO {new} (pool_id, repo_id, version, manifest_json, manifest_hash, state) "
+                    f"SELECT rr.pool_id, iv.repo_id, iv.version, iv.manifest_json, iv.manifest_hash, iv.state "
+                    f"FROM {old} iv LEFT JOIN remote_repos rr ON rr.repo_id = iv.repo_id")
+                # Rows with no remote_repos mapping get pool_id fallback '' —
+                # they remain queryable only with explicit pool scoping.
+                conn.execute(
+                    f"UPDATE {new} SET pool_id='' WHERE pool_id IS NULL OR pool_id=''")
+            else:
+                conn.execute(
+                    f"INSERT OR IGNORE INTO {new} (pool_id, repo_id, version, manifest_hash, prev_manifest_hash, signer_key_id, signature) "
+                    f"SELECT rr.pool_id, ic.repo_id, ic.version, ic.manifest_hash, ic.prev_manifest_hash, ic.signer_key_id, ic.signature "
+                    f"FROM {old} ic LEFT JOIN remote_repos rr ON rr.repo_id = ic.repo_id")
+                conn.execute(
+                    f"UPDATE {new} SET pool_id='' WHERE pool_id IS NULL OR pool_id=''")
+            conn.execute(f"DROP TABLE {old}")
+            conn.execute(f"ALTER TABLE {new} RENAME TO {old}")
+            conn.commit()
+    try:
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version','4')")
+        conn.commit()
+    except Exception:
+        pass
     return conn
 
 
@@ -239,10 +309,10 @@ def create_pool(conn, pool_id, name, maintainer_key_id, relay_url="", settings=N
     conn.commit()
 
 
-def add_member(conn, pool_id, key_id, role="member", box_pubkey_hex="") -> None:
+def add_member(conn, pool_id, key_id, role="member", box_pubkey_hex="", verify_pubkey_hex="") -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO members (pool_id, key_id, role, box_pubkey_hex)"
-        " VALUES (?,?,?,?)", (pool_id, key_id, role, box_pubkey_hex))
+        "INSERT OR REPLACE INTO members (pool_id, key_id, role, box_pubkey_hex, verify_pubkey_hex)"
+        " VALUES (?,?,?,?,?)", (pool_id, key_id, role, box_pubkey_hex, verify_pubkey_hex or ""))
     conn.commit()
 
 
@@ -292,9 +362,10 @@ def claim_ticket(conn, claim_id, ticket_id, key_id, declared_paths=None, budget=
 
 # --- Phase 3: ticket coordination (freeze, overlap, budgets, lifecycle) -----
 
-TICKET_STATES = ("open", "claimed", "review", "merged", "blocked")
+TICKET_STATES = ("pending", "open", "claimed", "review", "merged", "blocked")
 # Allowed transitions enforced by set_ticket_state().
 _TRANSITIONS = {
+    "pending": {"open", "blocked"},
     "open": {"claimed", "blocked"},
     "claimed": {"review", "open", "blocked"},
     "review": {"merged", "blocked", "review"},
@@ -344,6 +415,8 @@ def set_frozen(conn, pool_id, frozen: bool) -> bool:
 
 _GLOBAL_FROZEN_KEY = "global_frozen"
 
+FROZEN_MESSAGE = "pool frozen — contact the maintainer"
+
 
 def is_global_frozen(conn) -> bool:
     try:
@@ -371,10 +444,13 @@ def is_frozen_any(conn, pool_id) -> bool:
 def check_not_frozen(conn, pool_id) -> None:
     """Raise ClaimRefused if any freeze (global or per-pool) blocks *pool_id*."""
     if is_global_frozen(conn):
-        raise ClaimRefused("global kill-switch is set: all pools frozen "
-                           "(unfreeze with /pool freeze --unfreeze)")
-    if is_frozen(conn, pool_id):
-        raise ClaimRefused(f"pool {pool_id!r} is frozen")
+        raise ClaimRefused(FROZEN_MESSAGE)
+    try:
+        frozen = is_frozen(conn, pool_id)
+    except Exception:
+        frozen = False
+    if frozen:
+        raise ClaimRefused(FROZEN_MESSAGE)
 
 
 def normalize_budget(budget=None, defaults=None) -> dict:
@@ -418,7 +494,7 @@ def list_tickets(conn, pool_id=None, state=None, repo_id=None) -> list:
 def list_members(conn, pool_id) -> list:
     _pool_row(conn, pool_id)
     rows = conn.execute(
-        "SELECT key_id, role, box_pubkey_hex FROM members WHERE pool_id=? ORDER BY key_id",
+        "SELECT key_id, role, box_pubkey_hex, verify_pubkey_hex FROM members WHERE pool_id=? ORDER BY key_id",
         (pool_id,)).fetchall()
     return [dict(r) for r in rows]
 
@@ -581,9 +657,9 @@ def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None
             f"claim refused: ticket {ticket_id!r} is {ticket['state']!r}, not open "
             "(one-ticket-one-worker)")
     if is_global_frozen(conn):
-        raise ClaimRefused("claim refused: global kill-switch is set")
+        raise ClaimRefused(FROZEN_MESSAGE)
     if is_frozen(conn, ticket["pool_id"]):
-        raise ClaimRefused(f"claim refused: pool {ticket['pool_id']!r} is frozen")
+        raise ClaimRefused(FROZEN_MESSAGE)
     if whole_ticket:
         live = _live_file_claims(conn, ticket["repo_id"], ticket_id)
         if live and not maintainer_override:
@@ -631,9 +707,9 @@ def release_ticket(conn, ticket_id, key_id) -> dict:
     if ticket["claimant_key_id"] != key_id:
         raise ClaimRefused("release refused: only the claimant may release the ticket")
     if is_global_frozen(conn):
-        raise ClaimRefused("release refused: global kill-switch is set")
+        raise ClaimRefused(FROZEN_MESSAGE)
     if is_frozen(conn, ticket["pool_id"]):
-        raise ClaimRefused(f"release refused: pool {ticket['pool_id']!r} is frozen")
+        raise ClaimRefused(FROZEN_MESSAGE)
     conn.execute("UPDATE claims SET state='released' WHERE ticket_id=? AND state='active'",
                  (ticket_id,))
     conn.execute("DELETE FROM file_claims WHERE ticket_id=?", (ticket_id,))
@@ -865,12 +941,13 @@ def peek_notices(conn, pool_id=None):
 # never writes another agent's ledger; these tables hold only verified
 # imports. Canonical writes stay maintainer-only on the owning ledger.
 
-def upsert_peer(conn, pool_id, agent_key_id, maintainer_key_id, trust_state="unverified") -> dict:
+def upsert_peer(conn, pool_id, agent_key_id, maintainer_key_id, trust_state="unverified", verify_pubkey_hex="") -> dict:
     conn.execute(
-        "INSERT INTO peers (pool_id, agent_key_id, maintainer_key_id, trust_state)"
-        " VALUES (?,?,?,?) ON CONFLICT(pool_id, agent_key_id) DO UPDATE SET"
-        " maintainer_key_id=excluded.maintainer_key_id, trust_state=excluded.trust_state",
-        (pool_id, agent_key_id, maintainer_key_id, trust_state))
+        "INSERT INTO peers (pool_id, agent_key_id, maintainer_key_id, trust_state, verify_pubkey_hex)"
+        " VALUES (?,?,?,?,?) ON CONFLICT(pool_id, agent_key_id) DO UPDATE SET"
+        " maintainer_key_id=excluded.maintainer_key_id, trust_state=excluded.trust_state,"
+        " verify_pubkey_hex=excluded.verify_pubkey_hex",
+        (pool_id, agent_key_id, maintainer_key_id, trust_state, verify_pubkey_hex or ""))
     conn.commit()
     return get_peer(conn, pool_id, agent_key_id)
 
@@ -891,50 +968,97 @@ def list_peers(conn, pool_id=None):
     return [dict(r) for r in conn.execute("SELECT * FROM peers ORDER BY pool_id, agent_key_id")]
 
 
-def set_peer_trust(conn, pool_id, agent_key_id, trust_state):
-    if trust_state not in ("unverified", "verified", "revoked"):
+def set_peer_trust(conn, pool_id, agent_key_id, trust_state, verify_pubkey_hex=None):
+    if trust_state not in ("unverified", "verified", "pinned", "revoked"):
         raise ValueError(f"unknown trust_state: {trust_state!r}")
-    conn.execute("UPDATE peers SET trust_state=? WHERE pool_id=? AND agent_key_id=?",
-                 (trust_state, pool_id, agent_key_id))
+    if verify_pubkey_hex is not None:
+        conn.execute("UPDATE peers SET trust_state=?, verify_pubkey_hex=? WHERE pool_id=? AND agent_key_id=?",
+                     (trust_state, verify_pubkey_hex, pool_id, agent_key_id))
+    else:
+        conn.execute("UPDATE peers SET trust_state=? WHERE pool_id=? AND agent_key_id=?",
+                     (trust_state, pool_id, agent_key_id))
     conn.commit()
     return get_peer(conn, pool_id, agent_key_id)
 
 
+# --- Trust anchors (Phase 3) -------------------------------------------------
+# "peers" rows double as operator-pinned trust anchors: a local record of
+# "this remote pool's maintainer verification key". No peer ever creates or
+# upgrades its own trust; only an operator pin (--verify-key) sets "pinned".
+
+def get_trust_anchor(conn, pool_id):
+    """Pinned trust anchor for pool_id, or None (revoked/unverified → None)."""
+    rows = conn.execute("SELECT * FROM peers WHERE pool_id=? ORDER BY agent_key_id", (pool_id,)).fetchall()
+    for r in rows:
+        d = dict(r)
+        if d.get("trust_state") in ("pinned", "verified"):
+            return d
+    return None
+
+
+def list_trust_anchors(conn, pool_id=None):
+    if pool_id:
+        return [dict(r) for r in conn.execute("SELECT * FROM peers WHERE pool_id=? ORDER BY agent_key_id", (pool_id,))]
+    return [dict(r) for r in conn.execute("SELECT * FROM peers ORDER BY pool_id, agent_key_id")]
+
+
+def pin_trust_anchor(conn, pool_id, maintainer_key_id, verify_pubkey_hex, agent_key_id="anchor"):
+    if conn.execute("SELECT 1 FROM pools WHERE pool_id=?", (pool_id,)).fetchone():
+        raise ValueError(f"cannot pin trust for own local pool {pool_id!r}")
+    return upsert_peer(conn, pool_id, agent_key_id or "anchor", maintainer_key_id,
+                       trust_state="pinned", verify_pubkey_hex=verify_pubkey_hex or "")
+
+
+def revoke_trust_anchor(conn, pool_id, agent_key_id=None):
+    rows = conn.execute("SELECT agent_key_id FROM peers WHERE pool_id=?", (pool_id,)).fetchall()
+    if not rows:
+        raise ValueError(f"no trust anchor for pool {pool_id!r}")
+    for (ak,) in rows:
+        conn.execute("UPDATE peers SET trust_state='revoked' WHERE pool_id=? AND agent_key_id=?", (pool_id, ak))
+    conn.commit()
+    return get_peer(conn, pool_id)
+
+
 def upsert_remote_repo(conn, repo_id, pool_id, remote_repo_id=None, link=""):
+    repo_id = str(repo_id)
     conn.execute(
-        "INSERT INTO remote_repos (repo_id, pool_id, remote_repo_id, link) VALUES (?,?,?,?)"
-        " ON CONFLICT(repo_id) DO UPDATE SET pool_id=excluded.pool_id,"
+        "INSERT INTO remote_repos (pool_id, repo_id, remote_repo_id, link) VALUES (?,?,?,?)"
+        " ON CONFLICT(pool_id, repo_id) DO UPDATE SET"
         " remote_repo_id=excluded.remote_repo_id, link=excluded.link",
-        (repo_id, pool_id, remote_repo_id or repo_id, link or ""))
+        (pool_id, repo_id, remote_repo_id or repo_id, link or ""))
     conn.commit()
 
 
-def get_remote_repo(conn, repo_id):
-    row = conn.execute("SELECT * FROM remote_repos WHERE repo_id=?", (repo_id,)).fetchone()
+def get_remote_repo(conn, repo_id, pool_id=None):
+    if pool_id:
+        row = conn.execute("SELECT * FROM remote_repos WHERE pool_id=? AND repo_id=?", (pool_id, repo_id)).fetchone()
+        return dict(row) if row else None
+    row = conn.execute("SELECT * FROM remote_repos WHERE repo_id=? ORDER BY pool_id LIMIT 1", (repo_id,)).fetchone()
     return dict(row) if row else None
 
 
 def list_imported(conn, pool_id=None, repo_id=None):
     q, p = "SELECT * FROM imported_versions WHERE 1=1", []
+    if pool_id: q += " AND pool_id=?"; p.append(pool_id)
     if repo_id: q += " AND repo_id=?"; p.append(repo_id)
-    q += " ORDER BY repo_id, version"
-    rows = [dict(r) for r in conn.execute(q, p)]
-    if pool_id:
-        rows = [r for r in rows if get_remote_repo(conn, r["repo_id"]) and get_remote_repo(conn, r["repo_id"])["pool_id"] == pool_id]
-    return rows
+    q += " ORDER BY pool_id, repo_id, version"
+    return [dict(r) for r in conn.execute(q, p)]
 
 
-def import_version(conn, signed_manifest, manifest_hash_value):
+def import_version(conn, signed_manifest, manifest_hash_value, pool_id=None):
     repo_id = signed_manifest["repo_id"]
+    if pool_id is None:
+        rr = get_remote_repo(conn, repo_id)
+        pool_id = rr["pool_id"] if rr else ""
     conn.execute(
-        "INSERT OR REPLACE INTO imported_versions (repo_id, version, manifest_json, manifest_hash, state)"
-        " VALUES (?,?,?,?,?)",
-        (repo_id, signed_manifest["version"], json.dumps(signed_manifest),
+        "INSERT OR REPLACE INTO imported_versions (pool_id, repo_id, version, manifest_json, manifest_hash, state)"
+        " VALUES (?,?,?,?,?,?)",
+        (pool_id, repo_id, signed_manifest["version"], json.dumps(signed_manifest),
          manifest_hash_value, signed_manifest.get("state", "accepted")))
     conn.execute(
-        "INSERT OR REPLACE INTO imported_chain (repo_id, version, manifest_hash, prev_manifest_hash, signer_key_id, signature)"
-        " VALUES (?,?,?,?,?,?)",
-        (repo_id, signed_manifest["version"], manifest_hash_value,
+        "INSERT OR REPLACE INTO imported_chain (pool_id, repo_id, version, manifest_hash, prev_manifest_hash, signer_key_id, signature)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (pool_id, repo_id, signed_manifest["version"], manifest_hash_value,
          signed_manifest.get("prev_manifest_hash"), signed_manifest["signer_key_id"],
          signed_manifest.get("signature", "")))
     conn.commit()
@@ -965,21 +1089,27 @@ def list_imported_tickets(conn, pool_id=None, state=None, repo_id=None):
     return [dict(r) for r in conn.execute(q, p)]
 
 
-def get_latest_imported_manifest(conn, repo_id):
-    row = conn.execute("SELECT manifest_json FROM imported_versions WHERE repo_id=? AND state='accepted' ORDER BY version DESC LIMIT 1", (repo_id,)).fetchone()
+def get_latest_imported_manifest(conn, repo_id, pool_id=None):
+    if pool_id:
+        row = conn.execute("SELECT manifest_json FROM imported_versions WHERE pool_id=? AND repo_id=? AND state='accepted' ORDER BY version DESC LIMIT 1", (pool_id, repo_id)).fetchone()
+    else:
+        row = conn.execute("SELECT manifest_json FROM imported_versions WHERE repo_id=? AND state='accepted' ORDER BY version DESC LIMIT 1", (repo_id,)).fetchone()
     return json.loads(row[0]) if row else None
 
 
-def list_imported_chain(conn, repo_id):
-    rows = conn.execute("SELECT manifest_json FROM imported_versions WHERE repo_id=? AND state='accepted' ORDER BY version", (repo_id,)).fetchall()
+def list_imported_chain(conn, repo_id, pool_id=None):
+    if pool_id:
+        rows = conn.execute("SELECT manifest_json FROM imported_versions WHERE pool_id=? AND repo_id=? AND state='accepted' ORDER BY version", (pool_id, repo_id)).fetchall()
+    else:
+        rows = conn.execute("SELECT manifest_json FROM imported_versions WHERE repo_id=? AND state='accepted' ORDER BY version", (repo_id,)).fetchall()
     return [json.loads(r[0]) for r in rows]
 
 
 def get_auto_approve(conn, pool_id) -> bool:
     row = conn.execute("SELECT value FROM meta WHERE key=?", (f"auto_approve:{pool_id}",)).fetchone()
     if row is None:
-        # Default: auto-approve ON for backwards compat (existing tickets open)
-        return True
+        # Default: auto-approve OFF — tickets mint as "pending".
+        return False
     return row[0] == "1"
 
 

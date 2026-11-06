@@ -13,7 +13,7 @@ from nacl.encoding import RawEncoder
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ledger import (ClaimRefused, add_member, claim_ticket_enforced, create_pool,
+from ledger import (set_auto_approve,ClaimRefused, add_member, claim_ticket_enforced, create_pool,
                     create_ticket, get_ticket, init_ledger, is_frozen, list_members,
                     release_ticket, set_frozen, set_ticket_state)
 from tickets import PoolService
@@ -31,6 +31,7 @@ def _memdb():
 def conn():
     c = _memdb()
     create_pool(c, "pool-1", "Team", "agent:maint", relay_url="off")
+    set_auto_approve(c, "pool-1", True)
     c.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
               " VALUES ('demo','pool-1','Demo',0)")
     c.commit()
@@ -171,6 +172,7 @@ def test_full_flow_claim_review_integrate_audit_show(tmp_path):
     maint = ensure_identity(tmp_path / "m")
     contrib = ensure_identity(tmp_path / "a")
     create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
+    set_auto_approve(conn, "pool-1", True)
     conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
                  " VALUES ('demo','pool-1','Demo',0)")
     for ident, role in ((maint, "maintainer"), (contrib, "member")):
@@ -280,6 +282,8 @@ def test_command_handlers_smoke(tmp_path):
         plugin.register(ctx)
         out = json.loads(ctx.commands["pool"]("register pool-1 --name Team"))
         assert out["ok"] and out["maintainer"] == ident.key_id
+        out = json.loads(ctx.commands["pool"]("auto-approve on --pool pool-1"))
+        assert out["ok"] and out["auto_approve"] is True
         out = json.loads(ctx.commands["pool"](f"invite pool-1 agent:alice --role member"))
         assert out["role"] == "member"
         out = json.loads(ctx.commands["pool"]("members pool-1"))

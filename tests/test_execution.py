@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from execution import (BudgetTracker, LocalProcessRunner, LifecycleWorkerRunner,
                        SandboxPolicy, build_mandate_brief, create_worktree,
                        run_worker_loop)
-from ledger import (add_member, create_pool, init_ledger)
+from ledger import (set_auto_approve,add_member, create_pool, init_ledger)
 from tickets import PoolService
 from transport import FakeTransport
 from identity import ensure_identity
@@ -68,6 +68,7 @@ def world(tmp_path):
     maint = ensure_identity(tmp_path / "m")
     worker = ensure_identity(tmp_path / "w")
     create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
+    set_auto_approve(conn, "pool-1", True)
     conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
                  " VALUES ('demo','pool-1','Demo',0)")
     for ident, role in ((maint, "maintainer"), (worker, "member")):

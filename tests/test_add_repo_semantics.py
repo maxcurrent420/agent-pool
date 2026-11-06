@@ -13,6 +13,13 @@ def test_add_repo_link_registers_without_fetch(tmp_path):
     svc=PoolService(c, caller_key_id="agent:maint", caller_signing_key=SigningKey.generate())
     out=svc.add_repo("pool-1","demo","",repo_link="https://example/demo.git")
     assert out["registered_link"] is True and out["fetched"] is False
-    assert get_repo(c,"demo")["path"]=="https://example/demo.git"
+    # Link is a pointer in remote_repos only — never in repos.path.
+    assert get_repo(c,"demo")["path"] is None
+    rr=c.execute("SELECT link FROM remote_repos WHERE pool_id='pool-1' AND repo_id='demo'").fetchone()
+    assert rr[0]=="https://example/demo.git"
     # No repo_versions created (no fetch/submit)
     assert c.execute("SELECT COUNT(*) FROM repo_versions WHERE repo_id='demo'").fetchone()[0]==0
+    # Empty link refused.
+    import pytest
+    with pytest.raises(ValueError):
+        svc.add_repo("pool-1","demo2","",repo_link="   ")

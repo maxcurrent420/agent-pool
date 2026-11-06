@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from bridge import dispatch_button_event, make_platform_event_handler, parse_button_event
 from buttons import parse_custom_id
-from ledger import add_member, create_pool, init_ledger
+from ledger import add_member, create_pool, init_ledger, set_auto_approve
 from tickets import PoolService
 from transport import FakeTransport
 from identity import ensure_identity
@@ -28,6 +28,7 @@ def _setup(tmp_path):
     conn.row_factory = sqlite3.Row
     maint = ensure_identity(tmp_path / "m")
     create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
+    set_auto_approve(conn, "pool-1", True)
     conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo','pool-1','Demo',0)")
     conn.execute("INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, created_at) VALUES (?,?,?,0)",
                  (maint.key_id, maint.verify_key.encode(RawEncoder).hex(), maint.box_pk.encode(RawEncoder).hex()))

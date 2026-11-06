@@ -36,7 +36,7 @@ from bridge import (dispatch_button_event, make_platform_event_handler,
                     parse_button_event)
 from crypto import blake3_hash, manifest_hash, unwrap_dek, verify_chain
 from execution import BudgetExhausted, BudgetTracker
-from ledger import (ClaimRefused, add_member, create_pool, get_ticket,
+from ledger import (set_auto_approve,ClaimRefused, add_member, create_pool, get_ticket,
                     init_ledger, is_global_frozen)
 from propagation import _verify_key
 from tickets import PoolService
@@ -67,6 +67,7 @@ class _World:
         self.member = ensure_identity(self.tmp / "b")
         self.extra = ensure_identity(self.tmp / "x")
         create_pool(self.conn, "pool-1", "Team", self.maint.key_id, relay_url="off")
+        set_auto_approve(self.conn, "pool-1", True)
         self.conn.execute(
             "INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo','pool-1','Demo',0)")
         for ident, role in ((self.maint, "maintainer"), (self.contrib, "member"),
@@ -420,6 +421,7 @@ def test_16_button_bridge_parse_and_hook_ignore(world):
 # 17 -----------------------------------------------------------------------
 def test_17_global_freeze_blocks_claim_across_pools(world):
     create_pool(world.conn, "pool-2", "Other", world.maint.key_id)
+    set_auto_approve(world.conn, "pool-2", True)
     world.conn.execute(
         "INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo2','pool-2','Demo2',0)")
     world.conn.commit()
@@ -427,9 +429,9 @@ def test_17_global_freeze_blocks_claim_across_pools(world):
     t2 = world.maint_svc.add_ticket("pool-2", "demo2", "Pool two")
     world.maint_svc.freeze_global(True)
     assert is_global_frozen(world.conn) is True
-    with pytest.raises(ClaimRefused, match="global kill-switch"):
+    with pytest.raises(ClaimRefused, match="pool frozen"):
         world.contrib_svc.claim(t1["ticket_id"], declared_paths=["hello.txt"])
-    with pytest.raises(ClaimRefused, match="global kill-switch"):
+    with pytest.raises(ClaimRefused, match="pool frozen"):
         world.contrib_svc.claim(t2["ticket_id"], declared_paths=["hello.txt"])
 
 
@@ -440,24 +442,24 @@ def test_18_global_freeze_blocks_work_and_integrate(world):
     world.contrib_svc.claim(tid, declared_paths=["hello.txt"])
     branch = world.contributor_branch(tid, "hello.txt", "v2\n")
     world.maint_svc.freeze_global(True)
-    with pytest.raises(ClaimRefused, match="global kill-switch"):
+    with pytest.raises(ClaimRefused, match="pool frozen"):
         world.contrib_svc.work_submit(tid, branch, 2)
-    with pytest.raises(ClaimRefused, match="global kill-switch"):
+    with pytest.raises(ClaimRefused, match="pool frozen"):
         world.maint_svc.integrate(tid, work_dir=world.work_dir)
-    with pytest.raises(ClaimRefused, match="global kill-switch"):
+    with pytest.raises(ClaimRefused, match="pool frozen"):
         world.maint_svc.resolve_integration(tid, "approve", work_dir=world.work_dir)
 
 
 # 19 -----------------------------------------------------------------------
 def test_19_global_freeze_blocks_pool_mutation(world):
     world.maint_svc.freeze_global(True)
-    with pytest.raises(ClaimRefused, match="global kill-switch"):
+    with pytest.raises(ClaimRefused, match="pool frozen"):
         world.maint_svc.add_ticket("pool-1", "demo", "Nope")
-    with pytest.raises(ClaimRefused, match="global kill-switch"):
+    with pytest.raises(ClaimRefused, match="pool frozen"):
         world.maint_svc.invite("pool-1", "agent:new")
-    with pytest.raises(ClaimRefused, match="global kill-switch"):
+    with pytest.raises(ClaimRefused, match="pool frozen"):
         world.maint_svc.register_pool("pool-3", "Late")
-    with pytest.raises(ClaimRefused, match="global kill-switch"):
+    with pytest.raises(ClaimRefused, match="pool frozen"):
         world.maint_svc.remove_member("pool-1", world.extra.key_id)
 
 

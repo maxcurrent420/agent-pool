@@ -81,6 +81,15 @@ def _pool_status(args=None, **kwargs):
         try:
             svc = _service_for(ctx)
             status["queued_notices"] = svc.drain_notices()
+            # Local identity (public values only): key_id, verify key, box pubkey.
+            try:
+                status["identity_detail"] = {
+                    "key_id": getattr(svc, "_caller_key_id", ""),
+                    "verify_key_hex": svc._caller_sk.verify_key.encode().hex() if getattr(svc, "_caller_sk", None) is not None else "",
+                    "box_pubkey_hex": svc._caller_box_sk.public_key.encode().hex() if getattr(svc, "_caller_box_sk", None) is not None else "",
+                }
+            except Exception:
+                pass
         except Exception:
             pass
         return json.dumps(status)
@@ -225,7 +234,16 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
             out = svc.invite(pool_id, key_id, role=opts.get("role", "member"),
                              box_pubkey_hex=opts.get("box_pubkey", ""),
                              source=source,
-                             discord_user_id=opts.get("discord_user", ""))
+                             discord_user_id=opts.get("discord_user", ""),
+                             verify_pubkey_hex=opts.get("verify_key", ""))
+        elif sub == "auto-approve":
+            # `/pool auto-approve <on|off> [--pool <id>]` — maintainer-only.
+            pool_id = opts.get("pool", "") or opts.get("pool_id", "")
+            arg = (rest[0] if rest else opts.get("state", "") or "").strip().lower()
+            if arg not in ("on", "off", "true", "false"):
+                return _result({"ok": False, "error": "usage: /pool auto-approve <on|off> [--pool <id>]"})
+            resolved = svc._resolve_pool(pool_id or None, source=source)
+            out = svc.set_auto_approve(resolved, arg in ("on", "true"))
         elif sub == "members":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             out = {"ok": True, "pool_id": pool_id, "members": svc.members(pool_id, source=source)}
@@ -258,6 +276,7 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
         elif sub == "import":
             # Read-only bootstrap: import canonical manifest string(s) into
             # the remote view. No new command family; plugin stays passive.
+            # Requires --verify-key (or an existing pinned anchor); no TOFU.
             pool_id = opts.get("pool_id") or opts.get("pool", "")
             manifest_raw = opts.get("manifest", "")
             if not manifest_raw and rest:
@@ -272,28 +291,32 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
             vk_hex = opts.get("verify_key", "")
             maintainer = opts.get("maintainer", "")
             verify_keys = {}
-            if vk_hex and maintainer:
+            if vk_hex:
                 from nacl.signing import VerifyKey
                 from nacl.encoding import RawEncoder
-                verify_keys = {maintainer: VerifyKey(bytes.fromhex(vk_hex), encoder=RawEncoder)}
-            elif manifests:
-                # TOFU: signer in manifest is the maintainer key.
-                signer = manifests[0].get("signer_key_id", "")
-                if vk_hex and signer:
-                    from nacl.signing import VerifyKey
-                    from nacl.encoding import RawEncoder
+                signer = maintainer or (manifests[0].get("signer_key_id", "") if manifests else "")
+                if signer:
                     verify_keys = {signer: VerifyKey(bytes.fromhex(vk_hex), encoder=RawEncoder)}
             out = svc.import_canonical(pool_id, manifests, verify_keys,
                                        tickets=manifest.get("tickets") if isinstance(manifest, dict) else None,
                                        maintainer_key_id=maintainer or None) if manifests else {"ok": False, "error": "no manifests to import"}
+        elif sub == "trust":
+            # `/pool trust <pool_id> <maintainer_key_id> --verify-key <hex>` (pin)
+            # `/pool trust --list [pool_id]` / `/pool trust --revoke <pool_id>`
+            if "list" in flags:
+                out = svc.pool_trust_list(rest[0] if rest and rest[0] else opts.get("pool_id") or None)
+            elif "revoke" in flags:
+                out = svc.pool_trust_revoke(rest[0] if rest else opts.get("pool_id", ""))
+            else:
+                pool_id = rest[0] if rest else opts.get("pool_id", "")
+                maintainer = rest[1] if len(rest) > 1 else opts.get("maintainer", "")
+                out = svc.pool_trust(pool_id, maintainer, opts.get("verify_key", ""))
         elif sub in ("peer", "confirm"):
-            pool_id = rest[0] if rest else opts.get("pool_id", "")
-            agent_key = rest[1] if len(rest) > 1 else opts.get("key_id", "")
-            out = svc.confirm_peer(pool_id, agent_key)
+            return _result({"ok": False, "error": "peer/confirm removed: use /pool trust to pin a trust anchor"})
         else:
             return _result({"ok": False,
                             "error": f"unknown /pool subcommand: {sub}",
-                            "usage": "/pool register|invite|members|remove|freeze|list"})
+                            "usage": "/pool register|invite|members|remove|freeze|list|import|trust|auto-approve"})
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -309,6 +332,7 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
         if sub == "add":
             if opts.get("packet"):
                 try:
+                    # Handler passes the pool's member verify keys (Phase 2).
                     ticket = svc.accept_proposal(opts["packet"])
                 except Exception as exc:
                     return _result({"ok": False, "error": str(exc)})
@@ -331,6 +355,28 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
                 {"ticket_id": t["ticket_id"], "title": t["title"], "state": t["state"],
                  "repo_id": t["repo_id"], "claimant": t.get("claimant_key_id"),
                  "thread_ref": t.get("thread_ref")} for t in rows]}
+            # Maintainer approval queue (Phase 4): ask_choice Approve/Deny/Modify.
+            try:
+                if ctx is not None and getattr(ctx, "ask_choice", None) and callable(getattr(ctx, "ask_choice")):
+                    pid = opts.get("pool_id") or None
+                    if pid:
+                        try:
+                            resolved = svc._resolve_pool(pid, source=source)
+                        except Exception:
+                            resolved = pid
+                    else:
+                        resolved = None
+                    if resolved and svc._is_bound_maintainer(resolved):
+                        pending = [t for t in svc.list_pending(resolved) if t["ticket_id"] not in {r["ticket_id"] for r in rows}]
+                        for t in pending:
+                            choice = ctx.ask_choice(
+                                f"Pending ticket {t['ticket_id']}: {t['title']} — approve? "
+                                f"(choice is recorded; use /task approve|deny|modify to apply)",
+                                ["Approve", "Deny", "Modify"])
+                            out.setdefault("pending_decisions", []).append(
+                                {"ticket_id": t["ticket_id"], "choice": str(choice).strip()})
+            except Exception:
+                pass
         elif sub == "show":
             ticket_id = rest[0] if rest else opts.get("ticket", "")
             t = svc.show_ticket(ticket_id)
@@ -340,9 +386,14 @@ def _handle_task(ctx, raw: str, *, source=None, session_id="", session_key="", p
                 "brief": t.get("brief", ""), "claimant": t.get("claimant_key_id"),
                 "budget": json.loads(t.get("budget_json") or "{}"),
                 "thread_ref": t.get("thread_ref")}}
+        elif sub in ("approve", "deny", "modify"):
+            ticket_id = rest[0] if rest else opts.get("ticket", "")
+            out = svc.approve_ticket(ticket_id, sub if sub != "deny" else "deny",
+                                     edit_files={opts["edit_file"]: opts["edit_content"]} if opts.get("edit_file") and opts.get("edit_content") is not None else None,
+                                     reason=opts.get("reason", ""))
         else:
             return _result({"ok": False, "error": f"unknown /task subcommand: {sub}",
-                            "usage": "/task add|list|show"})
+                            "usage": "/task add|list|show|approve|deny|modify"})
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -561,10 +612,10 @@ _POOL_STATUS_SCHEMA = {
 }
 
 _COMMANDS = (
-    ("pool", _handle_pool, "Agent Pool: register|invite|members|remove|freeze|list, status",
-     "register|invite|members|remove|freeze|list [options]"),
-    ("task", _handle_task, "Agent Pool tickets: add|list|show",
-     "add|list|show [options]"),
+    ("pool", _handle_pool, "Agent Pool: register|invite|members|remove|freeze|list|import|trust|auto-approve, status",
+     "register|invite|members|remove|freeze|list|import|trust|auto-approve [options]"),
+    ("task", _handle_task, "Agent Pool tickets: add|list|show|approve|deny|modify",
+     "add|list|show|approve|deny|modify [options]"),
     ("add-repo", _handle_add_repo, "Register a project and submit its repo bytes as a new version",
      "<repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]"),
     ("task_add", _handle_task_add, "Create a ticket for a registered project (alias of /task add)",
@@ -585,7 +636,95 @@ _COMMANDS = (
 
 
 def _wrap_command(handler, ctx):
+    """Dispatch seam: absolute freeze guard (Phase 1) + user binding check."""
     def wrapped(raw="", *, source=None, session_id="", session_key="", platform=""):
+        try:
+            from . import ledger as _L
+        except Exception:
+            try:
+                import ledger as _L
+            except Exception:
+                _L = None
+        if _L is not None:
+            try:
+                svc = _service_for(ctx, source=source)
+                pos, opts, flags = _parse_args(raw or "")
+                sub = pos[0] if pos else ""
+                # Freeze control itself must run to unfreeze.
+                is_freeze_ctl = (sub == "freeze")
+                if not is_freeze_ctl:
+                    # Resolve pool best-effort from raw args.
+                    pool_id = (opts.get("pool") or opts.get("pool_id") or opts.get("pool-id") or ""
+                               or (pos[1] if len(pos) > 1 and handler.__name__ in ("_handle_pool",) else ""))
+                    # Also honor source-bound pool and ticket's pool.
+                    resolved = None
+                    try:
+                        if pool_id:
+                            resolved = svc._resolve_pool(pool_id, source=source)
+                        elif handler.__name__ == "_handle_work":
+                            tid = pos[1] if len(pos) > 1 else opts.get("ticket", "")
+                            if tid:
+                                resolved = svc.show_ticket(tid)["pool_id"]
+                        elif handler.__name__ in ("_handle_claim", "_handle_release", "_handle_integrate", "_handle_audit"):
+                            tid = pos[0] if pos else opts.get("ticket", "")
+                            if tid:
+                                resolved = svc.show_ticket(tid)["pool_id"]
+                        elif handler.__name__ == "_handle_task":
+                            tid = pos[1] if len(pos) > 1 and pos[0] == "show" else opts.get("ticket", "")
+                            if tid:
+                                resolved = svc.show_ticket(tid)["pool_id"]
+                        elif handler.__name__ == "_handle_task_add":
+                            pass
+                        else:
+                            src = svc._source_from(source)
+                            if src is not None:
+                                try:
+                                    resolved = svc._resolve_pool(None, source=src)
+                                except Exception:
+                                    resolved = None
+                    except Exception:
+                        resolved = None
+                    frozen = False
+                    try:
+                        if _L.is_global_frozen(svc._conn):
+                            frozen = True
+                        elif resolved and _L.is_frozen(svc._conn, resolved):
+                            frozen = True
+                    except Exception:
+                        pass
+                    if frozen:
+                        try:
+                            _L.record_event(svc._conn, resolved or None, "freeze_blocked",
+                                            {"command": handler.__name__, "raw": (raw or "")[:500]})
+                        except Exception:
+                            pass
+                        return _result({"ok": False, "error_code": "frozen",
+                                        "error": "pool frozen — contact the maintainer"})
+                    # Per-command user check (Phase 1 step 3): resolve Discord
+                    # user to a key; unbound users are refused on every verb.
+                    user_id = None
+                    if isinstance(source, dict):
+                        user_id = source.get("user_id") or source.get("discord_user_id")
+                    elif source is not None:
+                        user_id = getattr(source, "user_id", None) or getattr(source, "discord_user_id", None)
+                        if callable(user_id):
+                            user_id = None
+                    if user_id is not None:
+                        key = _L.lookup_key_by_discord_user(svc._conn, str(user_id))
+                        if key is None:
+                            return _result({"ok": False, "error_code": "unauthorized",
+                                            "error": f"not authorized for pool {resolved or ''} — ask the maintainer"})
+                        # Canonical writes require the maintainer binding.
+                        _canonical = {"_handle_pool": ("register", "invite", "remove", "freeze", "auto-approve", "trust", "import"),
+                                      "_handle_task": ("add",), "_handle_add_repo": (), "_handle_task_add": ("",)}
+                        verb = sub
+                        if handler.__name__ == "_handle_pool" and verb in ("register", "invite", "remove", "trust", "import", "auto-approve"):
+                            row = svc._conn.execute("SELECT maintainer_key_id FROM pools WHERE pool_id=?", (resolved or "",)).fetchone()
+                            if row is not None and row[0] != key:
+                                return _result({"ok": False, "error_code": "unauthorized",
+                                                "error": f"not authorized for pool {resolved or ''} — ask the maintainer"})
+            except Exception:
+                pass  # Freeze guard is best-effort; handler still runs.
         return handler(ctx, raw, source=source, session_id=session_id,
                        session_key=session_key, platform=platform)
     return wrapped

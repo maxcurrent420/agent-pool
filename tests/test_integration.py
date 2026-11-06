@@ -11,7 +11,7 @@ from nacl.encoding import RawEncoder
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from crypto import manifest_hash, unwrap_dek, verify_chain
-from ledger import (add_member, create_pool, get_ticket, init_ledger,
+from ledger import (set_auto_approve,add_member, create_pool, get_ticket, init_ledger,
                     get_latest_accepted_manifest)
 from propagation import _verify_key
 from tickets import PoolService
@@ -39,6 +39,7 @@ class _World:
         self.member = ensure_identity(self.tmp / "b")
         self.extra = ensure_identity(self.tmp / "x")
         create_pool(self.conn, "pool-1", "Team", self.maint.key_id, relay_url="off")
+        set_auto_approve(self.conn, "pool-1", True)
         self.conn.execute(
             "INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo','pool-1','Demo',0)")
         for ident, role in ((self.maint, "maintainer"), (self.contrib, "member"),

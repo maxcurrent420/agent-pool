@@ -273,7 +273,7 @@ class RepoPropagator:
             except Exception:
                 list_imported_chain = None
         if list_imported_chain is not None:
-            return list_imported_chain(self._conn, repo_id)
+            return list_imported_chain(self._conn, repo_id, pool_id=self._pool_id)
         return out
 
     def _verify_keys(self) -> dict:
