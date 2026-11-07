@@ -1,7 +1,7 @@
 import sqlite3, sys, json
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from ledger import (init_ledger, create_pool, add_member, bind_discord_user,
+from ledger import (init_ledger, create_pool, add_member, bind_membership,
                     list_members, authorize_user, is_owner,
                     is_authorized)
 from tickets import PoolService
@@ -22,7 +22,7 @@ def test_F1_non_maintainer_mint_refused_through_wrapper():
     create_pool(c,"pool-1","Team","agent:maint", owner_discord_user_id="maint-123")
     add_member(c,"pool-1","agent:maint",role="maintainer")
     add_member(c,"pool-1","agent:friend",role="member")
-    bind_discord_user(c,"agent:friend","friend-123")
+    bind_membership(c,"pool-1","friend-123","agent:friend")
     authorize_user(c,"pool-1","friend-123")
     from __init__ import _wrap_command
     import __init__ as plugin

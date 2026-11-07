@@ -836,18 +836,6 @@ def remove_member(conn, pool_id, key_id) -> dict:
 
 # --- Gateway-native: discord identity, queued notices ------------------------
 
-def bind_discord_user(conn, key_id, user_id) -> None:
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(identities)")}
-    if "discord_user_id" not in cols:
-        init_ledger(conn)
-    conn.execute(
-        "INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex,"
-        " discord_user_id, created_at) VALUES (?,?,?,?,0)"
-        " ON CONFLICT(key_id) DO UPDATE SET discord_user_id=excluded.discord_user_id",
-        (key_id, "", "", str(user_id)))
-    conn.commit()
-
-
 def authorize_user(conn, pool_id, discord_user_id) -> None:
     if discord_user_id is None:
         raise ValueError("authorize needs a discord_user_id")

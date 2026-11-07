@@ -416,14 +416,19 @@ class PoolService:
                                   (pool_id,)).fetchone()
         if pool is None:
             raise ValueError(f"unknown pool: {pool_id!r}")
-        removed = L.remove_member(self._conn, pool_id, key_id)
-        # Drop the whitelist row if the bound Discord id is known.
+        # Drop the whitelist row for the removed member's bound Discord id.
+        # Binding lives in pool_memberships (first-claim, Phase 1);
+        # identities.discord_user_id has no production writer.
         try:
-            _row = self._conn.execute("SELECT discord_user_id FROM identities WHERE key_id=?", (key_id,)).fetchone()
-            if _row and _row[0]:
-                L.deauthorize_user(self._conn, pool_id, _row[0])
+            _row = self._conn.execute(
+                "SELECT discord_user_id FROM pool_memberships WHERE pool_id=? AND key_id=?",
+                (pool_id, key_id)).fetchone()
+            _discord_user_id = _row[0] if _row else None
         except Exception:
-            pass
+            _discord_user_id = None
+        removed = L.remove_member(self._conn, pool_id, key_id)
+        if _discord_user_id:
+            L.deauthorize_user(self._conn, pool_id, _discord_user_id)
         notice = (f"member removed: {key_id} (forward separation only: "
                   f"{L.REVOCATION_LIMITATION})")
         self._queue_notice(pool_id, notice, kind="member_removed")

@@ -331,6 +331,20 @@ def test_no_invite_surface():
     assert "_invite_bound_key" not in dir(_t.PoolService)
 
 
+def test_remove_member_revokes_whitelisted_discord_id(tmp_path):
+    """WO-020: /pool remove revokes the removed member's whitelist access.
+
+    The Discord id is bound via pool_memberships (first-claim binding),
+    NOT identities.discord_user_id (Phase 1 removed that writer).
+    """
+    conn, svc, friend_svc, maint, friend = world(tmp_path)
+    import ledger as L
+    L.bind_membership(conn, "pool-1", FRIEND, friend.key_id)
+    assert L.is_authorized(conn, "pool-1", FRIEND) is True
+    svc.remove_member("pool-1", friend.key_id, source=src(OWNER))
+    assert L.is_authorized(conn, "pool-1", FRIEND) is False
+
+
 def test_whitelist_env_wins_over_config(monkeypatch):
     """Env AGENT_POOL_ALLOWED_USERS beats config allowed_users; owner is
     always added by sync_whitelist (checked via the resolver helper)."""
