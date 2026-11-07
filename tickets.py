@@ -28,6 +28,17 @@ STATE_MARKER = "[agent-pool:state={state}]"
 MAX_BRIEF_CHARS = 3000  # coordination payloads stay under the 4 KB guard
 
 
+def _env_get(name, default=""):
+    """Env read via the profile secret scope (see plugin ``__init__``)."""
+    try:
+        from agent.secret_scope import get_secret
+
+        val = get_secret(name, default)
+        return default if val is None else val
+    except Exception:
+        return os.environ.get(name, default)
+
+
 def _ticket_payload(ticket: dict) -> dict:
     """Forum-post body: title + mandate brief + state marker. Never repo bytes."""
     budget = json.loads(ticket.get("budget_json") or "{}")
@@ -121,10 +132,10 @@ class PoolService:
         # config > 5. No pool-level budgets.
         self._agent_task_allocations = dict(agent_task_allocations or {})
         self._env_task_allocations = _parse_env_allocations(
-            os.environ.get("AGENT_POOL_TASK_ALLOCATIONS", ""))
+            _env_get("AGENT_POOL_TASK_ALLOCATIONS", ""))
         # Maintainer Discord id from config (threaded in by _service_for);
         # AGENT_POOL_MAINTAINER_DISCORD_USER_ID env beats config.
-        _maint_env = os.environ.get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "").strip()
+        _maint_env = _env_get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "").strip()
         if _maint_env:
             self._maintainer_discord_user_id = _maint_env
         else:
@@ -134,7 +145,7 @@ class PoolService:
         # The agent's configured checkout root for per-ticket worktrees.
         self._worktree_root = (
             worktree_root
-            or os.environ.get("AGENT_POOL_WORKTREE_ROOT", "").strip()
+            or _env_get("AGENT_POOL_WORKTREE_ROOT", "").strip()
             or "/tmp/agent-pool-worktrees").rstrip("/")
 
     def _allocation_for(self, key_id) -> int:
@@ -466,7 +477,7 @@ class PoolService:
         discord_user_id = (
             str(maintainer_discord_user_id).strip()
             or getattr(self, "_maintainer_discord_user_id", "")
-            or os.environ.get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "").strip())
+            or _env_get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "").strip())
         if not discord_user_id:
             raise ValueError("register needs maintainer_discord_user_id: set it in config or AGENT_POOL_MAINTAINER_DISCORD_USER_ID")
         maintainer = key_id or self._caller_key_id

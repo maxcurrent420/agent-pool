@@ -29,6 +29,22 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _env_get(name, default=""):
+    """Read a plugin env var via the profile secret scope.
+
+    Falls back to the process env when no scope/module is available
+    (tests / standalone); ``UnscopedSecretError`` and missing setups
+    are treated as unset rather than crashing command handling.
+    """
+    try:
+        from agent.secret_scope import get_secret
+
+        val = get_secret(name, default)
+        return default if val is None else val
+    except Exception:
+        return os.environ.get(name, default)
+
+
 def _cfg(ctx, key, default):
     try:
         return ctx.get_config(key, default=default)
@@ -106,7 +122,7 @@ def _pool_status(args=None, **kwargs):
         # relay_url is deprecated/ignored: no relay in the connection
         # path. Kept as "" for shape compatibility.
         relay_url = ""
-        env_relay = os.environ.get("HERMES_IROH_RELAY", "").strip()
+        env_relay = _env_get("HERMES_IROH_RELAY", "").strip()
         legacy_relay = _legacy_relay_pools(ctx)
         budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
             ("max_turns", 25), ("max_tasks_per_day", 5),
@@ -192,7 +208,13 @@ def _pool_status(args=None, **kwargs):
             pass
         return json.dumps(status)
     except Exception as exc:  # never raise from a handler
-        return json.dumps({"ok": False, "error": str(exc)})
+        return json.dumps({"ok": False, "code": "status_unavailable",
+                           "error_code": "status_unavailable",
+                           "error": str(exc),
+                           "fix": "check pool_status again after the Tor "
+                                 "unit is running (systemctl start "
+                                 "agent-pool-tor); byte transfers fail "
+                                 "closed until tor_ready() passes"})
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +230,7 @@ def _whitelist_user_ids(ctx):
     ``L.sync_whitelist`` always ensures the owner. Empty result means the
     owner is the only authorized user.
     """
-    env = os.environ.get("AGENT_POOL_ALLOWED_USERS", "")
+    env = _env_get("AGENT_POOL_ALLOWED_USERS", "")
     if env.strip():
         return [u.strip() for u in str(env).split(",") if u.strip()]
     cfg = _cfg(ctx, "allowed_users", []) if ctx else []
@@ -225,7 +247,7 @@ def _maintainer_discord_user_id(ctx):
     Source order: ``AGENT_POOL_MAINTAINER_DISCORD_USER_ID`` when
     non-empty, else the ``maintainer_discord_user_id`` config key.
     """
-    env = os.environ.get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "")
+    env = _env_get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "")
     if env.strip():
         return env.strip()
     cfg = _cfg(ctx, "maintainer_discord_user_id", "") if ctx else ""
@@ -354,7 +376,9 @@ def _result(payload, svc=None, source=None) -> str:
 def _error(exc) -> str:
     code = getattr(exc, "error_code", None) or "error"
     detail = getattr(exc, "detail", None) or str(exc)
-    payload = {"ok": False, "error": str(exc)}
+    payload = {"ok": False, "code": code, "error": str(exc),
+               "fix": ("check pool_status for Tor readiness; if Tor is "
+                       "down, start the agent-pool-tor unit and retry")}
     if code != "error":
         payload["error_code"] = code
         payload["detail"] = detail
@@ -673,7 +697,10 @@ def _pool_report_usage(args=None, **kwargs):
         svc = _service_for(ctx)
         claim_id = str(args.get("claim_id", "") or "").strip()
         if not claim_id:
-            return json.dumps({"ok": False, "error": "pool_report_usage needs claim_id"})
+            return json.dumps({"ok": False, "code": "missing_argument",
+                               "error_code": "missing_argument",
+                               "error": "pool_report_usage needs claim_id",
+                               "fix": "pass claim_id from the /claim result"})
         row = svc.report_usage(
             claim_id, turns=int(args.get("turns", 0) or 0),
             tokens=int(args.get("tokens", 0) or 0),
@@ -683,7 +710,13 @@ def _pool_report_usage(args=None, **kwargs):
                            "tokens_used": row.get("tokens_used", 0),
                            "wall_seconds_used": row.get("wall_seconds_used", 0)})
     except Exception as exc:  # never raise from a handler
-        return json.dumps({"ok": False, "error": str(exc)})
+        code = getattr(exc, "error_code", None) or "error"
+        return json.dumps({"ok": False, "code": code,
+                           "error_code": code,
+                           "error": str(exc),
+                           "fix": "pass a valid claim_id from an active "
+                                 "claim; check pool_status for Tor "
+                                 "readiness if the claim lookup failed"})
 
 
 _POOL_STATUS_SCHEMA = {
@@ -732,6 +765,17 @@ def _wrap_command(handler, ctx):
                 import ledger as _L
             except Exception:
                 _L = None
+        if _L is None:
+            # Ledger unavailable: fail closed — never run the handler
+            # without the freeze/whitelist guard.
+            return _result({"ok": False, "error_code": "guard_unavailable",
+                            "code": "guard_unavailable",
+                            "error": "pool guard unavailable: ledger could "
+                                     "not be loaded; refusing to run the "
+                                     "command without freeze/whitelist "
+                                     "checks",
+                            "fix": "check pool_status / plugin-data "
+                                   "readiness and retry"})
         if _L is not None:
             try:
                 svc = _service_for(ctx, source=source)
@@ -816,8 +860,11 @@ def _wrap_command(handler, ctx):
                             frozen = True
                         elif resolved and _L.is_frozen(svc._conn, resolved):
                             frozen = True
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Freeze state could not be determined: fail
+                        # closed via the outer guard (never run unfrozen).
+                        raise RuntimeError(
+                            f"freeze check unavailable: {exc}") from exc
                     if frozen:
                         try:
                             _L.record_event(svc._conn, resolved or None, "freeze_blocked",
@@ -854,38 +901,57 @@ def _wrap_command(handler, ctx):
                         elif handler.__name__ == "_handle_pool" and sub in ("remove",):
                             return _result({"ok": False, "error_code": "unauthorized",
                                             "error": "not authorized — ask the maintainer"})
-            except Exception:
-                pass  # Freeze guard is best-effort; handler still runs.
+            except Exception as exc:
+                # Fail closed: a guard failure (service/pool resolution,
+                # DB error, Tor-gate refusal) must never let the handler
+                # run without freeze + whitelist checks.
+                return _result({"ok": False, "error_code": "guard_unavailable",
+                                "code": "guard_unavailable",
+                                "error": f"pool guard unavailable: {exc}",
+                                "fix": "check pool_status for Tor/ledger "
+                                       "readiness; if Tor is down, start "
+                                       "the agent-pool-tor unit and retry"})
         return handler(ctx, raw, source=source, session_id=session_id,
                        session_key=session_key, platform=platform)
     return wrapped
 
 
+def _register_tool_compat(ctx, **kwargs):
+    """Call ``ctx.register_tool`` with only kwargs its signature accepts.
+
+    Filters via ``inspect.signature`` so an unsupported kwarg on a
+    future host cannot turn into a TypeError that drops all tools.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(ctx.register_tool).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if params and not any(p.kind == inspect.Parameter.VAR_KEYWORD
+                          for p in params.values()):
+        kwargs = {k: v for k, v in kwargs.items() if k in params}
+    return ctx.register_tool(**kwargs)
+
+
 def register(ctx):
     """Wire the full gateway-native surface.
 
-    Hard tor gate for the real backend: tor_ready() must pass at
-    plugin registration or TorNotReady is raised as a clear startup
-    error (fail closed, no fallback). The fake backend (tests/CLI
-    only) is exempt. Tool/command wiring itself remains fail-soft.
+    Registration is pure wiring (fast, offline): it must load with
+    all tools/commands even when the Tor sidecar is absent. The Tor
+    gate is lazy — ``_service_for`` (and the transport's per-transfer
+    ``_require_tor_ready``) fails closed at first use / actual byte
+    transfer, and ``pool_status.tor.ready`` surfaces readiness.
     """
-    _transport_name = _cfg(ctx, "transport", "real") if ctx else "real"
-    if _transport_name != "fake":
-        try:
-            from .transport import tor_ready as _gate_tor_ready
-        except ImportError:
-            from transport import tor_ready as _gate_tor_ready
-        _control, _socks, _tor_binary = _tor_config(ctx)
-        # Raises TorNotReady naming the unit — surfaced, not swallowed.
-        _gate_tor_ready(control_port=_control, socks_port=_socks,
-                        binary=_tor_binary)
     try:
-        ctx.register_tool(name="pool_status", toolset="agent_pool",
-                          schema=_POOL_STATUS_SCHEMA,
-                          handler=lambda args=None, **kw: _pool_status(args, ctx=ctx, **kw))
-        ctx.register_tool(name="pool_report_usage", toolset="agent_pool",
-                          schema=_POOL_REPORT_USAGE_SCHEMA,
-                          handler=lambda args=None, **kw: _pool_report_usage(args, ctx=ctx, **kw))
+        _register_tool_compat(
+            ctx, name="pool_status", toolset="agent_pool",
+            schema=_POOL_STATUS_SCHEMA,
+            handler=lambda args=None, **kw: _pool_status(args, ctx=ctx, **kw))
+        _register_tool_compat(
+            ctx, name="pool_report_usage", toolset="agent_pool",
+            schema=_POOL_REPORT_USAGE_SCHEMA,
+            handler=lambda args=None, **kw: _pool_report_usage(args, ctx=ctx, **kw))
     except Exception as exc:
         logger.warning("agent-pool: tool registration failed: %s", exc)
     for name, handler, description, args_hint in _COMMANDS:

@@ -2,19 +2,23 @@
 # This file does NOT belong to the agent-pool plugin repo's source tree —
 # it must be added as plugin-catalog/agent-pool.yaml in the hermes-agent
 # repository via PR (human-merged gate). It is kept here so the owner can
-# copy it verbatim. The sha pins the WO-025 code commit (01ea88e); bump it
+# copy it verbatim. The sha pins the code commit (b4c5f67); bump it
 # in the hermes-agent PR whenever the plugin advances.
 name: agent-pool
 repo: https://github.com/maxcurrent420/agent-pool
-sha: 01ea88eed8c2704ea1a001f525db45374a331d56
+sha: b4c5f67d14ac2cad7c4f83f44adb1c0e63e28d40
 description: >-
-  Agent Pool — friends form an agent team: repos propagate via Iroh (QUIC,
-  BLAKE3-verified bearer tickets via send_hermes), coordination only via
-  the Hermes gateway. Gateway-native: the plugin does NOT post to Discord —
-  it returns content that Hermes posts. Passive plumbing (no timers, no
-  observation, no execution); one pool per gateway, and the pool maintainer
-  is the gateway owner (the maintainer registered the pool on this gateway;
-  acceptance happens on the maintainer gateway only). Access is a whitelist,
+  Agent Pool — friends form an agent team: repos propagate via Iroh-over-Tor
+  only (Iroh + Tor custom transport via the tor-enabled send_hermes sidecar;
+  Tor-mandatory — no relay fallback, fails closed at first use / byte
+  transfer, never at plugin registration), coordination only via the Hermes
+  gateway. Gateway-native: the plugin does NOT post to Discord — it returns
+  content that Hermes posts. Passive plumbing (no timers, no observation, no
+  execution); one pool per gateway, and the pool maintainer is the gateway
+  owner (the maintainer registered the pool on this gateway; acceptance
+  happens on the maintainer gateway only). Surface: 2 tools (pool_status,
+  pool_report_usage) and 10 slash commands (pool, fetch, task, add-repo,
+  task_add, task_list, claim, release, push, audit). Access is a whitelist,
   not an invite: the pool owner (maintainer_discord_user_id) is always
   authorized; additional Discord users arrive via env
   AGENT_POOL_ALLOWED_USERS or the allowed_users config. Budgets belong to
@@ -33,15 +37,13 @@ description: >-
   chain verification happens on the hosted-pool fetch only. Per-version
   DEK wrapping per member, sandbox audit gate (audit-on-push), global
   freeze kill-switch, pool_not_local refusal for foreign pools. Task
-  lifecycle: open / claimed / completed. Transport: Iroh-over-Tor
-  only (Iroh + Tor custom transport via sidecar; hard-gated, fails
-  closed, no relay fallback).
+  lifecycle: open / claimed / completed.
   Disclosure — spawns git/bubblewrap/send_hermes child processes; network
   calls go to Iroh peers over Tor (no relay in the connection path;
   HERMES_IROH_RELAY is ignored — there is no relay or direct mode);
-  reads profile plugin-data dir for
-  ledger, identities, worktrees; stores ed25519/box keys under the plugin
-  data dir; no telemetry, no stored credentials beyond its own keypairs.
+  reads profile plugin-data dir for ledger, identities, worktrees; stores
+  ed25519/box keys under the plugin data dir; no telemetry, no stored
+  credentials beyond its own keypairs.
 maintainer: maxcurrent420
 tier: community
 category: tools
@@ -53,6 +55,26 @@ capabilities:
   provides_tools:
     - pool_status
     - pool_report_usage
+  provides_commands:
+    - pool
+    - fetch
+    - task
+    - add-repo
+    - task_add
+    - task_list
+    - claim
+    - release
+    - push
+    - audit
   provides_hooks: []
   provides_middleware: []
-  requires_env: []
+  requires_env:
+    - AGENT_POOL_ALLOWED_USERS
+    - AGENT_POOL_MAINTAINER_DISCORD_USER_ID
+    - AGENT_POOL_TASK_ALLOCATIONS
+    - AGENT_POOL_WORKTREE_ROOT
+    - AGENT_POOL_DATA_DIR
+    - HERMES_IROH_RELAY
+    - HERMES_IROH_STATE_DIR
+    - HERMES_IROH_SEND_TIMEOUT
+    - HERMES_IROH_FETCH_TIMEOUT

@@ -47,7 +47,8 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
    systemctl start agent-pool-tor
    ```
    Tor is mandatory: without it the plugin fails closed at service
-   construction, plugin registration, and pool registration. There
+   construction (lazy, first use) and pool registration; plugin
+   registration is pure wiring and loads even with Tor down. There
    is no relay mode.
 
 ## Config

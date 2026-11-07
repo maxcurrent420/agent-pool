@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-pool"
+version = "2.7.0"
+description = "Agent Pool — friends form an agent team; repos propagate via Iroh-over-Tor only (Tor-mandatory, gateway-native Hermes plugin)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pynacl>=1.5,<2",
+    "blake3>=0.4,<2",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pyyaml>=6",
+]
+
+[tool.setuptools]
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

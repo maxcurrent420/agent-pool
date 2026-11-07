@@ -11,6 +11,40 @@ import sqlite3
 import time
 from pathlib import Path
 
+
+def _env_get(name, default=""):
+    """Env read via the profile secret scope (see plugin ``__init__``)."""
+    try:
+        from agent.secret_scope import get_secret
+
+        val = get_secret(name, default)
+        return default if val is None else val
+    except Exception:
+        return os.environ.get(name, default)
+
+
+def _plugin_base_dir() -> Path:
+    """Profile-aware plugin data dir.
+
+    Order: ``AGENT_POOL_DATA_DIR`` override, Hermes
+    ``plugin_data_dir("agent-pool")``, ``$HERMES_HOME/plugin-data``,
+    then the legacy ``~/.hermes`` fallback (tests / standalone).
+    """
+    override = _env_get("AGENT_POOL_DATA_DIR")
+    if override:
+        return Path(override)
+    try:
+        from plugins.plugin_storage import plugin_data_dir
+
+        return Path(plugin_data_dir("agent-pool"))
+    except Exception:
+        pass
+    hermes_home = _env_get("HERMES_HOME")
+    if hermes_home:
+        return Path(hermes_home) / "plugin-data" / "agent-pool"
+    return Path.home() / ".hermes" / "plugin-data" / "agent-pool"
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pools (
     pool_id TEXT PRIMARY KEY,
@@ -282,8 +316,7 @@ def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
 
 
 def default_db_path() -> Path:
-    override = os.environ.get("AGENT_POOL_DATA_DIR")
-    base = Path(override) if override else Path.home() / ".hermes" / "plugin-data" / "agent-pool"
+    base = _plugin_base_dir()
     base.mkdir(parents=True, exist_ok=True)
     return base / "data.db"
 

@@ -317,8 +317,9 @@ Env vars: `HERMES_IROH_STATE_DIR`,
    `apt install tor` + `scripts/install-tor.sh` (writes `ops/torrc`,
    builds the tor-enabled sidecar, enables the tor service). Both
    endpoints in a pool must enable Tor; the plugin fails closed at
-   service construction, plugin registration, and pool registration
-   until then. No relay fallback exists.
+   service construction (lazy, first use) and pool registration
+   until then — plugin registration itself is pure wiring and loads
+   even with Tor down. No relay fallback exists.
 4. Symlink the plugin into `~/.hermes/plugins/agent-pool`.
 
 ## Tests / Demo

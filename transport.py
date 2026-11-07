@@ -44,6 +44,32 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+
+def _env_get(name, default=""):
+    """Env read via the profile secret scope (see plugin ``__init__``)."""
+    try:
+        from agent.secret_scope import get_secret
+
+        val = get_secret(name, default)
+        return default if val is None else val
+    except Exception:
+        return os.environ.get(name, default)
+
+
+def _hermes_home_dir() -> Path:
+    """Profile-aware Hermes home (never hard-codes ``~/.hermes``)."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:
+        pass
+    home = _env_get("HERMES_HOME")
+    if home:
+        return Path(home)
+    return Path.home() / ".hermes"
+
+
 _TICKET_RE = re.compile(r"(?:sendme receive )([a-z0-9]{20,})|\b(blob[a-z0-9]{40,})\b",
                         re.IGNORECASE)
 _HASH_RE = re.compile(r"hash ([0-9a-f]{16,})")
@@ -309,8 +335,8 @@ class RealSendHermesTransport(TransportBackend):
         self.tor_control_port = int(tor_control_port)
         self.tor_socks_port = int(tor_socks_port)
         self.tor_binary = (str(tor_binary).strip() if tor_binary else "") or None
-        env_dir = os.environ.get("HERMES_IROH_STATE_DIR")
-        base = Path(state_dir or env_dir or Path.home() / ".hermes" / "iroh-interconnect")
+        env_dir = _env_get("HERMES_IROH_STATE_DIR")
+        base = Path(state_dir or env_dir or _hermes_home_dir() / "iroh-interconnect")
         self._state_dir = base
         self._state_dir.mkdir(parents=True, exist_ok=True)
         self._providers: dict[str, dict] = {}
@@ -374,7 +400,7 @@ class RealSendHermesTransport(TransportBackend):
         )
         ticket = None
         content_hash = None
-        timeout = max(20, int(os.environ.get("HERMES_IROH_SEND_TIMEOUT", "90")))
+        timeout = max(20, int(_env_get("HERMES_IROH_SEND_TIMEOUT", "90")))
         deadline = time.time() + timeout
         while time.time() < deadline:
             output = log_path.read_text(encoding="utf-8", errors="replace")
@@ -416,7 +442,7 @@ class RealSendHermesTransport(TransportBackend):
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True, cwd=str(dest),
         )
-        timeout = int(os.environ.get("HERMES_IROH_FETCH_TIMEOUT", "600"))
+        timeout = int(_env_get("HERMES_IROH_FETCH_TIMEOUT", "600"))
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:

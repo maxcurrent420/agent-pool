@@ -10,8 +10,8 @@ above the gigabyte range are out of scope for the current design.
 
 There is no relay fallback and no relay option. `transport_mode=tor`
 is the only valid value; `tor_ready()` is a hard gate at service
-construction, plugin registration, and pool registration and fails
-closed. To use any other transport (including re-adding a relay) you
+construction (lazy, first use) and pool registration and fails
+closed; plugin registration is pure wiring and never probes Tor. To use any other transport (including re-adding a relay) you
 must fork and edit the source (`VALID_MODES` / `normalize_mode` in
 `transport.py`, the argv builders, and the tor gate) — there is no
 config flip that downgrades the transport. A legacy top-level

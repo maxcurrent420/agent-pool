@@ -62,4 +62,6 @@ def test_oversize_reply_surfaces_as_clean_error_json():
     except Exception as exc:  # the exact handler pattern
         out = plugin._error(exc)
     parsed = json.loads(out)
-    assert parsed == {"ok": False, "error": "reply exceeds 4096-byte gateway limit"}
+    assert parsed["ok"] is False
+    assert parsed["error"] == "reply exceeds 4096-byte gateway limit"
+    assert parsed["code"] and parsed["fix"]

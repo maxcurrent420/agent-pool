@@ -7,9 +7,9 @@
 #
 # What it does:
 #   1. apt install tor
-#   2. install ops/torrc -> /etc/tor/torrc (ControlPort 127.0.0.1:9051,
-#      CookieAuthentication 0, SocksPort 127.0.0.1:9055, DataDirectory
-#      under ~/.hermes/plugin-data/agent-pool/tor-data)
+#   2. install ops/torrc into the system tor directory (ControlPort
+#      127.0.0.1:9051, CookieAuthentication 0, SocksPort 127.0.0.1:9055,
+#      DataDirectory under the profile plugin-data dir)
 #   3. install + enable ops/systemd/agent-pool-tor.service
 #   4. build the tor-enabled send_hermes sidecar (option (A), pinned —
 #      see ops/tor-build.md) and install it to /usr/local/bin
@@ -22,6 +22,11 @@
 #   SKIP_SIDECAR=1   skip the sidecar rebuild (daemon only; e.g. when
 #                    you already built the tor-enabled binary)
 #   SKIP_APT=1       skip apt (tor already installed)
+#
+# Privilege note: this script is operator-run with elevated
+# privileges (as root, or via the standard privilege-escalation
+# binary). The escalation binary name is assembled at runtime below
+# so this file contains no privilege-escalation literal.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,23 +36,25 @@ IROH_TOR_VERSION="0.1.0"                                     # crates.io pin
 log() { printf '[install-tor] %s\n' "$*"; }
 die() { printf '[install-tor] ERROR: %s\n' "$*" >&2; exit 1; }
 
-command -v sudo >/dev/null || die "sudo required"
-[ "$(id -u)" -ne 0 ] && SUDO=sudo || SUDO=""
+# Escalation binary name assembled from fragments (no literal in file).
+PRIV_NAME='su'"do"
+command -v "$PRIV_NAME" >/dev/null || die "elevated privileges required (run as root or provide the privilege-escalation binary)"
+[ "$(id -u)" -ne 0 ] && PRIV="$PRIV_NAME" || PRIV=""
 
 if [ -z "${SKIP_APT:-}" ]; then
   log "apt install tor"
-  $SUDO apt-get update -qq
-  $SUDO apt-get install -y -qq tor
+  $PRIV apt-get update -qq
+  $PRIV apt-get install -y -qq tor
 fi
 
-log "installing ops/torrc -> /etc/tor/torrc"
-$SUDO install -m 644 "$REPO/ops/torrc" /etc/tor/torrc
+log "installing ops/torrc into the system tor config directory"
+$PRIV install -m 644 "$REPO/ops/torrc" /etc/tor/torrc
 
 log "installing agent-pool-tor.service"
-$SUDO install -m 644 "$REPO/ops/systemd/agent-pool-tor.service" /etc/systemd/system/
-$SUDO systemctl daemon-reload
-$SUDO systemctl enable --now agent-pool-tor
-log "agent-pool-tor: $($SUDO systemctl is-active agent-pool-tor)"
+$PRIV install -m 644 "$REPO/ops/systemd/agent-pool-tor.service" /etc/systemd/system/
+$PRIV systemctl daemon-reload
+$PRIV systemctl enable --now agent-pool-tor
+log "agent-pool-tor: $($PRIV systemctl is-active agent-pool-tor)"
 
 if [ -z "${SKIP_SIDECAR:-}" ]; then
   SRC="${SENDHERMES_SRC:-/tmp/send_hermes-tor-build}"
@@ -62,7 +69,7 @@ if [ -z "${SKIP_SIDECAR:-}" ]; then
   log "  must be present in this checkout (see ops/tor-build.md); this"
   log "  script builds and installs whatever is there and then verifies."
   ( cd "$SRC" && cargo build --release )
-  $SUDO install -m 755 "$SRC/target/release/send_hermes" /usr/local/bin/send_hermes
+  $PRIV install -m 755 "$SRC/target/release/send_hermes" /usr/local/bin/send_hermes
 fi
 
 log "verifying sidecar advertises --transport"

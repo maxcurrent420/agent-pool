@@ -273,7 +273,7 @@ def test_release_version_is_2_7_0_everywhere_except_migration_guard():
     for fname in RELEASE_REF_FILES:
         assert "2.6.0" not in (ROOT / fname).read_text(), (
             f"{fname} still references the 2.6.0 release version")
-    assert (ROOT / "plugin.yaml").read_text().splitlines()[1].strip() == "version: 2.7.0"
+    assert (ROOT / "plugin.yaml").read_text().splitlines()[1].strip() == 'version: "2.7.0"'
 
 
 def test_budget_wording_matches_agent_allocation_model():

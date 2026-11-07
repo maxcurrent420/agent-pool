@@ -1,6 +1,17 @@
 name: agent-pool
-version: 2.7.0
-description: Agent Pool — friends form an agent team; repos propagate via Iroh, coordination only via the gateway
+version: "2.7.0"
+description: >-
+  Agent Pool — friends form an agent team; repos propagate via Iroh-over-Tor
+  only (Iroh + Tor custom transport via the tor-enabled send_hermes sidecar;
+  Tor-mandatory, no relay fallback, fails closed at first use / byte
+  transfer, never at plugin registration). Coordination only via the Hermes
+  gateway: 2 tools (pool_status, pool_report_usage) and 10 slash commands
+  (pool, fetch, task, add-repo, task_add, task_list, claim, release, push,
+  audit — see provides_commands). Disclosure: spawns git/bubblewrap/send_hermes
+  child processes; network calls go to Iroh peers over Tor (no relay in the
+  connection path; HERMES_IROH_RELAY is ignored); stores its own ed25519/box
+  keypairs and ledger under the profile plugin-data dir; no telemetry, no
+  stored credentials beyond its own keypairs.
 manifest_version: 2
 api_version: 1
 license: MIT
@@ -9,9 +20,30 @@ requires_hermes: ">=0.22.0"
 python_dependencies:
   - "pynacl>=1.5,<2"
   - "blake3>=0.4,<2"
+requires_env:
+  - AGENT_POOL_ALLOWED_USERS
+  - AGENT_POOL_MAINTAINER_DISCORD_USER_ID
+  - AGENT_POOL_TASK_ALLOCATIONS
+  - AGENT_POOL_WORKTREE_ROOT
+  - AGENT_POOL_DATA_DIR
+  - HERMES_IROH_RELAY
+  - HERMES_IROH_STATE_DIR
+  - HERMES_IROH_SEND_TIMEOUT
+  - HERMES_IROH_FETCH_TIMEOUT
 provides_tools:
   - pool_status
   - pool_report_usage
+provides_commands:
+  - pool
+  - fetch
+  - task
+  - add-repo
+  - task_add
+  - task_list
+  - claim
+  - release
+  - push
+  - audit
 provides_hooks: []
 config_schema:
   relay_url:
@@ -21,11 +53,11 @@ config_schema:
   transport_mode:
     type: str
     default: "tor"
-    description: "Repo-byte transport: 'tor' only — Iroh Tor custom transport via the tor-enabled send_hermes sidecar (option (A), scripts/install-tor.sh); connection paths are onion-routed, neither peer learns the other's IP, and there is no relay in the connection path. Both endpoints must enable Tor; the tor_ready() probe is a hard gate at service construction, plugin registration, and pool registration and fails closed (systemctl start agent-pool-tor) — there is no relay fallback and no relay option. Any other value, including legacy 'relay' at the transport layer, is rejected; a legacy top-level transport_mode=relay in plugin config is ignored (treated as tor) with a migration warning in pool_status. Fork the source to change the transport. HERMES_IROH_RELAY is ignored."
+    description: "Repo-byte transport: 'tor' only — Iroh Tor custom transport via the tor-enabled send_hermes sidecar (option (A), scripts/install-tor.sh); connection paths are onion-routed, neither peer learns the other's IP, and there is no relay in the connection path. Both endpoints must enable Tor; the tor_ready() probe is a hard gate at service construction (lazy, first use) and before every transfer and fails closed (systemctl start agent-pool-tor) — plugin registration itself is pure wiring and never probes Tor; there is no relay fallback and no relay option. Any other value, including legacy 'relay' at the transport layer, is rejected; a legacy top-level transport_mode=relay in plugin config is ignored (treated as tor) with a migration warning in pool_status. Fork the source to change the transport. HERMES_IROH_RELAY is ignored."
   tor_control_port:
     type: int
     default: 9051
-    description: "Tor control port (127.0.0.1 only, CookieAuthentication 0, ops/torrc). Probed by tor_ready() at service construction, plugin registration, and before every transfer; failure names 'systemctl start agent-pool-tor' and fails closed."
+    description: "Tor control port (127.0.0.1 only, CookieAuthentication 0, ops/torrc). Probed by tor_ready() at service construction (lazy, first use) and before every transfer; failure names 'systemctl start agent-pool-tor' and fails closed. Never probed at plugin registration."
   tor_socks_port:
     type: int
     default: 9055
@@ -69,5 +101,4 @@ config_schema:
   transport:
     type: str
     default: "real"
-    description: "Bundle transport: real (send_hermes/Iroh over Tor, gated by tor_ready()) or fake (in-memory, tests/CLI only; exempt from the tor gate)"
-
+    description: "Bundle transport: real (send_hermes/Iroh over Tor, gated by tor_ready() at first use) or fake (in-memory, tests/CLI only; exempt from the tor gate)"

@@ -1,6 +1,7 @@
-"""Tor hard gate: service construction, plugin registration, pool
-registration fail closed when Tor is not ready (real backend only;
-fake backend is test-only and exempt). No live Discord / no real Tor
+"""Tor hard gate: service construction and pool registration fail closed
+when Tor is not ready (real backend only; fake backend is test-only and
+exempt). Plugin register() is pure wiring and must load even with Tor
+down (lazy gate at first use). No live Discord / no real Tor
 daemon required — tor_ready is monkeypatched.
 """
 import importlib.util
@@ -75,13 +76,18 @@ def test_service_for_fake_backend_exempt(monkeypatch, tmp_path):
     assert isinstance(svc._transport, FakeTransport)
 
 
-def test_plugin_register_real_backend_raises_on_tor_down(monkeypatch):
+def test_plugin_register_real_backend_ok_on_tor_down(monkeypatch):
+    # H1: register() must wire all tools/commands even when the Tor
+    # sidecar is down — the gate is lazy (service construction /
+    # byte transfer), never at registration.
     import transport as transport_mod
     monkeypatch.setattr(transport_mod, "tor_ready", _boom)
     monkeypatch.setattr("transport.tor_ready", _boom, raising=False)
     plugin = _load_plugin()
-    with pytest.raises(TorNotReady, match="agent-pool-tor"):
-        plugin.register(_Ctx({"transport": "real"}))
+    ctx = _Ctx({"transport": "real"})
+    plugin.register(ctx)
+    assert "pool_status" in ctx.tools and "pool_report_usage" in ctx.tools
+    assert len(ctx.commands) == 10
 
 
 def test_plugin_register_fake_backend_ok(monkeypatch):

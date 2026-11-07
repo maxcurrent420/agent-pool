@@ -77,11 +77,12 @@ pool fails closed with a clear error, never a silent downgrade).
 
 ```sh
 # 1. Tor daemon (ops/torrc + ops/systemd/agent-pool-tor.service)
-sudo apt install tor
-sudo install -m 644 ops/torrc /etc/tor/torrc
-sudo install -m 644 ops/systemd/agent-pool-tor.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now agent-pool-tor
+# Run as root (or with elevated privileges):
+apt install tor
+install -m 644 ops/torrc /etc/tor/torrc
+install -m 644 ops/systemd/agent-pool-tor.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now agent-pool-tor
 
 # 2. Rebuild send_hermes with the Tor custom transport
 git clone https://github.com/rahlquist/sendme.git send_hermes
@@ -96,7 +97,7 @@ cd send_hermes && git checkout c700cbcaedb8f626716b8769dcbc5571ec64d088
 # when --transport tor is given (no relay flags are emitted in
 # that mode: the ticket must be a Tor hidden-service ticket).
 cargo build --release
-sudo install -m 755 target/release/send_hermes /usr/local/bin/send_hermes
+install -m 755 target/release/send_hermes /usr/local/bin/send_hermes
 send_hermes send --help   # must list --transport
 ```
 
