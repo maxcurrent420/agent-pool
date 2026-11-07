@@ -678,6 +678,78 @@ class PoolService:
         except Exception:
             return None
 
+    def _caller_box_pubkey_hex(self) -> str:
+        if self._caller_box_sk is None:
+            return ""
+        try:
+            return self._caller_box_sk.public_key.encode().hex()
+        except Exception:
+            return ""
+
+    def _caller_verify_key_hex(self) -> str:
+        if self._caller_sk is None:
+            return ""
+        try:
+            return self._caller_sk.verify_key.encode().hex()
+        except Exception:
+            return ""
+
+    def _ensure_member(self, pool_id, key_id) -> None:
+        """Provision the ``members`` row for a key (DEK-wrap registry).
+
+        The whitelist authorizes the Discord id, and first-claim binds
+        it to a key — but DEKs are wrapped per ``members`` row, and in
+        production nothing except ``register_pool`` ever wrote one.
+        Without this row, a whitelisted/bound user gets no wrapped DEK
+        in future repo versions and cannot fetch bytes. Call this for
+        the bound/presented key at claim time.
+
+        Box/verify keys come from, in order: the existing member row,
+        the recorded ``identities`` row, or the live caller identity
+        when ``key_id`` is this gateway's own key. Never clobbers a
+        non-empty recorded value. Only a local caller key can be
+        provisioned with a box pubkey here; a foreign key with no
+        recorded pubkey still gets a row (future versions skip
+        wrapping it until a pubkey is recorded, exactly as a member
+        with an empty ``box_pubkey_hex`` is skipped today).
+
+        Limitation: this cannot create a wrapped DEK for a repo
+        version that was submitted BEFORE this key was provisioned —
+        the DEK plaintext is gone by then. The user waits for the
+        next version (noted in the ``add_repo`` notice).
+        """
+        key_id = str(key_id or "").strip()
+        if not pool_id or not key_id:
+            return
+        existing = self._conn.execute(
+            "SELECT role, box_pubkey_hex, verify_pubkey_hex FROM members"
+            " WHERE pool_id=? AND key_id=?", (pool_id, key_id)).fetchone()
+        role = (existing[0] if existing and existing[0] else None)
+        box = (existing[1] if existing and existing[1] else "")
+        verify = (existing[2] if existing and existing[2] else "")
+        if not box or not verify:
+            try:
+                irow = self._conn.execute(
+                    "SELECT box_pubkey_hex, verify_key_hex FROM identities"
+                    " WHERE key_id=?", (key_id,)).fetchone()
+            except Exception:
+                irow = None
+            if irow:
+                box = box or (irow[0] or "")
+                verify = verify or (irow[1] or "")
+        if key_id == self._caller_key_id:
+            box = box or self._caller_box_pubkey_hex()
+            verify = verify or self._caller_verify_key_hex()
+        if not role:
+            prow = self._conn.execute(
+                "SELECT maintainer_key_id FROM pools WHERE pool_id=?",
+                (pool_id,)).fetchone()
+            role = "maintainer" if (prow and prow[0] == key_id) else "member"
+        if existing and box == (existing[1] or "") and verify == (existing[2] or "") and role == existing[0]:
+            return
+        L.add_member(self._conn, pool_id, key_id, role=role,
+                     box_pubkey_hex=box or "", verify_pubkey_hex=verify or "")
+
     def _require_owner(self, pool_id, source) -> None:
         # No legacy skip: absence of an owner row = refusal.
         # Phase 2: owner == (Discord owner) AND (same gateway). The gateway
@@ -738,6 +810,9 @@ class PoolService:
                       display_name=display_name or None,
                       submitter_key_id=self._caller_key_id or None)
         version = L.next_repo_version(self._conn, repo_id)
+        # Persist the submitting gateway's member row so manifests
+        # wrap the DEK for it even if no claim has provisioned it.
+        self._ensure_member(pool_id, self._caller_key_id)
         prop = self._propagator(pool_id)
         submitter = prop._members.get(self._caller_key_id)
         if submitter is None:
@@ -890,6 +965,14 @@ class PoolService:
             worktree_path=worktree_path, branch=branch, base_ref=base_ref)
         if not bound and user_id and key:
             L.bind_membership(self._conn, ticket["pool_id"], user_id, key)
+        if user_id and key:
+            # Provision the crypto member row so FUTURE repo versions
+            # wrap a DEK for this user's bound key. Without it the
+            # user is whitelisted+bound yet has no wrapped DEK and
+            # fetch refuses them. Runs on every claim (not just the
+            # first) so legacy bound users with no member row get
+            # provisioned too.
+            self._ensure_member(ticket["pool_id"], key)
         ticket = L.get_ticket(self._conn, ticket_id)
         notice = (f"{STATE_MARKER.format(state='claimed')} ticket {ticket_id} "
                   f"claimed by {key}")
@@ -1324,9 +1407,16 @@ class PoolService:
                                      verify_key_hex=row[5] or row[2] or "",
                                      box_pubkey_hex=row[3] or row[4] or "", box_sk=box_sk)
         if self._caller_key_id and self._caller_key_id not in members:
+            # The live caller identity IS a valid wrap target: it has
+            # this gateway's box key in memory. The old fallback used
+            # an EMPTY box_pubkey_hex, so submit/build_push_bundle/
+            # accept skipped wrapping for the caller and fetch
+            # refused them despite being whitelisted+bound.
             members[self._caller_key_id] = Member(
                 key_id=self._caller_key_id, role="member",
-                box_pubkey_hex="", box_sk=self._caller_box_sk)
+                verify_key_hex=self._caller_verify_key_hex(),
+                box_pubkey_hex=self._caller_box_pubkey_hex(),
+                box_sk=self._caller_box_sk)
         return members
 
     def _propagator(self, ticket_or_pool) -> RepoPropagator:
