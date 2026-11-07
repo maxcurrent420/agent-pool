@@ -64,9 +64,7 @@ def format_result(payload) -> str:
         return payload
     if payload is None:
         return ""
-    if not isinstance(payload, dict):
-        return json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
     out = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
     if len(out.encode("utf-8")) > MAX_CONTENT_BYTES:
-        out = out[:MAX_CONTENT_BYTES - 20] + "…[truncated]"
+        raise ValueError("reply exceeds 4096-byte gateway limit")
     return out

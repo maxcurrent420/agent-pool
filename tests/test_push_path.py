@@ -242,3 +242,26 @@ def test_push_routes_over_configured_transport(tmp_path):
     out = w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
                                       manifest, source=_member_source())
     assert out["ok"] is True
+
+
+def test_push_build_bundle_rejects_non_directory_repo_path(tmp_path):
+    """Path contract: repo_path must be an existing directory on the
+    agent's gateway (Discord never carries repo bytes)."""
+    w = world(tmp_path)
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(ValueError, match="push_build_bundle: repo_path is not an existing directory"):
+        w["member_svc"].push_build_bundle(str(missing), REPO)
+    a_file = tmp_path / "a-file.txt"
+    a_file.write_text("not a dir\n")
+    with pytest.raises(ValueError, match="push_build_bundle: repo_path is not an existing directory"):
+        w["member_svc"].push_build_bundle(str(a_file), REPO)
+
+
+def test_push_build_bundle_returns_manifest_json(tmp_path):
+    """The agent reads manifest_json from the result and carries it over
+    Discord to /push repo --deliver --manifest."""
+    w = world(tmp_path)
+    bundle = w["member_svc"].push_build_bundle(w["src"], REPO)
+    assert "manifest_json" in bundle
+    assert json.loads(bundle["manifest_json"]) == bundle["manifest"]
+    assert bundle["manifest"]["transfer_ticket"] in bundle["manifest_json"]

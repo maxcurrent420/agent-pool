@@ -147,9 +147,7 @@ def test_fetch_repo_download_roundtrip(tmp_path):
     w = world(tmp_path)
     fetched = w["maint_svc"].fetch_repo(REPO, source=_owner_source())
     manifest = json.loads(fetched["manifest_json"])
-    find = PoolService(memdb(), w["transport"], caller_key_id=w["member"].key_id,
-                       caller_signing_key=w["member"].signing_key,
-                       caller_box_sk=w["member"].box_sk)
+    find = _finder_with_recorded_signer(w, tmp_path)
     dest = tmp_path / "dl"
     res = find.fetch_repo_download(manifest, dest=dest, source=_member_source())
     hello = Path(res["clone_dir"]) / "hello.txt"
@@ -200,3 +198,42 @@ def test_fetch_repo_unknown_repo(tmp_path):
     w = world(tmp_path)
     with pytest.raises(ValueError, match="no ACCEPTED version"):
         w["maint_svc"].fetch_repo("nope", source=_owner_source())
+
+
+def _finder_with_recorded_signer(w, tmp_path, host_unrelated_pool=False):
+    """Contributor gateway: fresh ledger recording only the signer's
+    verify key (identities.verify_key_hex), as a real agent gateway
+    must hold to verify the maintainer signature (D4)."""
+    conn = memdb()
+    _insert_identity(conn, w["maint"])
+    conn.commit()
+    find = PoolService(conn, w["transport"], caller_key_id=w["member"].key_id,
+                       caller_signing_key=w["member"].signing_key,
+                       caller_box_sk=w["member"].box_sk)
+    if host_unrelated_pool:
+        find.register_pool("pool-local", "Local", discord_user_id=MEMBER_USER)
+    return find
+
+
+def test_download_verifies_manifest_signature(tmp_path):
+    w = world(tmp_path)
+    fetched = w["maint_svc"].fetch_repo(REPO, source=_owner_source())
+    manifest = json.loads(fetched["manifest_json"])
+    manifest["content_hash"] = "0" * 64  # tamper: signature must fail
+    find = _finder_with_recorded_signer(w, tmp_path)
+    with pytest.raises(RuntimeError, match="fetch refused: manifest signature does not verify"):
+        find.fetch_repo_download(manifest, dest=tmp_path / "dl", source=_member_source())
+
+
+def test_download_no_local_pool_branch(tmp_path):
+    """A contributor gateway that also hosts an unrelated pool still
+    downloads the foreign repo via the wrapped-key ACL path, not the
+    local-chain path (D6)."""
+    w = world(tmp_path)
+    fetched = w["maint_svc"].fetch_repo(REPO, source=_owner_source())
+    manifest = json.loads(fetched["manifest_json"])
+    find = _finder_with_recorded_signer(w, tmp_path, host_unrelated_pool=True)
+    dest = tmp_path / "dl"
+    res = find.fetch_repo_download(manifest, dest=dest, source=_member_source())
+    hello = Path(res["clone_dir"]) / "hello.txt"
+    assert hello.read_text() == HELLO

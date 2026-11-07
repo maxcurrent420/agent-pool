@@ -318,43 +318,77 @@ class PoolService:
         using the caller's own box key (the /fetch repo --manifest
         form), over the configured transport.
 
-        Unwraps the DEK with the caller's box private key,
-        BLAKE3-verifies, clones. Manifest comes from /fetch repo on
-        the pool gateway.
+        Cross-gateway path (D6): this ALWAYS uses the wrapped-key ACL +
+        BLAKE3 path (``verify_chain=False``) — there is no local-pool
+        branch. If a local pool happens to host the repo, that is a
+        different operation (``/fetch repo`` on that gateway). Full
+        chain verification happens only on the hosted-pool ``fetch()``;
+        this download path verifies the manifest signature (D4, against
+        the signer's recorded verify key) + the wrapped-key ACL +
+        BLAKE3 content hash. Discord carries only the manifest JSON;
+        the agent on this gateway performs the download.
         """
         if not manifest:
             raise ValueError("fetch repo needs --manifest <json>")
         if not self._caller_box_sk:
             raise PermissionError("fetch repo needs the agent's own box key for DEK unwrap")
-        repo_id = manifest.get("repo_id", "repo")
-        try:
-            pool_id = self._resolve_pool(None, source=source)
-        except Exception:
-            pool_id = None
-        from propagation import Member as _M
-        members = {self._caller_key_id: _M(key_id=self._caller_key_id, role="member",
-                                           box_pubkey_hex="", box_sk=self._caller_box_sk)}
-        signer = manifest.get("signer_key_id", "")
-        if signer and signer not in members:
-            members[signer] = _M(key_id=signer, role="maintainer",
-                                 verify_key_hex="", box_pubkey_hex="", box_sk=None)
-        try:
-            prop = self._propagator(repo_id if pool_id is None else pool_id) if pool_id else None
-        except Exception:
-            prop = None
-        if prop is not None:
-            fetcher = prop._members.get(self._caller_key_id) or members[self._caller_key_id]
-            return prop.fetch(manifest=manifest, fetcher=fetcher, dest=Path(dest))
         wrapped = manifest.get("wrapped_keys") or {}
         if self._caller_key_id not in wrapped:
             raise PermissionError(
                 "fetch repo refused: caller key not in manifest wrapped_keys (only whitelisted members can decrypt)")
+        signer = manifest.get("signer_key_id", "")
+        verify_hex = self._recorded_verify_key_hex(signer)
+        if not verify_hex:
+            raise RuntimeError("fetch refused: manifest signature does not verify")
+        try:
+            from nacl.encoding import RawEncoder
+            from nacl.signing import VerifyKey
+            signer_vk = VerifyKey(bytes.fromhex(verify_hex), encoder=RawEncoder)
+        except Exception:
+            raise RuntimeError("fetch refused: manifest signature does not verify")
+        if not C.verify_manifest(signer_vk, manifest):
+            raise RuntimeError("fetch refused: manifest signature does not verify")
+        from propagation import Member as _M
         from propagation import RepoPropagator as _RP
-        prop = _RP(self._conn, self._transport, pool_id=pool_id or "fetch",
-                   maintainer_key_id=signer, maintainer_signing_key=None, members=members)
+        members = {self._caller_key_id: _M(key_id=self._caller_key_id, role="member",
+                                           box_pubkey_hex="", box_sk=self._caller_box_sk)}
+        if signer and signer not in members:
+            members[signer] = _M(key_id=signer, role="maintainer",
+                                 verify_key_hex=verify_hex,
+                                 box_pubkey_hex="", box_sk=None)
+        prop = _RP(self._conn, self._transport, pool_id="fetch",
+                   maintainer_key_id=signer, maintainer_signing_key=None,
+                   members=members)
         fetcher = members[self._caller_key_id]
         return prop.fetch(manifest=manifest, fetcher=fetcher, dest=Path(dest),
                           verify_chain=False)
+
+    def _recorded_verify_key_hex(self, key_id) -> str:
+        """The recorded verify key for ``key_id`` from this gateway's
+        ledger: ``members.verify_pubkey_hex`` first, then
+        ``identities.verify_key_hex``; the caller's own key falls back
+        to its live identity. Empty when no key is recorded (the
+        download path then refuses — it cannot verify the manifest)."""
+        if not key_id:
+            return ""
+        if key_id == self._caller_key_id and self._caller_sk is not None:
+            try:
+                own = self._caller_sk.verify_key.encode().hex()
+                if own:
+                    return own
+            except Exception:
+                pass
+        for sql in (
+            "SELECT verify_pubkey_hex FROM members WHERE key_id=? AND verify_pubkey_hex != '' LIMIT 1",
+            "SELECT verify_key_hex FROM identities WHERE key_id=? AND verify_key_hex != '' LIMIT 1",
+        ):
+            try:
+                row = self._conn.execute(sql, (key_id,)).fetchone()
+            except Exception:
+                row = None
+            if row and row[0]:
+                return row[0]
+        return ""
 
     def _gateway_addressing(self, pool_id) -> dict:
         """Transport addressing for this gateway's hosted pool (endpoint
@@ -987,7 +1021,17 @@ class PoolService:
         transport send -> contributor-signed manifest, with no ledger
         write. Thin wrapper over the propagator so the contributor's
         plugin drives it through the service; *version* defaults to the
-        next repo version."""
+        next repo version.
+
+        Agent-facing, service-level only (no slash command): the AGENT
+        on the gateway calls this with its local ``repo_path`` and does
+        the push work; Discord carries only the resulting
+        ``manifest_json`` + transfer ticket + grant token. ``repo_path``
+        must be an existing directory on the agent's gateway.
+        """
+        if not repo_path or not Path(repo_path).is_dir():
+            raise ValueError(
+                f"push_build_bundle: repo_path is not an existing directory: {repo_path}")
         resolved = self._resolve_pool(pool_id, source=source)
         prop = self._propagator(resolved)
         pusher = prop._members.get(self._caller_key_id)
@@ -996,9 +1040,11 @@ class PoolService:
                 f"push refused: caller {self._caller_key_id!r} is not a pool member")
         if version is None:
             version = L.next_repo_version(self._conn, repo_id)
-        return prop.build_push_bundle(
+        result = prop.build_push_bundle(
             repo_path=Path(repo_path), repo_id=repo_id, version=int(version),
             pusher=pusher, pusher_signing_key=self._caller_sk)
+        result["manifest_json"] = json.dumps(result["manifest"], sort_keys=True)
+        return result
 
     def push_deliver(self, transfer_ticket, token, manifest, *,
                      pool_id=None, source=None) -> dict:

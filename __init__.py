@@ -642,7 +642,7 @@ _POOL_STATUS_SCHEMA = {
 _COMMANDS = (
     ("pool", _handle_pool, "Agent Pool: register|members|remove|freeze|list, status",
      "register|members|remove|freeze|list [options]"),
-    ("fetch", _handle_fetch, "Fetch repo list (projects + available tasks + gateway addressing), task list (with claimed status), or one repo manifest / download form",
+    ("fetch", _handle_fetch, "Fetch repo list (projects + available tasks + gateway addressing), task list (with claimed status), or one repo manifest / download form. Discord carries only paths and manifest JSON — the agent on the gateway performs the download",
      "repo list | task list [--ticket <id>] | repo <repo_id> | repo --manifest <json> [options]"),
     ("task", _handle_task, "Agent Pool tickets: add|list|show",
      "add|list|show [options]"),
@@ -656,7 +656,7 @@ _COMMANDS = (
      "[ticket] [--paths <paths>] [--any-project --max-tasks N] [options]"),
     ("release", _handle_release, "Release a claimed ticket back to open",
      "[ticket]"),
-    ("push", _handle_push, "Push a diff for a claimed ticket: issue the push link (grant), or deliver a pushed bundle (audits and completes the task)",
+    ("push", _handle_push, "Push a diff for a claimed ticket: issue the push link (grant), or deliver a pushed bundle (audits and completes the task). Pushes are never completed from Discord: the agent builds the bundle locally (push_build_bundle), and Discord carries only the manifest JSON + transfer ticket + grant",
      "repo <repo_id> --ticket <id> | repo --deliver <transfer_ticket> --token <grant> --manifest <json>"),
     ("audit", _handle_audit, "Show the audit report for a ticket",
      "show [ticket]"),

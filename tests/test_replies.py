@@ -37,3 +37,29 @@ def test_content_size_guard_rejects_over_4kb():
         check_content_size({"a": "x" * 5000})
     with pytest.raises(ValueError):
         check_content_size("x" * 5000)
+
+
+def test_format_result_raises_on_oversize():
+    """D10: format_result fails loudly instead of silently truncating."""
+    with pytest.raises(ValueError, match="reply exceeds 4096-byte gateway limit"):
+        format_result({"a": "x" * 5000})
+
+
+def test_oversize_reply_surfaces_as_clean_error_json():
+    """Handlers wrap _result/format_result in try/except -> _error; an
+    oversize reply must come back as error JSON, not a crash."""
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "agent_pool_plugin_replies", Path(__file__).parent.parent / "__init__.py"
+    )
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    try:
+        out = plugin._result({"a": "x" * 5000})
+    except Exception as exc:  # the exact handler pattern
+        out = plugin._error(exc)
+    parsed = json.loads(out)
+    assert parsed == {"ok": False, "error": "reply exceeds 4096-byte gateway limit"}
