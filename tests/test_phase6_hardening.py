@@ -388,7 +388,7 @@ def test_19_global_freeze_blocks_pool_mutation(world):
     with pytest.raises(ClaimRefused, match="pool frozen"):
         world.maint_svc.add_ticket("pool-1", "demo", "Nope")
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.maint_svc.invite("pool-1", "agent:new")
+        world.maint_svc.add_ticket("pool-1", "demo", "Nope again")
     with pytest.raises(ClaimRefused, match="pool frozen"):
         world.maint_svc.register_pool("pool-3", "Late")
     with pytest.raises(ClaimRefused, match="pool frozen"):

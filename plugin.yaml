@@ -53,6 +53,10 @@ config_schema:
     type: dict
     default: {}
     description: "Per-pool settings keyed by pool_id (budgets, relay overrides)"
+  allowed_users:
+    type: list
+    default: []
+    description: "Discord user ids allowed on the hosted pool (whitelist). Env AGENT_POOL_ALLOWED_USERS (comma-separated) wins over this config when both are set; the pool owner (register --discord-user) is always whitelisted. Empty = owner only."
   transport:
     type: str
     default: "real"

@@ -12,7 +12,7 @@ from nacl.encoding import RawEncoder
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from identity import ensure_identity
-from ledger import ClaimRefused, init_ledger
+from ledger import ClaimRefused, add_member, init_ledger, sync_whitelist
 from tickets import PoolNotLocalError, PoolService
 from transport import FakeTransport
 
@@ -21,6 +21,14 @@ MEMBER_USER = "member-1"
 HELLO = "hello fetch\n"
 POOL = "pool-1"
 REPO = "demo"
+
+
+def _whitelist(conn, pool_id, user_id, ident):
+    """Phase 1 stand-in for the removed invite method (see test_push_path)."""
+    sync_whitelist(conn, pool_id, [user_id])
+    add_member(conn, pool_id, ident.key_id, role="member",
+               box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex(),
+               verify_pubkey_hex=ident.verify_key.encode(RawEncoder).hex())
 
 
 def memdb():
@@ -66,9 +74,7 @@ def world(tmp_path):
                              caller_signing_key=member.signing_key,
                              caller_box_sk=member.box_sk)
     maint_svc.register_pool(POOL, "Team", discord_user_id=OWNER)
-    maint_svc.invite(POOL, member.key_id, role="member",
-                     box_pubkey_hex=member.box_pk.encode(RawEncoder).hex(),
-                     discord_user_id=MEMBER_USER, source={"user_id": OWNER})
+    _whitelist(conn, POOL, MEMBER_USER, member)
     src = _git_src(tmp_path / "src")
     maint_svc.add_repo(POOL, REPO, str(src), display_name="Demo",
                        source={"user_id": OWNER})
@@ -150,7 +156,7 @@ def test_fetch_repo_download_roundtrip(tmp_path):
     assert hello.read_text() == HELLO
 
 
-def test_fetch_repo_download_refuses_uninvited_key(tmp_path):
+def test_fetch_repo_download_refuses_unwhitelisted_key(tmp_path):
     w = world(tmp_path)
     fetched = w["maint_svc"].fetch_repo(REPO, source=_owner_source())
     manifest = json.loads(fetched["manifest_json"])

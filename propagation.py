@@ -526,7 +526,7 @@ class RepoPropagator:
         gateway and
         there is no local chain to compare against. The chain check is
         defense-in-depth on that path — the **wrapped-key ACL is the
-        authorization boundary** (only an invited agent's key can unwrap
+        authorization boundary** (only a whitelisted member's key can unwrap
         the DEK), and the BLAKE3 check against the manifest still pins the
         bytes. Chain verification stays mandatory for pool-gateway fetches.
         """

@@ -17,7 +17,7 @@ from nacl.encoding import RawEncoder
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from identity import ensure_identity
-from ledger import FROZEN_MESSAGE, init_ledger
+from ledger import FROZEN_MESSAGE, add_member, init_ledger, sync_whitelist
 from tickets import PoolService
 from transport import FakeTransport
 
@@ -26,6 +26,16 @@ MEMBER_USER = "member-1"
 OTHER_USER = "other-1"
 POOL = "pool-1"
 REPO = "demo"
+
+
+def _whitelist(conn, pool_id, user_id, ident):
+    """Phase 1 stand-in for the removed invite method: authorize the
+    Discord id via the whitelist sync and register the crypto member.
+    Key attribution binds on the user's first claim."""
+    sync_whitelist(conn, pool_id, [user_id])
+    add_member(conn, pool_id, ident.key_id, role="member",
+               box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex(),
+               verify_pubkey_hex=ident.verify_key.encode(RawEncoder).hex())
 
 
 def memdb():
@@ -81,12 +91,8 @@ def world(tmp_path):
                             caller_signing_key=other.signing_key,
                             caller_box_sk=other.box_sk)
     maint_svc.register_pool(POOL, "Team", discord_user_id=OWNER)
-    maint_svc.invite(POOL, member.key_id, role="member",
-                     box_pubkey_hex=member.box_pk.encode(RawEncoder).hex(),
-                     discord_user_id=MEMBER_USER, source={"user_id": OWNER})
-    maint_svc.invite(POOL, other.key_id, role="member",
-                     box_pubkey_hex=other.box_pk.encode(RawEncoder).hex(),
-                     discord_user_id=OTHER_USER, source={"user_id": OWNER})
+    _whitelist(conn, POOL, MEMBER_USER, member)
+    _whitelist(conn, POOL, OTHER_USER, other)
     src = _git_src(tmp_path / "src")
     maint_svc.add_repo(POOL, REPO, str(src), display_name="Demo",
                        source={"user_id": OWNER})

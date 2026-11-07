@@ -1,6 +1,6 @@
 """Agent Pool plugin — gateway-native: Hermes posts, plugin returns content.
 
-Slash commands: ``/pool register|invite|members|remove|freeze|list, status``,
+Slash commands: ``/pool register|members|remove|freeze|list, status``,
 ``/task add|list|show`` (flat aliases ``/task_add`` / ``/task_list``),
 ``/add-repo`` (register a project + submit its bytes as a new version),
 ``/claim`` (paths optional — omit ``--paths`` for a whole-ticket claim;
@@ -159,6 +159,26 @@ def _pool_status(args=None, **kwargs):
 # Service construction (lazy: no DB/identity work at register() time)
 # ---------------------------------------------------------------------------
 
+def _whitelist_user_ids(ctx):
+    """Resolve the pool whitelist (Phase 1): env beats config.
+
+    Source order: ``AGENT_POOL_ALLOWED_USERS`` (comma-separated Discord
+    user ids) when non-empty, else the ``allowed_users`` config key (list,
+    or a comma-separated string). The pool owner is NOT added here —
+    ``L.sync_whitelist`` always ensures the owner. Empty result means the
+    owner is the only authorized user.
+    """
+    env = os.environ.get("AGENT_POOL_ALLOWED_USERS", "")
+    if env.strip():
+        return [u.strip() for u in str(env).split(",") if u.strip()]
+    cfg = _cfg(ctx, "allowed_users", []) if ctx else []
+    if isinstance(cfg, str):
+        return [u.strip() for u in cfg.split(",") if u.strip()]
+    if isinstance(cfg, (list, tuple, set)):
+        return [str(u).strip() for u in cfg if str(u).strip()]
+    return []
+
+
 def _service_for(ctx, source=None):
     """Build a PoolService from the plugin context. Raises with a clear msg."""
     try:
@@ -172,6 +192,15 @@ def _service_for(ctx, source=None):
         from tickets import PoolService
         from transport import FakeTransport, RealSendHermesTransport
     conn = L.get_db()
+    # Phase 1 whitelist sync: once per service construction, for the single
+    # hosted pool, insert env/config whitelist users into pool_authorized
+    # (owner always ensured; existing rows never deleted).
+    try:
+        _hosts = L.list_local_pools(conn)
+        if len(_hosts) == 1:
+            L.sync_whitelist(conn, _hosts[0], _whitelist_user_ids(ctx))
+    except Exception:
+        pass
     data_dir = L.default_db_path().parent
     identity = ensure_identity(data_dir)
     transport_name = _cfg(ctx, "transport", "real") if ctx else "real"
@@ -290,14 +319,6 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
                                     relay_url=opts.get("relay_url", ""),
                                     source=source,
                                     discord_user_id=opts.get("discord_user", ""))
-        elif sub == "invite":
-            pool_id = rest[0] if rest else opts.get("pool_id", "")
-            key_id = rest[1] if len(rest) > 1 else opts.get("key_id", "")
-            out = svc.invite(pool_id, key_id, role=opts.get("role", "member"),
-                             box_pubkey_hex=opts.get("box_pubkey", ""),
-                             source=source,
-                             discord_user_id=opts.get("discord_user", ""),
-                             verify_pubkey_hex=opts.get("verify_key", ""))
         elif sub == "members":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             out = {"ok": True, "pool_id": pool_id, "members": svc.members(pool_id, source=source)}
@@ -330,7 +351,7 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
         else:
             return _result({"ok": False,
                             "error": f"unknown /pool subcommand: {sub}",
-                            "usage": "/pool register|invite|members|remove|freeze|list"})
+                            "usage": "/pool register|members|remove|freeze|list"})
         return _result(out, svc, source)
     except Exception as exc:
         return _error(exc)
@@ -577,8 +598,8 @@ _POOL_STATUS_SCHEMA = {
 }
 
 _COMMANDS = (
-    ("pool", _handle_pool, "Agent Pool: register|invite|members|remove|freeze|list, status",
-     "register|invite|members|remove|freeze|list [options]"),
+    ("pool", _handle_pool, "Agent Pool: register|members|remove|freeze|list, status",
+     "register|members|remove|freeze|list [options]"),
     ("fetch", _handle_fetch, "Fetch repo list (projects + available tasks + gateway addressing), task list (with claimed status), or one repo manifest / download form",
      "repo list | task list [--ticket <id>] | repo <repo_id> | repo --manifest <json> [options]"),
     ("task", _handle_task, "Agent Pool tickets: add|list|show",
@@ -716,7 +737,7 @@ def _wrap_command(handler, ctx):
                                 return _result({"ok": False, "error_code": "unauthorized",
                                                 "error": f"not authorized for pool {resolved} — ask the maintainer"})
                             _owner_only = False
-                            if handler.__name__ == "_handle_pool" and sub in ("invite", "remove", "register"):
+                            if handler.__name__ == "_handle_pool" and sub in ("remove", "register"):
                                 # register has no resolved pool yet (creation);
                                 # treated as owner-only only when resolved.
                                 if sub != "register":
@@ -733,7 +754,7 @@ def _wrap_command(handler, ctx):
                         # user_id present but no resolvable pool: fail-closed
                         # for owner-only verbs, else let handler run (it will
                         # refuse pool resolution itself).
-                        elif handler.__name__ == "_handle_pool" and sub in ("invite", "remove"):
+                        elif handler.__name__ == "_handle_pool" and sub in ("remove",):
                             return _result({"ok": False, "error_code": "unauthorized",
                                             "error": "not authorized — ask the maintainer"})
             except Exception:

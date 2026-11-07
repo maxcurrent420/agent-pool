@@ -297,7 +297,7 @@ class PoolService:
         wrapped = manifest.get("wrapped_keys") or {}
         if self._caller_key_id not in wrapped:
             raise PermissionError(
-                "fetch repo refused: caller key not in manifest wrapped_keys (only invited agents can decrypt)")
+                "fetch repo refused: caller key not in manifest wrapped_keys (only whitelisted members can decrypt)")
         from propagation import RepoPropagator as _RP
         prop = _RP(self._conn, self._transport, pool_id=pool_id or "fetch",
                    maintainer_key_id=signer, maintainer_signing_key=None, members=members)
@@ -384,32 +384,11 @@ class PoolService:
         L.record_event(self._conn, pool_id, "pool_registered",
                        {"pool_id": pool_id, "maintainer": maintainer,
                         "owner_discord_user_id": str(discord_user_id)})
-        # Attribution only: the invite-bound key for the owner's Discord id.
-        # (No chat binding — the platform routes commands across gateways;
-        # the plugin only selects among pools it hosts, 2109 Phase 2.)
-        L.bind_discord_user(self._conn, maintainer, discord_user_id)
+        # Register authorizes the owner only. Key attribution is NOT bound
+        # here: it binds on the user's first claim (pool_memberships), and
+        # the whitelist itself is synced from env/config by _service_for.
         return {"ok": True, "pool_id": pool_id, "name": name, "maintainer": maintainer,
                 "owner_discord_user_id": str(discord_user_id)}
-
-    def invite(self, pool_id, key_id, role="member", box_pubkey_hex="",
-               source=None, discord_user_id=None, verify_pubkey_hex="") -> dict:
-        pool_id = self._assert_local_owned(pool_id, source=source)
-        # Owner-only (whitelist model): the whitelist IS the authorization.
-        self._require_owner(pool_id, source)
-        # Freeze is absolute: a frozen pool refuses every other verb from
-        # every user with the exact message, before argument validation.
-        self._check_not_frozen(pool_id)
-        if role not in ("member", "maintainer"):
-            raise ValueError(f"role must be member|maintainer, got {role!r}")
-        if not discord_user_id:
-            raise ValueError("invite needs --discord-user <id>: the whitelist is the auth")
-        L.add_member(self._conn, pool_id, key_id, role=role, box_pubkey_hex=box_pubkey_hex,
-                     verify_pubkey_hex=verify_pubkey_hex or "")
-        L.bind_discord_user(self._conn, key_id, discord_user_id)
-        L.authorize_user(self._conn, pool_id, discord_user_id)
-        L.record_event(self._conn, pool_id, "invited",
-                       {"key_id": key_id, "role": role})
-        return {"ok": True, "pool_id": pool_id, "key_id": key_id, "role": role}
 
     def members(self, pool_id, source=None) -> list:
         pool_id = self._resolve_pool(pool_id, source=source)
@@ -438,7 +417,7 @@ class PoolService:
         if pool is None:
             raise ValueError(f"unknown pool: {pool_id!r}")
         removed = L.remove_member(self._conn, pool_id, key_id)
-        # Drop the whitelist row if the invite-bound Discord id is known.
+        # Drop the whitelist row if the bound Discord id is known.
         try:
             _row = self._conn.execute("SELECT discord_user_id FROM identities WHERE key_id=?", (key_id,)).fetchone()
             if _row and _row[0]:
@@ -566,18 +545,20 @@ class PoolService:
         user_id = self._source_field(src, "user_id", "discord_user_id")
         return str(user_id) if user_id is not None else None
 
-    def _invite_bound_key(self, source) -> str | None:
-        """Invite-bound agent key for the driving Discord user (OD1).
+    def _whitelist_bound_key(self, pool_id=None, source=None) -> str | None:
+        """Whitelist-bound agent key for the driving Discord user (Phase 1).
 
-        Attribution only — crypto records WHO acted (overlap checks,
-        manifests, notices). The Discord id is the authorization; this
-        lookup never decides access.
+        Reads ``pool_memberships`` (first-claim binding). Attribution only —
+        crypto records WHO acted (overlap checks, manifests, notices). The
+        Discord id is the authorization; this lookup never decides access.
+        Returns the bound key_id, or None when unbound (callers fall back
+        to the gateway identity).
         """
         user_id = self._discord_user(source)
         if user_id is None:
             return None
         try:
-            return L.lookup_key_by_discord_user(self._conn, user_id)
+            return L.lookup_membership_key(self._conn, user_id, pool_id=pool_id)
         except Exception:
             return None
 
@@ -653,7 +634,7 @@ class PoolService:
                        {"repo_id": repo_id, "version": version,
                         "state": result["state"],
                         "manifest_hash": result["manifest_hash"]})
-        # DEK timing: members invited AFTER this version have no wrapped
+        # DEK timing: members whitelisted AFTER this version have no wrapped
         # key for it and must wait for the next version.
         members_with_box = [m for m in prop._members.values() if m.box_pubkey_hex]
         wrapped = set((result["manifest"].get("wrapped_keys") or {}).keys())
@@ -662,11 +643,11 @@ class PoolService:
                   f"{result['state']} ({result['manifest_hash'][:12]})")
         if missing:
             notice += (f"; WARNING: {len(missing)} member(s) have no DEK key "
-                       f"for this version ({', '.join(sorted(missing))}) — invite "
+                       f"for this version ({', '.join(sorted(missing))}) — whitelist "
                        "members BEFORE /add-repo; late joiners wait for the "
                        "next version")
         else:
-            notice += ("; invite members BEFORE /add-repo — members invited "
+            notice += ("; whitelist members BEFORE /add-repo — members whitelisted "
                        "later wait for the next version")
         return {"ok": True, "repo_id": repo_id, "pool_id": pool_id,
                 "version": version, "state": result["state"],
@@ -748,18 +729,31 @@ class PoolService:
         ticket = self.show_ticket(ticket_id)
         # Freeze is absolute: the exact message for every user.
         self._check_not_frozen(ticket["pool_id"])
-        # Whitelist: only authorized users may claim (OD1: claimant stored as
-        # invite-bound agent key; the lookup is attribution, not authz).
+        # Whitelist: only authorized users may claim (the Discord id is the
+        # authorization; the bound key lookup is attribution, not authz).
         self._require_authorized(ticket["pool_id"], source)
-        # Resolve claimant key: explicit > invite-bound (attribution) >
-        # gateway identity for bare fixtures / CLI.
-        key = key_id or self._invite_bound_key(source) or self._caller_key_id
+        # First-claim key binding (Phase 1): the presented key is
+        # explicit key_id, else the gateway identity. If this user already
+        # has a bound key, the presented key MUST match it — the binding is
+        # permanent; a different key is refused with the exact message
+        # below. If unbound, the presented key binds on a successful claim.
+        user_id = self._discord_user(source)
+        bound = self._whitelist_bound_key(ticket["pool_id"], source)
+        presented = key_id or self._caller_key_id
+        if bound and presented and presented != bound:
+            raise PermissionError(
+                f"claim refused: user {user_id} already bound to key {bound} "
+                f"on pool {ticket['pool_id']} — presented key {presented} differs; "
+                "first-claim binding is permanent")
+        key = bound or presented
         if not key:
             raise ValueError("claim needs a claimant key_id")
         claim = L.claim_ticket_enforced(
             self._conn, f"c-{secrets.token_hex(4)}", ticket_id, key,
             declared_paths=declared_paths, budget=budget,
             maintainer_override=maintainer_override)
+        if not bound and user_id and key:
+            L.bind_membership(self._conn, ticket["pool_id"], user_id, key)
         ticket = L.get_ticket(self._conn, ticket_id)
         notice = (f"{STATE_MARKER.format(state='claimed')} ticket {ticket_id} "
                   f"claimed by {key}")
@@ -815,7 +809,7 @@ class PoolService:
         self._check_not_frozen(ticket["pool_id"])
         # Whitelist: authorized-level verb.
         self._require_authorized(ticket["pool_id"], source)
-        key = key_id or self._invite_bound_key(source) or self._caller_key_id
+        key = key_id or self._whitelist_bound_key(ticket["pool_id"], source) or self._caller_key_id
         updated = L.release_ticket(self._conn, ticket_id, key)
         notice = f"{STATE_MARKER.format(state='open')} ticket {ticket_id} released"
         self._queue_notice(updated["pool_id"], notice, kind="ticket_release")
@@ -828,7 +822,7 @@ class PoolService:
         ticket = self.show_ticket(ticket_id)
         self._check_not_frozen(ticket["pool_id"])
         self._require_authorized(ticket["pool_id"], source)
-        key = key_id or self._invite_bound_key(source) or self._caller_key_id
+        key = key_id or self._whitelist_bound_key(ticket["pool_id"], source) or self._caller_key_id
         updated = L.complete_ticket(self._conn, ticket_id, key)
         notice = f"{STATE_MARKER.format(state='completed')} ticket {ticket_id} completed"
         self._queue_notice(updated["pool_id"], notice, kind="ticket_completed")
@@ -843,7 +837,7 @@ class PoolService:
         repo <repo_id> --ticket <id>`` verb, on the POOL's gateway).
 
         Claimant-only: the ticket must be ``claimed`` by the driving
-        user's invite-bound key. The grant token plus the gateway
+        user's whitelist-bound key. The grant token plus the gateway
         addressing is the push link; the contributor's agent pushes the
         diff over the configured transport and delivers the transfer
         ticket + grant back (see :meth:`push_deliver`).
@@ -861,7 +855,7 @@ class PoolService:
             raise ValueError(
                 f"push refused: ticket {ticket_id!r} is on repo "
                 f"{ticket['repo_id']!r}, not {repo_id!r}")
-        key = self._invite_bound_key(source) or self._caller_key_id
+        key = self._whitelist_bound_key(resolved, source) or self._caller_key_id
         if ticket["state"] != "claimed" or ticket.get("claimant_key_id") != key:
             raise PermissionError(
                 f"push refused: ticket {ticket_id!r} is {ticket['state']!r} "

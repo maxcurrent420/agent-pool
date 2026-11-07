@@ -304,10 +304,13 @@ def test_command_handlers_smoke(tmp_path):
         assert out["ok"] and out["maintainer"] == ident.key_id
         out = json.loads(ctx.commands["pool"]("auto-approve on --pool pool-1", source=OWNER))
         assert out["ok"] is False  # deleted in Phase 1
-        out = json.loads(ctx.commands["pool"](f"invite pool-1 agent:alice --role member --discord-user alice-1", source=OWNER))
-        assert out["role"] == "member"
+        # Phase 1: /pool invite is removed; membership comes from the
+        # env/config whitelist, so the subcommand is unknown and the only
+        # member is the maintainer.
+        out = json.loads(ctx.commands["pool"]("invite pool-1 agent:alice --role member --discord-user alice-1", source=OWNER))
+        assert out["ok"] is False
         out = json.loads(ctx.commands["pool"]("members pool-1", source=OWNER))
-        assert {m["key_id"] for m in out["members"]} == {ident.key_id, "agent:alice"}
+        assert {m["key_id"] for m in out["members"]} == {ident.key_id}
         out = json.loads(ctx.commands["task"](
             'add --pool-id pool-1 --repo demo --title "Fix it" --brief "Scope: a.py"',
             source=OWNER))

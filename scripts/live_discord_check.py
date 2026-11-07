@@ -82,7 +82,7 @@ def main():
         "4. Config: transport=real, transport_mode=relay|tor, budgets (no gateway_channel_id)",
         "5. Discord: bot allowlist contains tester; 10 commands in picker",
         "6. /pool register demo-pool --name Demo --discord-user <id>",
-        "7. /pool invite demo-pool <key_id> --box-pubkey <hex> --discord-user <id>",
+        "7. Whitelist the member: AGENT_POOL_ALLOWED_USERS=<discord id> (or config allowed_users), then restart/reload the gateway",
         "8. /add-repo demo --path /srv/repos/demo --pool demo-pool --name Demo",
         "9. /task add --pool-id demo-pool --repo demo --title \"Live test\"",
         "10. /claim <ticket_id>",

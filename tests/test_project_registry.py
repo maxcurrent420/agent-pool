@@ -137,7 +137,7 @@ def test_add_repo_accepted_version_in_chain(tmp_path):
     chain = conn.execute(
         "SELECT version FROM manifest_chain WHERE repo_id='demo'").fetchall()
     assert [c[0] for c in chain] == [1]
-    assert "invite members BEFORE /add-repo" in out["notice"]
+    assert "whitelist members BEFORE /add-repo" in out["notice"]
 
 
 # --- listings ----------------------------------------------------------------

@@ -140,6 +140,12 @@ CREATE TABLE IF NOT EXISTS pool_authorized (
     discord_user_id TEXT NOT NULL,
     PRIMARY KEY (pool_id, discord_user_id)
 );
+CREATE TABLE IF NOT EXISTS pool_memberships (
+    pool_id TEXT NOT NULL REFERENCES pools(pool_id),
+    discord_user_id TEXT NOT NULL,
+    key_id TEXT NOT NULL,
+    PRIMARY KEY (pool_id, discord_user_id)
+);
 CREATE TABLE IF NOT EXISTS pool_gateways (
     pool_id TEXT PRIMARY KEY,
     gateway_endpoint TEXT,
@@ -160,7 +166,7 @@ CREATE TABLE IF NOT EXISTS push_grants (
 
 TABLES = ("pools", "members", "identities", "repos", "repo_versions",
           "manifest_chain", "tickets", "claims", "file_claims", "audits",
-          "events", "pool_chats", "remote_repos", "pool_authorized", "pool_gateways",
+          "events", "pool_chats", "remote_repos", "pool_authorized", "pool_memberships", "pool_gateways",
           "push_grants")
 
 
@@ -894,6 +900,62 @@ def authorize_user(conn, pool_id, discord_user_id) -> None:
     conn.execute("INSERT OR IGNORE INTO pool_authorized (pool_id, discord_user_id) VALUES (?,?)",
                  (pool_id, str(discord_user_id)))
     conn.commit()
+
+
+def sync_whitelist(conn, pool_id, user_ids) -> None:
+    """Sync the env/config whitelist into ``pool_authorized`` (Phase 1).
+
+    The pool owner (``pools.owner_discord_user_id``) is always ensured.
+    Missing whitelist users are inserted; existing authorized rows are
+    NEVER deleted (removal is ``deauthorize_user``, a separate act).
+    Empty ``user_ids`` therefore authorizes nobody beyond the owner.
+    """
+    ids = [str(u).strip() for u in (user_ids or []) if str(u).strip()]
+    try:
+        pool = conn.execute(
+            "SELECT owner_discord_user_id FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
+    except Exception:
+        pool = None
+    if pool is not None and pool[0]:
+        ids.append(str(pool[0]))
+    for uid in dict.fromkeys(ids):  # dedupe, keep order
+        conn.execute("INSERT OR IGNORE INTO pool_authorized (pool_id, discord_user_id) VALUES (?,?)",
+                     (pool_id, uid))
+    conn.commit()
+
+
+def bind_membership(conn, pool_id, discord_user_id, key_id) -> None:
+    """First-claim key binding: record the key a whitelisted user presented.
+
+    ``INSERT OR IGNORE`` — the first binding wins; later binds are no-ops
+    (a different presented key is refused in ``PoolService.claim``).
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO pool_memberships (pool_id, discord_user_id, key_id)"
+        " VALUES (?,?,?)", (pool_id, str(discord_user_id), str(key_id)))
+    conn.commit()
+
+
+def lookup_membership_key(conn, discord_user_id, pool_id=None):
+    """Bound key_id for a Discord user from ``pool_memberships``, or None.
+
+    One pool per gateway, so ``pool_id`` is optional; when given it narrows
+    the lookup to that pool.
+    """
+    if discord_user_id is None:
+        return None
+    try:
+        if pool_id is not None:
+            row = conn.execute(
+                "SELECT key_id FROM pool_memberships WHERE pool_id=? AND discord_user_id=?",
+                (pool_id, str(discord_user_id))).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT key_id FROM pool_memberships WHERE discord_user_id=?",
+                (str(discord_user_id),)).fetchone()
+    except Exception:
+        return None
+    return row[0] if row else None
 
 
 def deauthorize_user(conn, pool_id, discord_user_id) -> None:

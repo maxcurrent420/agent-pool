@@ -53,8 +53,10 @@ def test_create_claim_release_claim_complete():
                             source={"user_id": "owner-1"}) == []
     svc.release(tid, key_id="agent:alice", source={"user_id": "owner-1"})
     assert get_ticket(c, tid)["state"] == "open"
-    svc.claim(tid, key_id="agent:bob", declared_paths=["a.py"], source={"user_id": "owner-1"})
-    done = svc.complete(tid, key_id="agent:bob", source={"user_id": "owner-1"})
+    # Phase 1 first-claim binding is permanent per Discord user: owner-1 is
+    # bound to agent:alice, so the re-claim/complete reuse that key.
+    svc.claim(tid, key_id="agent:alice", declared_paths=["a.py"], source={"user_id": "owner-1"})
+    done = svc.complete(tid, key_id="agent:alice", source={"user_id": "owner-1"})
     assert done["state"] == "completed"
     assert get_ticket(c, tid)["state"] == "completed"
     # Claim row ends completed (the latest claim; the first was released).
