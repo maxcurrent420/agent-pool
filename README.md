@@ -328,6 +328,9 @@ Env vars: `HERMES_IROH_STATE_DIR`,
 - `scripts/demo.py` — end-to-end demo of the current model: add repo →
   add task → claim → push (grant + build + deliver) → task completed →
   verify chain. `--real` uses the real transport (send_hermes on PATH).
+- `scripts/contributor-push.py` — contributor push step (8b) off Discord:
+  `python3 scripts/contributor-push.py /path/to/checkout --repo <repo_id> [--pool <pool_id>] [--json]`
+  prints `manifest_json` + `transfer_ticket` + the `/push repo --deliver` command to paste on the pool gateway.
 - `scripts/live-discord-check.md` — operator runbook for a live Discord
   guild.
 
