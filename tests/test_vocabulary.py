@@ -248,3 +248,61 @@ def test_docs_state_current_contracts():
     assert "pool_status" in readme
     # Full chain verification is scoped to the hosted-pool fetch.
     assert "Full chain verification happens on the hosted-pool" in combined
+
+
+# --- WO-025 gates: 2.7.0 release, agent-budget wording, catalog ----------
+
+# ledger.py is excluded: its meta.state_migration == "2.6.0" is the
+# historical ticket-state migration guard, asserted by
+# tests/test_ledger.py + tests/test_migration.py. It names the migration,
+# not the current release version. Those two test files are also excluded.
+RELEASE_REF_FILES = (
+    "README.md",
+    "docs/architecture.md",
+    "docs/threat-model.md",
+    "docs/fallback-transport.md",
+    "scripts/live-discord-check.md",
+    "plugin.yaml",
+    "plugin-catalog/agent-pool.yaml",
+    "__init__.py",
+    "scripts/demo.py",
+)
+
+
+def test_release_version_is_2_7_0_everywhere_except_migration_guard():
+    for fname in RELEASE_REF_FILES:
+        assert "2.6.0" not in (ROOT / fname).read_text(), (
+            f"{fname} still references the 2.6.0 release version")
+    assert (ROOT / "plugin.yaml").read_text().splitlines()[1].strip() == "version: 2.7.0"
+
+
+def test_budget_wording_matches_agent_allocation_model():
+    yaml = (ROOT / "plugin.yaml").read_text()
+    for key in ("max_turns", "token_cap", "wall_clock_seconds"):
+        m = re.search(
+            rf"{key}:\s*\n\s+type:\s*int\s*\n\s+default:\s*\d+\s*\n"
+            rf"\s+description: \"([^\"]+)\"", yaml)
+        assert m, f"plugin.yaml: {key} description shape changed"
+        assert "only when" in m.group(1), f"{key} must state its limit is conditional"
+        assert "pool_report_usage" in m.group(1), f"{key} must name pool_report_usage"
+    m = re.search(
+        r"max_tasks_per_day:\s*\n\s+type:\s*int\s*\n\s+default:\s*\d+\s*\n"
+        r"\s+description: \"([^\"]+)\"", yaml)
+    assert m, "plugin.yaml: max_tasks_per_day description shape changed"
+    assert "per-agent task allocation" in m.group(1).lower()
+    init = (ROOT / "__init__.py").read_text()
+    m = re.search(
+        r'_POOL_STATUS_SCHEMA = \{\s*"name": "pool_status",\s*'
+        r'"description": \(([^)]+)\)', init, re.S)
+    assert m, "_POOL_STATUS_SCHEMA description shape changed"
+    assert "per-claim" not in m.group(1).lower()
+    assert "per-claim" not in yaml.lower(), "stale per-claim wording in plugin.yaml"
+    assert "per-claim" not in init.lower(), "stale per-claim wording in __init__.py"
+
+
+def test_catalog_lists_both_tools_and_current_version():
+    data = (ROOT / "plugin-catalog" / "agent-pool.yaml").read_text()
+    assert re.search(r'^version: "2\.7\.0"$', data, re.M), (
+        "catalog version must be 2.7.0")
+    caps = data.split("provides_tools:")[1].split("provides_hooks:")[0]
+    assert "pool_status" in caps and "pool_report_usage" in caps

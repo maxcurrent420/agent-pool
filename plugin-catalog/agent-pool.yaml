@@ -12,10 +12,28 @@ description: >-
   BLAKE3-verified bearer tickets via send_hermes), coordination only via
   the Hermes gateway. Gateway-native: the plugin does NOT post to Discord —
   it returns content that Hermes posts. Passive plumbing (no timers, no
-  observation, no execution); one pool per gateway. Per-version DEK wrapping
-  per member, sandbox audit gate (audit-on-push), global freeze kill-switch,
-  per-profile pool isolation (pool_not_local refusal for foreign pools).
-  Task lifecycle: open / claimed / completed. Transport: relay (default) or
+  observation, no execution); one pool per gateway, and the pool maintainer
+  is the gateway owner (the maintainer registered the pool on this gateway;
+  acceptance happens on the maintainer gateway only). Access is a whitelist,
+  not an invite: the pool owner (register --discord-user) is always
+  authorized; additional Discord users arrive via env
+  AGENT_POOL_ALLOWED_USERS or the allowed_users config. Budgets belong to
+  agents, not pools: each agent has a task-completion allocation
+  (max_tasks_per_day default, agent_task_allocations per-agent override,
+  env AGENT_POOL_TASK_ALLOCATIONS wins); max_turns/token_cap/
+  wall_clock_seconds are optional secondary limits enforced only when the
+  agent reports usage via pool_report_usage. Claims carry an agent
+  worktree/branch spec (worktree_path/branch/base_ref + stop_condition);
+  the agent runs the git operations at that path and branch, the plugin
+  only specifies. Push and pull are path-based: Discord carries only
+  paths and manifest JSON; the agent performs the work (push_build_bundle
+  on its own gateway; deliver accepts through the maintainer gateway).
+  Replies that exceed the 4096-byte gateway limit fail loudly. Downloads
+  verify the manifest signature, the wrapped-key ACL, and BLAKE3; full
+  chain verification happens on the hosted-pool fetch only. Per-version
+  DEK wrapping per member, sandbox audit gate (audit-on-push), global
+  freeze kill-switch, pool_not_local refusal for foreign pools. Task
+  lifecycle: open / claimed / completed. Transport: relay (default) or
   tor (Iroh + Tor custom transport via sidecar; fails closed).
   Disclosure — spawns git/bubblewrap/send_hermes child processes; network
   calls go to Iroh peers/relay (relay-only on both ends in relay mode;
@@ -27,12 +45,13 @@ maintainer: maxcurrent420
 tier: community
 category: tools
 requires_hermes: ">=0.22.0"
-version: "2.6.0"
+version: "2.7.0"
 readme: true
 platforms: []
 capabilities:
   provides_tools:
     - pool_status
+    - pool_report_usage
   provides_hooks: []
   provides_middleware: []
   requires_env: []

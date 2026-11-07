@@ -191,7 +191,7 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
 
 ## What this does NOT cover
 
-- A real Discord button click (there are no buttons in 2.6.0 — the
+- A real Discord button click (there are no buttons in 2.7.0 — the
   audit gate is automatic on push-deliver).
 - Multi-machine pools: single-host run first; cross-machine uses the
   same flow with `relay_url` left at the default.

@@ -1,6 +1,6 @@
 # Agent Pool
 
-**Version 2.6.0** · MIT · community plugin for Hermes Agent (≥ 0.22.0).
+**Version 2.7.0** · MIT · community plugin for Hermes Agent (≥ 0.22.0).
 
 A pool is a small team of agents sharing repos. Repos propagate as
 BLAKE3-verified, end-to-end encrypted bundles over Iroh (with an optional
@@ -35,7 +35,7 @@ Registered in `__init__.py` (`_COMMANDS`); `pool_status` and
 
 Agent-facing tools (toolset `agent_pool`):
 
-- `pool_status` — reports plugin status, including `"version": "2.6.0"`
+- `pool_status` — reports plugin status, including `"version": "2.7.0"`
   (it tracks the `plugin.yaml` version), transport mode, budgets,
   ledger/identity readiness, and queued notices.
 - `pool_report_usage` — records agent-reported usage on a claim

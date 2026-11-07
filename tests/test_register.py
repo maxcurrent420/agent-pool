@@ -48,6 +48,15 @@ def test_register_wires_tool_and_command():
                                    "token_cap", "wall_clock_seconds"}
 
 
+def test_pool_status_reports_version_not_phase():
+    plugin = _load_plugin()
+    ctx = FakeCtx()
+    plugin.register(ctx)
+    out = json.loads(ctx.tools["pool_status"]({}))
+    assert out["version"] == "2.7.0"
+    assert "phase" not in out
+
+
 def test_identity_generated_once_and_private(tmp_path):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from identity import ensure_identity, load_identity

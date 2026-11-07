@@ -1,4 +1,4 @@
-# Architecture — Agent Pool (gateway-native, 2.6.0)
+# Architecture — Agent Pool (gateway-native, 2.7.0)
 
 Hermes posts; the plugin only returns content. This document traces the
 paths with file/function evidence (no brittle line citations).

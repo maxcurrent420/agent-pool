@@ -94,7 +94,9 @@ def _pool_status(args=None, **kwargs):
         budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
             ("max_turns", 25), ("max_tasks_per_day", 5),
             ("token_cap", 50000), ("wall_clock_seconds", 1800))}
-        status = {"ok": True, "plugin": "agent-pool", "phase": 3,
+        # NOTE: the "version" string below must be kept in sync with
+        # plugin.yaml's version. It identifies the release, not a phase.
+        status = {"ok": True, "plugin": "agent-pool", "version": "2.7.0",
                   "relay_url": relay_url, "transport_mode": mode,
                   "transport_privacy": (
                       "tor: onion-routed via Iroh Tor custom transport "
@@ -108,6 +110,22 @@ def _pool_status(args=None, **kwargs):
                       "no direct mode and no way to opt into one"),
                   "pool_transports": per_pool,
                   "budgets": budgets,
+                  # Budgets belong to agents, not pools: max_tasks_per_day
+                  # is the default per-agent task allocation
+                  # (agent_task_allocations overrides per agent, env
+                  # AGENT_POOL_TASK_ALLOCATIONS beats config); max_turns /
+                  # token_cap / wall_clock_seconds are optional secondary
+                  # limits enforced only on agent-reported usage
+                  # (pool_report_usage). There are no pool-level budgets.
+                  "agent_task_allocations": (
+                      _cfg(ctx, "agent_task_allocations", {}) if ctx else {}),
+                  "budget_model": (
+                      "agent-level task allocation: max_tasks_per_day is "
+                      "the default per-agent allocation; "
+                      "agent_task_allocations overrides per agent; "
+                      "max_turns/token_cap/wall_clock_seconds are optional "
+                      "secondary limits enforced only on agent-reported "
+                      "usage (pool_report_usage); no pool-level budgets"),
                   "ledger": "ready", "identity": "ready",
                   "queued_notices": []}
         if mode == "tor":
@@ -634,7 +652,8 @@ def _pool_report_usage(args=None, **kwargs):
 
 _POOL_STATUS_SCHEMA = {
     "name": "pool_status",
-    "description": ("Report Agent Pool plugin status: relay URL, per-claim budgets, "
+    "description": ("Report Agent Pool plugin status: relay URL, agent-level "
+                    "task allocation and optional reported-usage limits, "
                     "and ledger/identity readiness."),
     "parameters": {"type": "object", "properties": {}},
 }
