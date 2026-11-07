@@ -366,7 +366,11 @@ class PoolService:
         maintainer = key_id or self._caller_key_id
         if not maintainer:
             raise ValueError("register needs a maintainer key_id")
-        L.create_pool(self._conn, pool_id, name, maintainer, relay_url=relay_url, owner_discord_user_id=discord_user_id)
+        # Phase 2: the pool maintainer IS the gateway owner — the maintainer
+        # must be this gateway's identity. No second owner / second pool.
+        if maintainer != self._caller_key_id:
+            raise ValueError("register refused: maintainer must be the gateway owner")
+        L.create_pool(self._conn, pool_id, name, maintainer, relay_url=relay_url, owner_discord_user_id=discord_user_id, owner_gateway_key_id=self._caller_key_id)
         # Record the maintainer's box pubkey so submit wraps the DEK for the
         # maintainer too (fixes "maintainer has no wrapped DEK" at audit).
         _irow = self._conn.execute(
@@ -569,9 +573,25 @@ class PoolService:
 
     def _require_owner(self, pool_id, source) -> None:
         # No legacy skip: absence of an owner row = refusal.
+        # Phase 2: owner == (Discord owner) AND (same gateway). The gateway
+        # arm only gates maintaining/hosting verbs (this method's callers);
+        # fetch/claim use _require_authorized and are unaffected, so a
+        # cross-gateway agent interacting with a remote pool still works.
+        # Key rotation: if the gateway identity changed, owner verbs are
+        # refused until the pool is re-registered; the stored column is
+        # never silently updated.
         user_id = self._discord_user(source)
         if user_id is None or not L.is_owner(self._conn, pool_id, user_id):
             raise PermissionError(f"not authorized for pool {pool_id} — ask the maintainer")
+        row = self._conn.execute(
+            "SELECT owner_gateway_key_id, maintainer_key_id FROM pools WHERE pool_id=?",
+            (pool_id,)).fetchone()
+        owner_gateway = (row[0] if row and row[0] else
+                         row[1] if row else None)
+        if owner_gateway != self._caller_key_id:
+            raise PermissionError(
+                "gateway identity changed: caller is not the pool's owner gateway — "
+                "re-register the pool to continue")
 
     def _require_authorized(self, pool_id, source) -> None:
         # No legacy skip: absence of whitelist rows = refusal.
@@ -888,6 +908,17 @@ class PoolService:
         resolved = self._resolve_pool(pool_id, source=source)
         self._check_not_frozen(resolved)
         self._require_authorized(resolved, source)
+        # Phase 2: only the pool maintainer gateway may accept a push.
+        # The caller must be the pool's owner gateway (== maintainer by the
+        # registration gate). This is the maintainer gate for accept().
+        _pool_row = self._conn.execute(
+            "SELECT owner_gateway_key_id, maintainer_key_id FROM pools WHERE pool_id=?",
+            (resolved,)).fetchone()
+        _owner_gateway = (_pool_row[0] if _pool_row and _pool_row[0] else
+                          _pool_row[1] if _pool_row else None)
+        if _owner_gateway != self._caller_key_id:
+            raise PermissionError(
+                "push deliver refused: only the pool maintainer gateway may accept")
         grant = L.get_push_grant(self._conn, token)
         if grant is None or grant.get("consumed_at") is not None:
             raise PermissionError("push deliver refused: unknown or replayed grant token")
@@ -999,9 +1030,11 @@ class PoolService:
         if maintainer_id not in members:
             raise RuntimeError(f"maintainer {maintainer_id!r} is not a pool member")
         maintainer_sk = self._caller_sk
-        # RepoPropagator only uses maintainer_signing_key in accept() (Phase 5);
-        # submit/audit run as the caller. The caller's key is a safe stand-in
-        # until the maintainer gate lands.
+        # RepoPropagator only uses maintainer_signing_key in accept().
+        # push_deliver gates accept() to the pool maintainer gateway (Phase
+        # 2), so by the time accept() runs the caller IS the maintainer;
+        # submit/audit legitimately run as the (possibly non-maintainer)
+        # caller.
         return RepoPropagator(
             self._conn, self._transport_overrides.get(pool_id, self._transport),
             pool_id=pool_id,

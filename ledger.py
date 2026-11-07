@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS pools (
     name TEXT NOT NULL,
     maintainer_key_id TEXT NOT NULL,
     owner_discord_user_id TEXT,
+    owner_gateway_key_id TEXT,
     relay_url TEXT NOT NULL DEFAULT '',
     settings_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL
@@ -208,6 +209,24 @@ def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
         conn.commit()
     except Exception:
         pass
+    # --- Phase 2 (WO-021) gateway-owner migration ------------------------
+    # pools.owner_gateway_key_id records the gateway identity that
+    # registered/hosts the pool (== maintainer by the registration gate).
+    # Additive only; pre-Phase-2 rows are backfilled from maintainer_key_id
+    # (before Phase 2 the maintainer was the hosting gateway identity).
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(pools)")}
+        if "owner_gateway_key_id" not in cols:
+            conn.execute("ALTER TABLE pools ADD COLUMN owner_gateway_key_id TEXT")
+            conn.commit()
+        conn.execute(
+            "UPDATE pools SET owner_gateway_key_id = maintainer_key_id "
+            "WHERE owner_gateway_key_id IS NULL OR owner_gateway_key_id = ''")
+        conn.commit()
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version','6')")
+        conn.commit()
+    except Exception:
+        pass
     # --- Phase 1 (2.6.0) ticket-state migration -------------------------
     # MIGRATION_2_6_0_START
     # Old ticket states map onto the three-state machine. Idempotent and
@@ -264,15 +283,19 @@ def record_event(conn, pool_id, kind, payload=None) -> None:
     conn.commit()
 
 
-def create_pool(conn, pool_id, name, maintainer_key_id, relay_url="", settings=None, owner_discord_user_id=None) -> None:
+def create_pool(conn, pool_id, name, maintainer_key_id, relay_url="", settings=None, owner_discord_user_id=None, owner_gateway_key_id=None) -> None:
     _existing = conn.execute("SELECT pool_id FROM pools LIMIT 1").fetchone()
     if _existing is not None:
         raise ValueError(
             f"this gateway already hosts pool {_existing[0]} — one pool per gateway")
+    # Phase 2: the owner gateway is the gateway identity that registered the
+    # pool. Defaults to the maintainer (the registration gate requires
+    # maintainer == caller/gateway identity).
+    _owner_gateway = owner_gateway_key_id or maintainer_key_id
     conn.execute(
-        "INSERT INTO pools (pool_id, name, maintainer_key_id, owner_discord_user_id, relay_url, settings_json, created_at)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (pool_id, name, maintainer_key_id, str(owner_discord_user_id) if owner_discord_user_id else None, relay_url,
+        "INSERT INTO pools (pool_id, name, maintainer_key_id, owner_discord_user_id, owner_gateway_key_id, relay_url, settings_json, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (pool_id, name, maintainer_key_id, str(owner_discord_user_id) if owner_discord_user_id else None, _owner_gateway, relay_url,
          json.dumps(settings or {}), _now()))
     if owner_discord_user_id:
         conn.execute("INSERT OR IGNORE INTO pool_authorized (pool_id, discord_user_id) VALUES (?,?)",

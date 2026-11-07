@@ -153,6 +153,14 @@ def test_member_roles_persist(conn):
 
 # --- service + gateway integration -----------------------------------------
 
+def _as_gateway(conn, ident):
+    """Phase 2 (WO-021): the test identity IS the gateway identity, so the
+    pool's maintainer/owner-gateway must be that identity for owner verbs."""
+    conn.execute("UPDATE pools SET maintainer_key_id=?, owner_gateway_key_id=?",
+                 (ident.key_id, ident.key_id))
+    conn.commit()
+
+
 def _service(conn, gateway=None, ident=None, transport=None):
     # gateway arg ignored (legacy)
     if ident is None:
@@ -166,6 +174,7 @@ def _service(conn, gateway=None, ident=None, transport=None):
 def test_ticket_creation_thread_and_state_marker(conn, tmp_path):
     ident = ensure_identity(tmp_path / "a")
     svc = _service(conn, None, ident)
+    _as_gateway(conn, ident)
     ticket = svc.add_ticket("pool-1", "demo", "Fix the thing", brief="Scope: src/a.py. Accept: tests green.", source=SRC)
     assert ticket["state"] == "open"
     assert ticket["title"] == "Fix the thing"
@@ -239,6 +248,7 @@ def test_full_flow_claim_fetch_complete(tmp_path):
 def test_freeze_via_service_blocks_claim_and_ticket(conn, tmp_path):
     ident = ensure_identity(tmp_path / "b")
     svc = _service(conn, None, ident)
+    _as_gateway(conn, ident)
     svc.freeze("pool-1", True, source=SRC)
     with pytest.raises(ClaimRefused, match="frozen"):
         svc.add_ticket("pool-1", "demo", "Nope", source=SRC)
@@ -364,6 +374,7 @@ def test_command_handlers_smoke(tmp_path):
 def test_add_ticket_records_thread_ref_from_source(conn, tmp_path):
     ident = ensure_identity(tmp_path / "a")
     svc = _service(conn, None, ident)
+    _as_gateway(conn, ident)
     src = {"chat_id": "chat-1", "thread_id": "th-1", "guild_id": "g-1", "user_id": OWNER}
     ticket = svc.add_ticket("pool-1", "demo", "Threaded", brief="b", source=src)
     assert ticket["thread_ref"] and "chat-1" in ticket["thread_ref"]
@@ -375,6 +386,7 @@ def test_add_ticket_records_thread_ref_from_source(conn, tmp_path):
 def test_claim_returns_notice_text_and_queues_for_next_command(conn, tmp_path):
     ident = ensure_identity(tmp_path / "a")
     svc = _service(conn, None, ident)
+    _as_gateway(conn, ident)
     ticket = svc.add_ticket("pool-1", "demo", "Claimable", brief="b", source=SRC)
     claim = svc.claim(ticket["ticket_id"], declared_paths=["src/a.py"], source=SRC)
     assert claim["notice"] and "claimed" in claim["notice"]
@@ -386,6 +398,7 @@ def test_claim_returns_notice_text_and_queues_for_next_command(conn, tmp_path):
 def test_notice_queue_surfaces_on_next_command(conn, tmp_path):
     ident = ensure_identity(tmp_path / "a")
     svc = _service(conn, None, ident)
+    _as_gateway(conn, ident)
     svc.freeze("pool-1", True, source=SRC)
     # freeze queued a notice; next drain (via handler) surfaces it
     queued = svc.drain_notices()
