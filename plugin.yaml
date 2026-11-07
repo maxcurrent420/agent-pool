@@ -11,6 +11,7 @@ python_dependencies:
   - "blake3>=0.4,<2"
 provides_tools:
   - pool_status
+  - pool_report_usage
 provides_hooks: []
 config_schema:
   relay_url:
@@ -41,6 +42,10 @@ config_schema:
     type: int
     default: 5
     description: "Per-claim budget: max tasks per day per worker"
+  agent_task_allocations:
+    type: dict
+    default: {}
+    description: "Per-agent task-count budget on the pool (key_id -> int): the maximum number of tasks the agent may COMPLETE. Once an agent's completed-task count reaches its allocation, further claims and pushes for that agent are refused. Precedence: AGENT_POOL_TASK_ALLOCATIONS env (comma-separated key_id=N pairs) > this config > max_tasks_per_day > 5. No pool-level budget and no slash command for allocations."
   token_cap:
     type: int
     default: 50000

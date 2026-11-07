@@ -227,11 +227,15 @@ def _service_for(ctx, source=None):
         ("max_turns", 25), ("max_tasks_per_day", 5),
         ("token_cap", 50000), ("wall_clock_seconds", 1800))}
     pool_resolver = (lambda: source) if source is not None else None
+    agent_task_allocations = _cfg(ctx, "agent_task_allocations", {}) if ctx else {}
+    if not isinstance(agent_task_allocations, dict):
+        agent_task_allocations = {}
     return PoolService(conn, transport, caller_key_id=identity.key_id,
                        caller_signing_key=identity.signing_key,
                        caller_box_sk=identity.box_sk, budget_defaults=budgets,
                        pool_resolver=pool_resolver,
-                       transport_overrides=overrides)
+                       transport_overrides=overrides,
+                       agent_task_allocations=agent_task_allocations)
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +598,40 @@ def _handle_audit(ctx, raw: str, *, source=None, session_id="", session_key="", 
         return _error(exc)
 
 
+_POOL_REPORT_USAGE_SCHEMA = {
+    "name": "pool_report_usage",
+    "description": ("Record agent-reported usage (turns/tokens/seconds) on a "
+                    "pool claim. The plugin records what the agent reports; "
+                    "exhaustion is checked separately and never auto-releases."),
+    "parameters": {"type": "object", "properties": {
+        "claim_id": {"type": "string"},
+        "turns": {"type": "integer", "default": 0},
+        "tokens": {"type": "integer", "default": 0},
+        "seconds": {"type": "integer", "default": 0}}, "required": ["claim_id"]},
+}
+
+
+def _pool_report_usage(args=None, **kwargs):
+    """Agent-facing usage reporting tool (next to pool_status; no slash command)."""
+    ctx = kwargs.get("ctx")
+    args = args or {}
+    try:
+        svc = _service_for(ctx)
+        claim_id = str(args.get("claim_id", "") or "").strip()
+        if not claim_id:
+            return json.dumps({"ok": False, "error": "pool_report_usage needs claim_id"})
+        row = svc.report_usage(
+            claim_id, turns=int(args.get("turns", 0) or 0),
+            tokens=int(args.get("tokens", 0) or 0),
+            seconds=int(args.get("seconds", 0) or 0))
+        return json.dumps({"ok": True, "claim_id": claim_id,
+                           "turns_used": row.get("turns_used", 0),
+                           "tokens_used": row.get("tokens_used", 0),
+                           "wall_seconds_used": row.get("wall_seconds_used", 0)})
+    except Exception as exc:  # never raise from a handler
+        return json.dumps({"ok": False, "error": str(exc)})
+
+
 _POOL_STATUS_SCHEMA = {
     "name": "pool_status",
     "description": ("Report Agent Pool plugin status: relay URL, per-claim budgets, "
@@ -774,6 +812,9 @@ def register(ctx):
         ctx.register_tool(name="pool_status", toolset="agent_pool",
                           schema=_POOL_STATUS_SCHEMA,
                           handler=lambda args=None, **kw: _pool_status(args, ctx=ctx, **kw))
+        ctx.register_tool(name="pool_report_usage", toolset="agent_pool",
+                          schema=_POOL_REPORT_USAGE_SCHEMA,
+                          handler=lambda args=None, **kw: _pool_report_usage(args, ctx=ctx, **kw))
     except Exception as exc:
         logger.warning("agent-pool: tool registration failed: %s", exc)
     for name, handler, description, args_hint in _COMMANDS:

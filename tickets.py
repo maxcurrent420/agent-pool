@@ -8,6 +8,7 @@ Discord client and never imports ``discord``.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import subprocess
 from pathlib import Path
@@ -41,6 +42,33 @@ def _ticket_payload(ticket: dict) -> dict:
     }
 
 
+def _parse_env_allocations(raw: str) -> dict:
+    """Parse ``AGENT_POOL_TASK_ALLOCATIONS`` ("agent:a=2,agent:b=3").
+
+    Malformed pairs are ignored; the value must be a non-negative int.
+    """
+    out = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, _, value = pair.partition("=")
+        try:
+            n = int(value.strip())
+        except ValueError:
+            continue
+        if key.strip() and n >= 0:
+            out[key.strip()] = n
+    return out
+
+
+def _fmt_num(value):
+    """Render a usage/limit number without a trailing '.0'."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 class PoolNotLocalError(Exception):
     """A gateway command named a pool not hosted by this agent (D3)."""
 
@@ -60,7 +88,8 @@ class PoolService:
     def __init__(self, conn, *args,
                  transport=None, caller_key_id: str = "", caller_signing_key=None,
                  caller_box_sk=None, budget_defaults=None, pool_resolver=None,
-                 gateway=None, transport_overrides=None):
+                 gateway=None, transport_overrides=None,
+                 agent_task_allocations=None, worktree_root=None):
         # Backwards-compat: old call sites passed (conn, gateway, transport).
         # Duck-type: anything with post_notice is a legacy gateway (ignored).
         if args:
@@ -86,6 +115,28 @@ class PoolService:
         self._caller_box_sk = caller_box_sk
         self._budget_defaults = budget_defaults
         self._pool_resolver = pool_resolver
+        # Phase 3: per-agent task allocations (config mapping) + env override
+        # read at construction. Precedence: env > config > max_tasks_per_day
+        # config > 5. No pool-level budgets.
+        self._agent_task_allocations = dict(agent_task_allocations or {})
+        self._env_task_allocations = _parse_env_allocations(
+            os.environ.get("AGENT_POOL_TASK_ALLOCATIONS", ""))
+        # The agent's configured checkout root for per-ticket worktrees.
+        self._worktree_root = (
+            worktree_root
+            or os.environ.get("AGENT_POOL_WORKTREE_ROOT", "").strip()
+            or "/tmp/agent-pool-worktrees").rstrip("/")
+
+    def _allocation_for(self, key_id) -> int:
+        """Resolved task allocation for one agent on this pool."""
+        if key_id in self._env_task_allocations:
+            return self._env_task_allocations[key_id]
+        if key_id in self._agent_task_allocations:
+            return int(self._agent_task_allocations[key_id])
+        try:
+            return int((self._budget_defaults or {}).get("max_tasks_per_day", 5))
+        except (TypeError, ValueError):
+            return 5
 
     # -- pool resolution + isolation (D2/D3) ---------------------------------
 
@@ -705,6 +756,31 @@ class PoolService:
             return t
         raise ValueError(f"unknown ticket: {ticket_id!r}")
 
+    def _worktree_spec(self, repo_id, ticket_id):
+        """Per-ticket worktree spec handed to the agent (Phase 3).
+
+        The plugin specifies; the agent runs the git operations at the
+        returned path/branch. No git is shelled out here.
+        """
+        worktree_path = f"{self._worktree_root}/{repo_id}/worktree-{ticket_id}"
+        branch = f"pool/{ticket_id}"
+        manifest = L.get_latest_accepted_manifest(self._conn, repo_id)
+        version = manifest.get("version") if manifest else None
+        base_ref = f"v{version}" if version is not None else ""
+        return worktree_path, branch, base_ref
+
+    def _active_cleanup_notice(self, ticket_id) -> str | None:
+        """Exact worktree cleanup notice for the ticket's active claim.
+
+        The agent performs the git cleanup; the notice text is the contract
+        (no cleanup hook exists).
+        """
+        claim = L.get_active_claim(self._conn, ticket_id)
+        if claim is None or not claim.get("worktree_path") or not claim.get("branch"):
+            return None
+        return (f"release worktree {claim['worktree_path']}"
+                f" and delete branch {claim['branch']}")
+
     def _set_state_and_notify(self, ticket, state) -> dict:
         updated = L.set_ticket_state(self._conn, ticket["ticket_id"], state)
         notice = (f"{STATE_MARKER.format(state=state)} ticket "
@@ -740,10 +816,22 @@ class PoolService:
         key = bound or presented
         if not key:
             raise ValueError("claim needs a claimant key_id")
+        # Phase 3: the agent's task-count budget is the primary stop. The
+        # budget belongs to the agent (claimant key), not the pool/ticket.
+        agent_budget = L.ensure_agent_budget(
+            self._conn, ticket["pool_id"], key, self._allocation_for(key))
+        if agent_budget["tasks_completed"] >= agent_budget["task_allocation"]:
+            raise L.ClaimRefused(
+                f"agent budget exhausted: {agent_budget['tasks_completed']} of"
+                f" {agent_budget['task_allocation']} tasks completed on pool"
+                f" {ticket['pool_id']} — no further claims allowed")
+        worktree_path, branch, base_ref = self._worktree_spec(
+            ticket["repo_id"], ticket_id)
         claim = L.claim_ticket_enforced(
             self._conn, f"c-{secrets.token_hex(4)}", ticket_id, key,
             declared_paths=declared_paths, budget=budget,
-            maintainer_override=maintainer_override)
+            maintainer_override=maintainer_override,
+            worktree_path=worktree_path, branch=branch, base_ref=base_ref)
         if not bound and user_id and key:
             L.bind_membership(self._conn, ticket["pool_id"], user_id, key)
         ticket = L.get_ticket(self._conn, ticket_id)
@@ -753,6 +841,13 @@ class PoolService:
         claim = dict(claim)
         claim["notice"] = notice
         claim["state_word"] = "claimed"
+        claim["worktree_path"] = worktree_path
+        claim["branch_name"] = branch
+        claim["branch"] = branch
+        claim["base_ref"] = base_ref
+        claim["budget"] = json.loads(claim.get("budget_json") or "{}")
+        claim["stop_condition"] = {"condition": "budget_exhausted",
+                                   "enforce": True}
         return claim
 
     def claim_any(self, pool_id=None, repo_id=None, max_tasks=1, key_id=None,
@@ -786,7 +881,13 @@ class PoolService:
                 claimed.append({"ticket_id": ticket["ticket_id"],
                                 "title": ticket["title"],
                                 "repo_id": ticket["repo_id"],
-                                "claim_id": c.get("claim_id", "")})
+                                "claim_id": c.get("claim_id", ""),
+                                "worktree_path": c.get("worktree_path", ""),
+                                "branch_name": c.get("branch_name", ""),
+                                "branch": c.get("branch", ""),
+                                "base_ref": c.get("base_ref", ""),
+                                "budget": c.get("budget", {}),
+                                "stop_condition": c.get("stop_condition", {})})
             except (L.ClaimRefused, ValueError) as exc:
                 skipped.append({"ticket_id": ticket["ticket_id"],
                                 "reason": str(exc)})
@@ -802,11 +903,16 @@ class PoolService:
         # Whitelist: authorized-level verb.
         self._require_authorized(ticket["pool_id"], source)
         key = key_id or self._whitelist_bound_key(ticket["pool_id"], source) or self._caller_key_id
+        cleanup_notice = self._active_cleanup_notice(ticket_id)
         updated = L.release_ticket(self._conn, ticket_id, key)
         notice = f"{STATE_MARKER.format(state='open')} ticket {ticket_id} released"
         self._queue_notice(updated["pool_id"], notice, kind="ticket_release")
         updated = dict(updated)
         updated["notice"] = notice
+        if cleanup_notice:
+            updated["cleanup_notice"] = cleanup_notice
+            self._queue_notice(updated["pool_id"], cleanup_notice,
+                               kind="worktree_cleanup")
         return updated
 
     def complete(self, ticket_id, key_id=None, *, source=None) -> dict:
@@ -815,11 +921,16 @@ class PoolService:
         self._check_not_frozen(ticket["pool_id"])
         self._require_authorized(ticket["pool_id"], source)
         key = key_id or self._whitelist_bound_key(ticket["pool_id"], source) or self._caller_key_id
+        cleanup_notice = self._active_cleanup_notice(ticket_id)
         updated = L.complete_ticket(self._conn, ticket_id, key)
         notice = f"{STATE_MARKER.format(state='completed')} ticket {ticket_id} completed"
         self._queue_notice(updated["pool_id"], notice, kind="ticket_completed")
         updated = dict(updated)
         updated["notice"] = notice
+        if cleanup_notice:
+            updated["cleanup_notice"] = cleanup_notice
+            self._queue_notice(updated["pool_id"], cleanup_notice,
+                               kind="worktree_cleanup")
         return updated
 
     # -- Phase 4: push write path (grant -> push -> deliver -> complete) -----
@@ -930,6 +1041,17 @@ class PoolService:
             raise PermissionError(
                 f"push deliver refused: ticket {ticket['ticket_id']!r} is "
                 f"{ticket['state']!r} (grant expired — released or completed)")
+        # Phase 3: the claimant's task-count budget is checked before accept.
+        # The push that completes the last allowed task still succeeds: this
+        # check runs before this push's completion is recorded.
+        agent_budget = L.ensure_agent_budget(
+            self._conn, resolved, grant["key_id"],
+            self._allocation_for(grant["key_id"]))
+        if agent_budget["tasks_completed"] >= agent_budget["task_allocation"]:
+            raise L.ClaimRefused(
+                f"agent budget exhausted: {agent_budget['tasks_completed']} of"
+                f" {agent_budget['task_allocation']} tasks completed on pool"
+                f" {resolved} — push refused")
         if not manifest:
             raise ValueError("push deliver needs the contributor-signed manifest (--manifest <json>)")
         if manifest.get("transfer_ticket") != transfer_ticket:
@@ -992,6 +1114,57 @@ class PoolService:
                 "dek_rotated": accepted.get("dek_rotated", False),
                 "report_hash": aud["report_hash"],
                 "audit_id": aud["audit_id"], "notice": notice}
+
+    # -- budget usage reporting (secondary, agent-reported) --------------------
+    # Turns/tokens/wall-clock are recorded only when the agent reports them.
+    # check_budget/enforce_budget act on those rows; when nothing was
+    # reported only the task-count limit applies. No auto-release ever:
+    # exhaustion raises and the claimant must /release or push.
+
+    def report_usage(self, claim_id, turns=0, tokens=0, seconds=0) -> dict:
+        """Record agent-reported usage on a claim (increments, never resets)."""
+        row = self._conn.execute(
+            "SELECT claim_id FROM claims WHERE claim_id=?",
+            (str(claim_id),)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown claim: {claim_id!r}")
+        self._conn.execute(
+            "UPDATE claims SET turns_used=turns_used+?, tokens_used=tokens_used+?,"
+            " wall_seconds_used=wall_seconds_used+? WHERE claim_id=?",
+            (int(turns or 0), int(tokens or 0), float(seconds or 0), str(claim_id)))
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT * FROM claims WHERE claim_id=?", (str(claim_id),)).fetchone()
+        return dict(row)
+
+    def check_budget(self, claim_id) -> dict:
+        """Secondary fields only: {ok, exceeded} (+ used/limit when exceeded)."""
+        row = self._conn.execute(
+            "SELECT * FROM claims WHERE claim_id=?", (str(claim_id),)).fetchone()
+        if row is None:
+            raise ValueError(f"unknown claim: {claim_id!r}")
+        claim = dict(row)
+        budget = json.loads(claim.get("budget_json") or "{}")
+        for field, used_key, limit_key in (
+                ("turns", "turns_used", "max_turns"),
+                ("tokens", "tokens_used", "token_cap"),
+                ("seconds", "wall_seconds_used", "wall_clock_seconds")):
+            used = claim.get(used_key, 0) or 0
+            limit = budget.get(limit_key)
+            if limit is not None and used > limit:
+                return {"ok": False, "exceeded": field, "used": used,
+                        "limit": limit}
+        return {"ok": True, "exceeded": None}
+
+    def enforce_budget(self, claim_id) -> dict:
+        """Raise ClaimRefused when a secondary field is exceeded."""
+        result = self.check_budget(claim_id)
+        if not result["ok"]:
+            raise L.ClaimRefused(
+                f"budget exhausted: {result['exceeded']}"
+                f" ({_fmt_num(result['used'])}/{_fmt_num(result['limit'])})"
+                " — release or push now")
+        return result
 
     # -- pool stewardship ------------------------------------------
 

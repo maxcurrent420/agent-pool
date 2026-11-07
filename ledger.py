@@ -84,7 +84,21 @@ CREATE TABLE IF NOT EXISTS claims (
     state TEXT NOT NULL DEFAULT 'active',
     declared_paths_json TEXT NOT NULL DEFAULT '[]',
     budget_json TEXT NOT NULL DEFAULT '{}',
+    worktree_path TEXT,
+    branch TEXT,
+    base_ref TEXT,
+    turns_used INTEGER NOT NULL DEFAULT 0,
+    tokens_used INTEGER NOT NULL DEFAULT 0,
+    wall_seconds_used REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_budgets (
+    pool_id TEXT NOT NULL REFERENCES pools(pool_id),
+    key_id TEXT NOT NULL,
+    task_allocation INTEGER NOT NULL DEFAULT 0,
+    tasks_completed INTEGER NOT NULL DEFAULT 0,
+    tasks_released INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (pool_id, key_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_claim_per_ticket
     ON claims (ticket_id) WHERE state = 'active';
@@ -163,7 +177,7 @@ CREATE TABLE IF NOT EXISTS push_grants (
 """
 
 TABLES = ("pools", "members", "identities", "repos", "repo_versions",
-          "manifest_chain", "tickets", "claims", "file_claims", "audits",
+          "manifest_chain", "tickets", "claims", "agent_budgets", "file_claims", "audits",
           "events", "remote_repos", "pool_authorized", "pool_memberships", "pool_gateways",
           "push_grants")
 
@@ -183,6 +197,20 @@ def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
          "ALTER TABLE repos ADD COLUMN submitter_key_id TEXT"),
         ("members", "verify_pubkey_hex",
          "ALTER TABLE members ADD COLUMN verify_pubkey_hex TEXT NOT NULL DEFAULT ''"),
+        # Phase 3 (WO-022): per-ticket worktree/branch spec + agent-reported
+        # usage counters live on the claim row.
+        ("claims", "worktree_path",
+         "ALTER TABLE claims ADD COLUMN worktree_path TEXT"),
+        ("claims", "branch",
+         "ALTER TABLE claims ADD COLUMN branch TEXT"),
+        ("claims", "base_ref",
+         "ALTER TABLE claims ADD COLUMN base_ref TEXT"),
+        ("claims", "turns_used",
+         "ALTER TABLE claims ADD COLUMN turns_used INTEGER NOT NULL DEFAULT 0"),
+        ("claims", "tokens_used",
+         "ALTER TABLE claims ADD COLUMN tokens_used INTEGER NOT NULL DEFAULT 0"),
+        ("claims", "wall_seconds_used",
+         "ALTER TABLE claims ADD COLUMN wall_seconds_used REAL NOT NULL DEFAULT 0"),
     ):
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if col not in cols:
@@ -338,13 +366,19 @@ def create_ticket(conn, ticket_id, pool_id, repo_id, title, brief="",
     conn.commit()
 
 
-def claim_ticket(conn, claim_id, ticket_id, key_id, declared_paths=None, budget=None) -> None:
-    """One-ticket-one-worker: the partial unique index refuses a second active claim."""
+def claim_ticket(conn, claim_id, ticket_id, key_id, declared_paths=None, budget=None,
+                 worktree_path=None, branch=None, base_ref=None) -> None:
+    """One-ticket-one-worker: the partial unique index refuses a second active claim.
+
+    Phase 3: worktree_path/branch/base_ref persist the per-ticket worktree
+    spec handed to the agent (the plugin specifies; the agent runs git).
+    """
     conn.execute(
         "INSERT INTO claims (claim_id, ticket_id, key_id, state, declared_paths_json,"
-        " budget_json, created_at) VALUES (?,?,?,'active',?,?,?)",
+        " budget_json, worktree_path, branch, base_ref, created_at)"
+        " VALUES (?,?,?,'active',?,?,?,?,?,?)",
         (claim_id, ticket_id, key_id, json.dumps(list(declared_paths or [])),
-         json.dumps(budget or {}), _now()))
+         json.dumps(budget or {}), worktree_path, branch, base_ref, _now()))
     conn.execute(
         "UPDATE tickets SET state='claimed', claimant_key_id=?, updated_at=? WHERE ticket_id=?",
         (key_id, _now(), ticket_id))
@@ -631,7 +665,8 @@ def _live_file_claims(conn, repo_id, ticket_id) -> list:
 
 
 def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None,
-                          budget=None, maintainer_override=False) -> dict:
+                          budget=None, maintainer_override=False,
+                          worktree_path=None, branch=None, base_ref=None) -> dict:
     """Ledger-enforced claim: frozen check, overlap refused,
     one-ticket-one-worker, budget persisted. Returns the claim row.
 
@@ -675,7 +710,8 @@ def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None
     try:
         # claim_ticket() inserts the claim + file_claims and flips the ticket.
         claim_ticket(conn, claim_id, ticket_id, key_id,
-                     declared_paths=claim_paths, budget=full_budget)
+                     declared_paths=claim_paths, budget=full_budget,
+                     worktree_path=worktree_path, branch=branch, base_ref=base_ref)
     except sqlite3.IntegrityError as exc:  # double-claim race / dup paths
         raise ClaimRefused(f"claim refused: {exc}") from exc
     if overlaps:
@@ -688,6 +724,58 @@ def claim_ticket_enforced(conn, claim_id, ticket_id, key_id, declared_paths=None
     claim = dict(row)
     claim["whole_ticket"] = whole_ticket
     return claim
+
+
+# --- Phase 3 (WO-022): per-agent task-count budget --------------------------
+# The budget belongs to the AGENT (claimant key on the pool), not the pool
+# and not the ticket. task_allocation is the resolved per-agent allocation
+# (config/env, see PoolService); tasks_completed counts completed tasks and
+# is the primary, always-enforced stop. tasks_released is audit-only: a
+# released ticket does not consume the completed-task budget.
+
+def get_agent_budget(conn, pool_id, key_id) -> dict | None:
+    row = conn.execute(
+        "SELECT pool_id, key_id, task_allocation, tasks_completed, tasks_released"
+        " FROM agent_budgets WHERE pool_id=? AND key_id=?",
+        (pool_id, key_id)).fetchone()
+    return dict(row) if row else None
+
+
+def ensure_agent_budget(conn, pool_id, key_id, allocation) -> dict:
+    """Create the agent's budget row, or refresh its allocation.
+
+    tasks_completed/tasks_released are never reset: a config/env change
+    only moves the allocation, never the counts.
+    """
+    conn.execute(
+        "INSERT INTO agent_budgets (pool_id, key_id, task_allocation)"
+        " VALUES (?,?,?) ON CONFLICT(pool_id, key_id) DO UPDATE"
+        " SET task_allocation=excluded.task_allocation",
+        (pool_id, key_id, int(allocation)))
+    conn.commit()
+    row = get_agent_budget(conn, pool_id, key_id)
+    assert row is not None  # just upserted
+    return row
+
+
+def record_task_completed(conn, pool_id, key_id) -> None:
+    """Increment tasks_completed by 1 (a task transitioned to completed)."""
+    conn.execute(
+        "INSERT INTO agent_budgets (pool_id, key_id, tasks_completed)"
+        " VALUES (?,?,1) ON CONFLICT(pool_id, key_id) DO UPDATE"
+        " SET tasks_completed=tasks_completed+1",
+        (pool_id, key_id))
+    conn.commit()
+
+
+def record_task_released(conn, pool_id, key_id) -> None:
+    """Increment tasks_released by 1 (audit only; completion budget untouched)."""
+    conn.execute(
+        "INSERT INTO agent_budgets (pool_id, key_id, tasks_released)"
+        " VALUES (?,?,1) ON CONFLICT(pool_id, key_id) DO UPDATE"
+        " SET tasks_released=tasks_released+1",
+        (pool_id, key_id))
+    conn.commit()
 
 
 def release_ticket(conn, ticket_id, key_id) -> dict:
@@ -708,6 +796,7 @@ def release_ticket(conn, ticket_id, key_id) -> dict:
         "UPDATE tickets SET state='open', claimant_key_id=NULL, updated_at=? WHERE ticket_id=?",
         (_now(), ticket_id))
     conn.commit()
+    record_task_released(conn, ticket["pool_id"], ticket["claimant_key_id"])
     record_event(conn, ticket["pool_id"], "released",
                  {"ticket_id": ticket_id, "key_id": key_id})
     return get_ticket_or_raise(conn, ticket_id)
@@ -732,6 +821,7 @@ def complete_ticket(conn, ticket_id, key_id=None) -> dict:
     conn.execute("DELETE FROM file_claims WHERE ticket_id=?", (ticket_id,))
     conn.execute("UPDATE tickets SET state='completed', updated_at=? WHERE ticket_id=?", (_now(), ticket_id))
     conn.commit()
+    record_task_completed(conn, ticket["pool_id"], ticket["claimant_key_id"])
     record_event(conn, ticket["pool_id"], "completed", {"ticket_id": ticket_id, "key_id": ticket["claimant_key_id"]})
     return get_ticket_or_raise(conn, ticket_id)
 
