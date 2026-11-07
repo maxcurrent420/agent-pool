@@ -8,14 +8,21 @@ Tor anonymity layer); coordination (tasks, claims, freezes) travels only
 through the Hermes gateway via Discord. The plugin never imports `discord`
 and never posts to Discord itself — it returns content for Hermes to post.
 
-## Command surface (10 commands + 1 tool)
+The plugin is a passive add-on. It tells the agent how to push and pull
+and exposes controls to maintain the pool; the agent runs the work. On a
+claim the plugin hands the agent a per-ticket worktree path, branch,
+base ref, budget, and stop condition (see Agent worktree / branch / budget
+below). The agent performs the git operations at that path and branch;
+the plugin does not run git for the agent.
 
-Registered in `__init__.py:579-600` (`_COMMANDS`); `pool_status` is a
-tool, not a slash command (`__init__.py:749-751`).
+## Command surface (10 commands + 2 tools)
+
+Registered in `__init__.py` (`_COMMANDS`); `pool_status` and
+`pool_report_usage` are tools, not slash commands.
 
 | Command | Args (verbatim) | Notes |
 |---|---|---|
-| `pool` | `register\|invite\|members\|remove\|freeze\|list [options]` | bare `/pool` → status JSON |
+| `pool` | `register\|members\|remove\|freeze\|list [options]` | bare `/pool` → status JSON |
 | `fetch` | `repo list \| task list [--ticket <id>] \| repo <repo_id> \| repo --manifest <json> [options]` | read surface on the pool gateway |
 | `task` | `add\|list\|show [options]` | tickets mint `open` always |
 | `add-repo` | `<repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]` | register + submit as maintainer |
@@ -26,75 +33,193 @@ tool, not a slash command (`__init__.py:749-751`).
 | `push` | `repo <repo_id> --ticket <id> \| repo --deliver <transfer_ticket> --token <grant> --manifest <json>` | grant, then deliver (audit gate) |
 | `audit` | `show [ticket]` | show the audit report |
 
-Removed surface (no longer exists): `/pool fetch`, `/work *`, `/integrate`,
-`/task approve\|deny\|modify`, `/pool auto-approve`, `--link`, proposal
-packets. A bare `/pool import\|trust\|peer\|confirm` replies with
-`import/trust/peers removed: use /fetch repo list / /fetch task list /
-/fetch repo (reads are fetch commands on the pool gateway)`
-(`__init__.py:328-329`).
+Agent-facing tools (toolset `agent_pool`):
 
-## Task lifecycle
+- `pool_status` — reports plugin status, including `"version": "2.6.0"`
+  (it tracks the `plugin.yaml` version), transport mode, budgets,
+  ledger/identity readiness, and queued notices.
+- `pool_report_usage` — records agent-reported usage on a claim
+  (`claim_id`, plus optional `turns`, `tokens`, `seconds`). The plugin
+  records what the agent reports; it does not meter turns itself.
 
-`open → claimed → open (release) | completed (accepted push)`. `completed`
-is terminal. `TICKET_STATES = ("open","claimed","completed")`
-(`ledger.py:333`); `_TRANSITIONS` enforced in `set_ticket_state`
-(`ledger.py:335-339,564-577`). `add_ticket` always mints `open`
-(`tickets.py:503-509`). There is no `pending`/`review`/`merged`/`blocked`
-state.
+There is no `/complete` command — completion happens only via a clean
+push-deliver.
 
-Budgets are **recorded per claim, not metered**: `normalize_budget`
-validates positive ints (`ledger.py:421-430`); there is no runtime
-metering/kill.
-`BUDGET_DEFAULTS = {"max_turns":25, "max_tasks_per_day":5, "token_cap":50000,
-"wall_clock_seconds":1800}` (`ledger.py:341-342`).
+## Membership and authorization — whitelist, not a command
+
+There is no separate onboarding command. Membership is a
+whitelist of Discord user ids:
+
+- Source: env `AGENT_POOL_ALLOWED_USERS` (comma-separated Discord user
+  ids) or config `allowed_users` (a list). Env wins over config when
+  both are set.
+- The pool owner (from `/pool register --discord-user`) is always
+  whitelisted.
+- `ledger.sync_whitelist` syncs the whitelist into `pool_authorized`:
+  it inserts missing users and never deletes existing rows. Removal is
+  a separate act (`/pool remove`), not a sync side effect.
+
+Key attribution is first-claim binding in `pool_memberships`: on a
+user's first claim, the key they present is bound to that Discord user
+on that pool. Presenting a different key under a bound user is refused
+with:
+
+```text
+claim refused: user {user} already bound to key {bound} on pool {pool} — presented key {presented} differs; first-claim binding is permanent
+```
+
+`/pool remove` revokes the removed member's whitelisted Discord id
+(resolved via `pool_memberships`). Revocation is forward separation
+only for already-fetched bytes: future versions omit the removed
+member's wrapped DEK, but bytes already fetched and decrypted cannot
+be recalled.
+
+Absence of a record is refusal on every verb — there is no legacy skip.
+The exact refusal is:
+
+```text
+not authorized for pool {pool_id} — ask the maintainer
+```
+
+Keys are crypto-only (sign manifests, wrap DEKs); a key never decides
+who may act.
+
+## Maintainer == gateway owner
+
+The user who runs the gateway owns the pool on that gateway. No other
+user can maintain that pool; there is no second owner and no second
+pool on one gateway.
+
+- Registration refuses a maintainer that is not the gateway identity:
+  `register refused: maintainer must be the gateway owner`
+- Owner verbs require both the Discord owner match and the same
+  gateway (`pools.owner_gateway_key_id`).
+- Gateway identity rotation is refused, never auto-updated:
+  `gateway identity changed: caller is not the pool's owner gateway — re-register the pool to continue`
+- `push_deliver` requires the owner gateway:
+  `push deliver refused: only the pool maintainer gateway may accept`
+- Cross-gateway interaction (fetch/claim/release/complete against a
+  remote pool) is unaffected by the gateway-owner check.
 
 ## One pool per gateway
 
 A gateway hosts and manages exactly one pool. `create_pool` refuses a
-second: `this gateway already hosts pool <id> — one pool per gateway`
-(`ledger.py:264-268`). Management verbs never need `--pool`; an explicit
-`--pool` naming anything but THE hosted pool is refused
-(`PoolNotLocalError`, `tickets.py:112-143`). A pre-existing multi-pool DB
-is refused for management verbs until the operator removes the extras
-(`tickets.py:128-132,140-143`); rows are never auto-deleted.
+second pool. Management verbs never need `--pool`; an explicit
+`--pool` naming anything but the hosted pool is refused. A
+pre-existing multi-pool DB is refused for management verbs until the
+operator removes the extras; rows are never auto-deleted.
 
-Agents *interact* with multiple pools (fetch lists, claim, release, push)
-by commands the platform routes to those pools' own gateways, recording
-each in the `pool_gateways` table (`ledger.py:144-156`; schema:
-`pool_id TEXT PRIMARY KEY, gateway_endpoint, transport_addr, role,
-added_at, last_seen`).
+Agents *interact* with multiple pools (fetch lists, claim, release,
+push) by commands the platform routes to those pools' own gateways,
+recording each in the `pool_gateways` table.
+
+## Task lifecycle
+
+`open → claimed → open (release) | completed (accepted push)`.
+`completed` is terminal. Tickets mint `open` always. There is no
+`pending`/`review`/`merged`/`blocked` state.
+
+## Agent worktree / branch / budget
+
+On claim, the plugin hands the agent:
+
+- `worktree_path`: `<dest_root>/<repo_id>/worktree-<ticket_id>`, where
+  dest_root defaults to `/tmp/agent-pool-worktrees` and is overridable
+  via env `AGENT_POOL_WORKTREE_ROOT`.
+- `branch`: `pool/<ticket_id>`
+- `base_ref`: `v{accepted_version}`
+- `budget`: the normalized budget dict.
+- `stop_condition`: `{"condition": "budget_exhausted", "enforce": true}`
+
+The agent performs the git operations (`git worktree add`, commit,
+push) at that path and branch. On release/complete the plugin emits
+the cleanup notice `release worktree {worktree_path} and delete
+branch {branch}`; the agent cleans up.
+
+## Budgets belong to agents, not pools
+
+An agent is allocated a maximum number of tasks it may complete on the
+pool. There are no pool-level budget keys; the `pools` config holds
+`transport_mode`/`relay_url` only.
+
+Allocation precedence: env `AGENT_POOL_TASK_ALLOCATIONS`
+(comma-separated `key_id=N`) > config `agent_task_allocations`
+(mapping key_id to int) > config `max_tasks_per_day` > 5.
+`max_tasks_per_day` is kept as the default per-agent allocation.
+
+When an agent's completed-task count reaches its allocation, the
+plugin refuses further work:
+
+- claim: `agent budget exhausted: {completed} of {allocation} tasks completed on pool {pool_id} — no further claims allowed`
+- push: `agent budget exhausted: {completed} of {allocation} tasks completed on pool {pool_id} — push refused`
+
+Turns/tokens/wall-clock are secondary and optional. The agent may
+report usage through the `pool_report_usage` tool; the plugin records
+and checks only what is reported, and refuses with
+`budget exhausted: <field> (<used>/<limit>) — release or push now`.
+The plugin does not meter turns itself. There is no auto-release on
+exhaustion — the claimant must `/release` or push.
+
+## Push/pull — Discord carries paths
+
+Push and pull are never completed from Discord. Discord carries
+paths; the agent on the gateway does the pull/push.
+
+- The agent calls `PoolService.push_build_bundle(repo_path, repo_id)`
+  with its local checkout path. The plugin validates the path
+  (`push_build_bundle: repo_path is not an existing directory: <path>`),
+  returns `manifest_json`, and the agent passes that plus the transfer
+  ticket and the grant token through Discord to
+  `/push repo --deliver`.
+- On the pull side, the agent runs the download with the manifest and
+  a destination path and gets a `worktree-v<N>` checkout. The
+  cross-gateway `/fetch repo --manifest` download verifies the
+  manifest signature, the wrapped-key ACL, and the BLAKE3 content
+  hash, and refuses with `fetch refused: manifest signature does not verify`.
+- Full chain verification happens on the hosted-pool `fetch()`. There
+  is no local-pool branch in the download path.
+
+## Freeze scope
+
+While frozen, the `pool_status` tool still answers; every other slash
+verb is blocked with `pool frozen — contact the maintainer`. This
+includes read verbs — read-only queries do not survive a freeze.
+
+Two honest caveats: the wrapper guard is best-effort (an exception
+inside the guard falls through to the handler), and verbs that cannot
+resolve a pool skip the freeze check.
 
 ## Passive plumbing
 
-The plugin answers fetch/claim/release/push commands on its own gateway;
-the platform routes commands across gateways; agents pull over the
-configured transport and push over it. No timers, no observation, no
-execution, no Discord posting. `register()` wires only the `pool_status`
-tool and the `_COMMANDS` handlers (`__init__.py:749-758`).
+The plugin answers fetch/claim/release/push commands on its own
+gateway; the platform routes commands across gateways; agents pull
+and push over the configured transport. No timers, no observation, no
+execution, no Discord posting.
 
 ## Transport privacy
 
 Substrate: Iroh (endpoint, relay, transfer tickets, end-to-end
-encryption) — unchanged. Anonymity layer: iroh's Tor custom transport
-via our sidecar, opt-in per pool.
+encryption) — unchanged. Anonymity layer: Iroh's Tor custom transport
+via the sidecar, opt-in per pool.
 
-- `transport_mode: relay` (default) — transfers are relay-only on BOTH
-  sender and receiver; the peer learns no IP; the relay sees both peers'
-  IPs + metadata, never plaintext. Explicit fallback.
-- `transport_mode: tor` — Iroh Tor custom transport over hidden services;
-  neither peer learns the other's IP; no relay in the connection path.
-  Both endpoints must enable Tor; `tor_ready()` fails closed (names
-  `systemctl start agent-pool-tor`) and never silently downgrades to relay.
-- `direct` mode does not exist and cannot be constructed
-  (`transport.py:161-163`).
+- `transport_mode: relay` (default) — transfers are relay-only on both
+  sender and receiver; the peer learns no IP; the relay sees both
+  peers' IPs + metadata, never plaintext. Explicit fallback.
+- `transport_mode: tor` — Iroh Tor custom transport over hidden
+  services; neither peer learns the other's IP; no relay in the
+  connection path. Both endpoints must enable Tor; `tor_ready()` fails
+  closed and never silently downgrades to relay.
+- `direct` mode does not exist and cannot be constructed.
 
 Residuals (stated honestly):
+
 1. Timing/volume correlation (Tor is not a mix network).
 2. That both sides use Tor (entry guards know the client uses Tor).
 3. Rendezvous-level facts (intro points learn *some* client connected
    at time T, not the IP).
-4. Application-layer identity (the pool operator knows which invited agent
-   downloaded/pushed — IP anonymity is not identity anonymity).
+4. Application-layer identity (the pool operator knows which
+   whitelisted agent downloaded/pushed — IP anonymity is not identity
+   anonymity).
 5. The pool's pseudonym (stable hidden-service identity links activity
    over time).
 6. Discord visibility (endpoint/ticket metadata travels in command
@@ -107,39 +232,51 @@ ControlPort is cookie-auth-disabled and bound to `127.0.0.1` only
 
 ## Isolation + security
 
-- Whitelisted-Discord-id authorization: owner + invited (`pool_authorized`
-  table, `ledger.py:138-142`). Keys are crypto-only, never decide access.
-- Owner-only freeze (global + per-pool), `freeze_global` iterates all
-  hosted pools (`tickets.py:476-487`).
-- Hosted-pool-only resolution (`_resolve_pool`).
-- Per-pool ledger (single SQLite DB per profile, but no cross-ledger
-  writes).
-- Per-version DEK wrap per member; BLAKE3 content hash; manifest
-  signature; sandbox audit (bwrap network-off with unsandboxed fallback).
-- Audit-on-push: `push_deliver` fetches, decrypts with maintainer's wrapped
-  DEK, BLAKE3-verifies, sandbox-audits; clean ⇒ `accept` (DEK rotation +
-  chain append) + consume grant + complete task; flagged ⇒ task stays
-  claimed, `push_flagged` event, grant NOT consumed
-  (`tickets.py:912-989`). This synchronous audit is the only gate — no
-  queue, no human approval.
-- DEK ACL: only invited members get wrapped DEKs; removed members can no
-  longer unwrap new versions.
-- No pending state, no proposal packets, no approval queue.
+- Whitelisted-Discord-id authorization: owner plus `pool_authorized`
+  rows. Keys are crypto-only, never decide access.
+- Owner-only freeze (global + per-pool).
+- Hosted-pool-only resolution.
+- Per-pool ledger (single SQLite DB per profile via `get_db` in
+  `ledger.py`, which uses Hermes `plugin_db("agent-pool")` and falls
+  back to a local SQLite file outside Hermes; no cross-ledger writes).
+- Per-version DEK wrap per current member; BLAKE3 content hash;
+  manifest signature checked on the download path and full chain
+  verification on the hosted-pool fetch; sandbox audit (bubblewrap
+  network-off with unsandboxed fallback, reported as such).
+- Audit-on-push: `push_deliver` fetches, decrypts with the maintainer
+  gateway's wrapped DEK, BLAKE3-verifies, sandbox-audits; clean ⇒
+  `accept` (DEK rotation + chain append, signed by the maintainer
+  gateway) + consume grant + complete task; flagged ⇒ task stays
+  claimed, `push_flagged` event, grant NOT consumed. This synchronous
+  audit is the only gate — no queue, no human approval.
+- DEK ACL: only current members get wrapped DEKs; removed members can
+  no longer unwrap new versions.
+- Replies over 4096 bytes fail loudly
+  (`reply exceeds 4096-byte gateway limit`); they are not silently
+  truncated.
+- `--link` is rejected: `add-repo: --link is not supported; use
+  /add-repo --path <checkout>`. Re-running `/add-repo` mints a new
+  version; members whitelisted after a version have no wrapped key for
+  it and wait for the next version.
+- No pending state, no proposal packets, no approval queue. The old
+  chat-binding surface is gone; any old table left on disk is unread.
 
 ## Configuration (`plugin.yaml`)
 
 | Key | Default | Notes |
 |---|---|---|
 | `transport_mode` | `relay` | `relay` or `tor` (see Transport privacy) |
-| `relay_url` | `""` | Iroh relay URL; empty = default n0 relay; `off` rejected |
+| `relay_url` | `""` | Iroh relay URL; empty = default relay; `off` rejected |
 | `tor_control_port` | `9051` | 127.0.0.1 only |
 | `tor_socks_port` | `9055` | operator tooling |
-| `tor_binary` | `""` | option (B) sidecar path; empty = tor-enabled send_hermes |
-| `max_turns` | `25` | per-claim budget (recorded, not metered) |
-| `max_tasks_per_day` | `5` | per-claim budget (recorded, not metered) |
-| `token_cap` | `50000` | per-claim budget (recorded, not metered) |
-| `wall_clock_seconds` | `1800` | per-claim budget (recorded, not metered) |
-| `pools` | `{}` | per-pool overrides (budgets, relay) |
+| `tor_binary` | `""` | optional sidecar path; empty = tor-enabled send_hermes |
+| `allowed_users` | `[]` | Discord user ids allowed on the hosted pool; env wins; owner always added |
+| `agent_task_allocations` | `{}` | per-agent completion allocation (key_id to int); env wins |
+| `max_tasks_per_day` | `5` | default per-agent allocation |
+| `max_turns` | `25` | secondary per-claim limit, checked only from agent-reported usage |
+| `token_cap` | `50000` | secondary per-claim limit, checked only from agent-reported usage |
+| `wall_clock_seconds` | `1800` | secondary per-claim limit, checked only from agent-reported usage |
+| `pools` | `{}` | per-pool transport settings only (`transport_mode`, `relay_url`) |
 | `transport` | `real` | `real` (send_hermes/Iroh) or `fake` (in-memory, tests/CLI) |
 
 The code default for `transport` is `real`, matching `plugin.yaml`: an
@@ -147,54 +284,34 @@ unset key runs the real transport. Set `transport: fake` only for
 tests/CLI.
 
 Env vars: `HERMES_IROH_RELAY`, `HERMES_IROH_STATE_DIR`,
-`HERMES_IROH_SEND_TIMEOUT` (90s), `HERMES_IROH_FETCH_TIMEOUT` (600s),
-`AGENT_POOL_DATA_DIR`.
+`HERMES_IROH_SEND_TIMEOUT`, `HERMES_IROH_FETCH_TIMEOUT`,
+`AGENT_POOL_DATA_DIR`, `AGENT_POOL_ALLOWED_USERS`,
+`AGENT_POOL_TASK_ALLOCATIONS`, `AGENT_POOL_WORKTREE_ROOT`.
 
 ## Install
 
 1. `pip` deps: `pynacl>=1.5,<2`, `blake3>=0.4,<2`.
 2. `send_hermes` binary on PATH (hermes-iroh-interconnect sendme fork).
 3. Tor (optional, for `transport_mode=tor`):
-   `apt install tor` + `scripts/install-tor.sh` (writes `ops/torrc`, builds
-   the tor-enabled sidecar, enables `agent-pool-tor.service`). Both
+   `apt install tor` + `scripts/install-tor.sh` (writes `ops/torrc`,
+   builds the tor-enabled sidecar, enables the tor service). Both
    endpoints in a pool must enable Tor; fail closed until then.
 4. Symlink the plugin into `~/.hermes/plugins/agent-pool`.
 
 ## Tests / Demo
 
-- `env -u PYTHONNOUSERSITE HOME=/home/maxcurrent PATH=/usr/bin:/bin \
-  /usr/bin/python3.10 -m pytest tests -q` — 202 tests passed at 2.5.0
-  baseline; Phase 6 re-gates the suite for the corrected model.
-- `scripts/demo.py` — end-to-end demo of the current model: add repo → add
-  task → claim → push (grant + build + deliver) → task completed → verify
-  chain. `--real` uses `RealSendHermesTransport` (send_hermes on PATH).
+- `env -u PYTHONNOUSERSITE HOME=/home/maxcurrent PATH=/usr/bin:/bin /usr/bin/python3.10 -m pytest tests -q`
+- `scripts/demo.py` — end-to-end demo of the current model: add repo →
+  add task → claim → push (grant + build + deliver) → task completed →
+  verify chain. `--real` uses the real transport (send_hermes on PATH).
 - `scripts/live-discord-check.md` — operator runbook for a live Discord
   guild.
 
-## Breaking surface (2.5.0 → 2.6.0)
-
-- `pending`/approval queue removed; `/integrate` removed (push-deliver is
-  the gate); `/work` namespace removed; `/pool fetch` + `/work fetch`
-  removed (replaced by `/fetch repo list` / `/fetch task list` /
-  `/fetch repo`); multi-pool hosting removed (one pool per gateway);
-  `/add-repo --link` removed (push grants); `transport_mode` gains a real
-  `tor`.
-- Ticket-state migration (in `init_ledger`, idempotent, meta-guarded):
-  `pending→open`, `review→claimed`, `blocked→open`, `merged→completed`.
-  Existing DBs keep their data; no destructive migration.
-- Multi-pool DBs: refused for management verbs until the operator removes
-  the extras (rows never auto-deleted).
-- Accepted versions pre-2.6.0 remain fetchable (Iroh tickets unchanged).
-- Tor must be installed and running on EVERY gateway in a pool before
-  `transport_mode=tor` transfers work; `relay` mode needs none of this and
-  stays the out-of-the-box mode.
-
 ## See also
 
-- `docs/architecture.md` — command-surface chain, Tor-routed Iroh flow,
-  one-pool model + `pool_gateways`.
+- `docs/architecture.md` — command-surface chain, Tor-routed Iroh
+  flow, one-pool model + `pool_gateways`.
 - `docs/threat-model.md` — anonymity/residual-risk, guarantees.
-- `docs/fallback-transport.md` — relay fallback, Radicle seed, Tor ceilings.
+- `docs/fallback-transport.md` — relay fallback, Radicle seed, Tor
+  ceilings.
 - `scripts/live-discord-check.md` — operator runbook.
-- `.hermes/plans/2026-11-06_0156-agent-pool-task-repo-model-corrections.md`
-  — the plan this phase implements.

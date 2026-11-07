@@ -162,3 +162,89 @@ def test_no_pool_gateway_reads_in_authz_helpers_via_db():
     assert L.is_owner(c, "pool-1", "owner-1") is True
     assert L.is_authorized(c, "pool-1", "owner-1") is True
     assert L.is_owner(c, "pool-1", "nobody") is False
+
+
+# --- WO-024 Phase 5 doc vocabulary gates ----------------------------------
+# Docs must describe the current behaviour only: no onboarding command,
+# no pool-configured budget keys, no stale reply-contract / throughput /
+# phase / freeze / acceptance vocabulary, and no brittle line citations.
+
+DOC_FILES = (
+    "README.md",
+    "docs/architecture.md",
+    "docs/threat-model.md",
+    "docs/fallback-transport.md",
+    "scripts/live-discord-check.md",
+)
+
+DOC_BANNED = (
+    r"\binvit\w*\b",                      # no onboarding/invitation command
+    r"ctx\.post_message",                 # not part of the reply contract
+    r"97\s*MB/s",                         # unverifiable throughput figure
+    r"~2 MB/s|\b2 MB/s\b",               # unverifiable throughput figure
+    r'"phase"\s*:\s*3',                   # pool_status emits a version string
+    r"maintainer-signed",                 # acceptance is by the maintainer gateway
+    r"per-pool overrides \(budgets|pools\.[^\s)]*\.budgets|per-pool budget",
+    r"read-only queries still run|queries still run while frozen",
+    r"\d+ tests passed\b",                # no pinned test count
+    r"\.(?:py|md|yaml):\d+",              # no brittle file:line citations
+    r"Discord-only push|Discord-only operator can finish|"
+    r"can finish a push|can complete a push from Discord",
+)
+
+
+def _doc_texts():
+    return {f: (ROOT / f).read_text() for f in DOC_FILES}
+
+
+def test_docs_have_no_stale_vocabulary():
+    hits = []
+    for fname, text in _doc_texts().items():
+        for pattern in DOC_BANNED:
+            for m in re.finditer(pattern, text):
+                hits.append(f"{fname}: {pattern!r} at {m.start()}")
+    assert hits == [], "stale vocabulary back in docs:\n" + "\n".join(hits)
+
+
+def test_docs_link_mentions_are_rejections_only():
+    for fname, text in _doc_texts().items():
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if "--link" not in line:
+                continue
+            window = "\n".join(lines[max(0, i - 1): i + 3])
+            assert ("not supported" in window or "rejected" in window), (
+                f"{fname}:{i + 1}: --link mentioned without a rejection:\n{line}")
+
+
+def test_docs_state_current_contracts():
+    combined = "\n".join(_doc_texts().values())
+    readme = _doc_texts()["README.md"]
+    required = (
+        "not authorized for pool",
+        "claim refused: user",
+        "register refused: maintainer must be the gateway owner",
+        "gateway identity changed: caller is not the pool's owner gateway",
+        "push deliver refused: only the pool maintainer gateway may accept",
+        "agent budget exhausted:",
+        "budget exhausted:",
+        "fetch refused: manifest signature does not verify",
+        "reply exceeds 4096-byte gateway limit",
+        "add-repo: --link is not supported",
+        "pool frozen — contact the maintainer",
+        "release worktree",
+        "AGENT_POOL_ALLOWED_USERS",
+        "AGENT_POOL_TASK_ALLOCATIONS",
+        "AGENT_POOL_WORKTREE_ROOT",
+        "push_build_bundle",
+        "worktree-<ticket_id>",
+        "pool/<ticket_id>",
+        "sync_whitelist",
+        "never completed from Discord",
+    )
+    for needle in required:
+        assert needle in combined, f"docs missing current contract: {needle!r}"
+    assert "pool_report_usage" in readme
+    assert "pool_status" in readme
+    # Full chain verification is scoped to the hosted-pool fetch.
+    assert "Full chain verification happens on the hosted-pool" in combined
