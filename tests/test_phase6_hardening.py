@@ -42,13 +42,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from crypto import (blake3_hash, build_manifest, manifest_hash, sign_manifest,
                     unwrap_dek, verify_chain, wrap_dek)
-from ledger import (ClaimRefused, add_member, create_pool, get_ticket,
+from ledger import (ClaimRefused, add_member, authorize_user, create_pool, get_ticket,
                     init_ledger, is_global_frozen)
 from propagation import _verify_key, encrypt_bundle, pack_bundle
 from tickets import PoolService
 from transport import (FakeTransport, TransportBackend, TransportUnavailable,
                        fetch_with_retry)
 from identity import ensure_identity
+
+OWNER = "owner-1"
+CONTRIB = "contrib-1"
+MEMBER = "member-1"
+SRC = {"user_id": OWNER}
+CONTRIB_SRC = {"user_id": CONTRIB}
+MEMBER_SRC = {"user_id": MEMBER}
 
 
 def _git(*args, **kw):
@@ -72,7 +79,12 @@ class _World:
         self.contrib = ensure_identity(self.tmp / "a")
         self.member = ensure_identity(self.tmp / "b")
         self.extra = ensure_identity(self.tmp / "x")
-        create_pool(self.conn, "pool-1", "Team", self.maint.key_id, relay_url="off")
+        create_pool(self.conn, "pool-1", "Team", self.maint.key_id, relay_url="off",
+                    owner_discord_user_id=OWNER)
+        # First-claim key binding is per Discord user: each service key
+        # drives its own whitelisted user.
+        authorize_user(self.conn, "pool-1", CONTRIB)
+        authorize_user(self.conn, "pool-1", MEMBER)
         self.conn.execute(
             "INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo','pool-1','Demo',0)")
         for ident, role in ((self.maint, "maintainer"), (self.contrib, "member"),
@@ -114,7 +126,7 @@ class _World:
         self.v1 = get_latest_accepted_manifest(self.conn, "demo")
 
     def make_ticket(self, title="Work", repo="demo"):
-        return self.maint_svc.add_ticket("pool-1", repo, title, brief="Scope: hello.txt")
+        return self.maint_svc.add_ticket("pool-1", repo, title, brief="Scope: hello.txt", source=SRC)
 
 @pytest.fixture
 def world(tmp_path):
@@ -195,18 +207,18 @@ def test_02_unapproved_member_fetch_refused(world):
 # 03 -----------------------------------------------------------------------
 def test_03_double_claim(world):
     ticket = world.make_ticket("Double")
-    world.contrib_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"])
+    world.contrib_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"], source=CONTRIB_SRC)
     with pytest.raises(ClaimRefused):
-        world.member_svc.claim(ticket["ticket_id"], declared_paths=["other.txt"])
+        world.member_svc.claim(ticket["ticket_id"], declared_paths=["other.txt"], source=MEMBER_SRC)
 
 
 # 04 -----------------------------------------------------------------------
 def test_04_overlap(world):
     t1 = world.make_ticket("First")
     t2 = world.make_ticket("Second")
-    world.contrib_svc.claim(t1["ticket_id"], declared_paths=["hello.txt"])
+    world.contrib_svc.claim(t1["ticket_id"], declared_paths=["hello.txt"], source=CONTRIB_SRC)
     with pytest.raises(ClaimRefused, match="overlap"):
-        world.member_svc.claim(t2["ticket_id"], declared_paths=["hello.txt"])
+        world.member_svc.claim(t2["ticket_id"], declared_paths=["hello.txt"], source=MEMBER_SRC)
 
 
 # 06 -----------------------------------------------------------------------
@@ -229,7 +241,7 @@ def test_07_revocation_forward_separation(world):
     Phase 2 re-gate: submit() is maintainer-only and the integrate/resolve
     gate is deleted, so the new version is a maintainer submit after removal."""
     assert world.extra.key_id in world.v1["wrapped_keys"]
-    world.maint_svc.remove_member("pool-1", world.extra.key_id)
+    world.maint_svc.remove_member("pool-1", world.extra.key_id, source=SRC)
     prop = world.maint_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
     assert world.extra.key_id not in prop._members
     res = prop.submit(repo_path=world.src, repo_id="demo", version=2,
@@ -250,8 +262,8 @@ def test_09_gateway_abstraction_full_loop_fake(world):
     (no repo bytes on gateway)."""
     ticket = world.make_ticket("Full loop")
     tid = ticket["ticket_id"]
-    world.contrib_svc.claim(tid, declared_paths=["hello.txt"])
-    done = world.contrib_svc.complete(tid)
+    world.contrib_svc.claim(tid, declared_paths=["hello.txt"], source=CONTRIB_SRC)
+    done = world.contrib_svc.complete(tid, source=CONTRIB_SRC)
     assert done["state"] == "completed"
     prop = world.maint_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
     res = prop.submit(repo_path=world.src, repo_id="demo", version=2,
@@ -358,12 +370,12 @@ def test_17_global_freeze_blocks_claim_across_pools(world):
         create_pool(world.conn, "pool-2", "Other", world.maint.key_id)
     t1 = world.make_ticket("Pool one")
     t2 = world.make_ticket("Pool one again")
-    world.maint_svc.freeze_global(True)
+    world.maint_svc.freeze_global(True, source=SRC)
     assert is_global_frozen(world.conn) is True
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.contrib_svc.claim(t1["ticket_id"], declared_paths=["hello.txt"])
+        world.contrib_svc.claim(t1["ticket_id"], declared_paths=["hello.txt"], source=CONTRIB_SRC)
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.contrib_svc.claim(t2["ticket_id"], declared_paths=["hello.txt"])
+        world.contrib_svc.claim(t2["ticket_id"], declared_paths=["hello.txt"], source=CONTRIB_SRC)
 
 
 # 18 -----------------------------------------------------------------------
@@ -372,37 +384,37 @@ def test_18_global_freeze_blocks_work_and_integrate(world):
     frozen pool now blocks claim and complete."""
     ticket = world.make_ticket("Frozen work")
     tid = ticket["ticket_id"]
-    world.contrib_svc.claim(tid, declared_paths=["hello.txt"])
+    world.contrib_svc.claim(tid, declared_paths=["hello.txt"], source=CONTRIB_SRC)
     other = world.make_ticket("Frozen other")
-    world.maint_svc.freeze_global(True)
+    world.maint_svc.freeze_global(True, source=SRC)
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.contrib_svc.claim(other["ticket_id"], declared_paths=["hello.txt"])
+        world.contrib_svc.claim(other["ticket_id"], declared_paths=["hello.txt"], source=CONTRIB_SRC)
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.contrib_svc.complete(tid)
+        world.contrib_svc.complete(tid, source=CONTRIB_SRC)
     assert get_ticket(world.conn, tid)["state"] == "claimed"  # untouched
 
 
 # 19 -----------------------------------------------------------------------
 def test_19_global_freeze_blocks_pool_mutation(world):
-    world.maint_svc.freeze_global(True)
+    world.maint_svc.freeze_global(True, source=SRC)
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.maint_svc.add_ticket("pool-1", "demo", "Nope")
+        world.maint_svc.add_ticket("pool-1", "demo", "Nope", source=SRC)
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.maint_svc.add_ticket("pool-1", "demo", "Nope again")
+        world.maint_svc.add_ticket("pool-1", "demo", "Nope again", source=SRC)
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.maint_svc.register_pool("pool-3", "Late")
+        world.maint_svc.register_pool("pool-3", "Late", source=SRC)
     with pytest.raises(ClaimRefused, match="pool frozen"):
-        world.maint_svc.remove_member("pool-1", world.extra.key_id)
+        world.maint_svc.remove_member("pool-1", world.extra.key_id, source=SRC)
 
 
 # 20 -----------------------------------------------------------------------
 def test_20_global_freeze_unfreezes_cleanly(world):
     ticket = world.make_ticket("Unfreeze")
-    world.maint_svc.freeze_global(True)
-    world.maint_svc.freeze_global(False)
+    world.maint_svc.freeze_global(True, source=SRC)
+    world.maint_svc.freeze_global(False, source=SRC)
     assert is_global_frozen(world.conn) is False
     assert world.maint_svc.is_frozen("pool-1") is False
-    world.contrib_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"])
+    world.contrib_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"], source=CONTRIB_SRC)
     assert get_ticket(world.conn, ticket["ticket_id"])["state"] == "claimed"
 
 
@@ -444,7 +456,7 @@ def test_22_legacy_accept_excludes_removed_member(world):
                             world.contrib.signing_key)
     assert res["state"] == "pending"
     assert world.extra.key_id in res["manifest"]["wrapped_keys"]
-    world.maint_svc.remove_member("pool-1", world.extra.key_id)
+    world.maint_svc.remove_member("pool-1", world.extra.key_id, source=SRC)
     # Rebuild the propagator AFTER removal (members come from the registry).
     prop2 = world.maint_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
     assert world.extra.key_id not in prop2._members
@@ -499,10 +511,10 @@ def test_25_per_pool_freeze_blocks_integrate(world):
     blocks complete() (complete() checks frozen)."""
     ticket = world.make_ticket("Per-pool freeze")
     tid = ticket["ticket_id"]
-    world.contrib_svc.claim(tid, declared_paths=["hello.txt"])
-    world.maint_svc.freeze("pool-1", True)
+    world.contrib_svc.claim(tid, declared_paths=["hello.txt"], source=CONTRIB_SRC)
+    world.maint_svc.freeze("pool-1", True, source=SRC)
     with pytest.raises(ClaimRefused, match="frozen"):
-        world.contrib_svc.complete(tid)
-    world.maint_svc.freeze("pool-1", False)
-    done = world.contrib_svc.complete(tid)
+        world.contrib_svc.complete(tid, source=CONTRIB_SRC)
+    world.maint_svc.freeze("pool-1", False, source=SRC)
+    done = world.contrib_svc.complete(tid, source=CONTRIB_SRC)
     assert done["state"] == "completed"

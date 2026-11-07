@@ -52,7 +52,7 @@ config_schema:
   pools:
     type: dict
     default: {}
-    description: "Per-pool settings keyed by pool_id (budgets, relay overrides)"
+    description: "Per-pool settings keyed by pool_id (transport_mode, relay_url only)"
   allowed_users:
     type: list
     default: []

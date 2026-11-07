@@ -21,6 +21,9 @@ from tickets import PoolService
 from transport import FakeTransport
 from identity import ensure_identity
 
+OWNER = "owner-1"
+SRC = {"user_id": OWNER}
+
 
 def _memdb():
     c = sqlite3.connect(":memory:")
@@ -31,7 +34,8 @@ def _memdb():
 @pytest.fixture
 def conn():
     c = _memdb()
-    create_pool(c, "pool-1", "Team", "agent:maint", relay_url="off")
+    create_pool(c, "pool-1", "Team", "agent:maint", relay_url="off",
+                owner_discord_user_id=OWNER)
     c.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
               " VALUES ('demo','pool-1','Demo',0)")
     c.commit()
@@ -162,7 +166,7 @@ def _service(conn, gateway=None, ident=None, transport=None):
 def test_ticket_creation_thread_and_state_marker(conn, tmp_path):
     ident = ensure_identity(tmp_path / "a")
     svc = _service(conn, None, ident)
-    ticket = svc.add_ticket("pool-1", "demo", "Fix the thing", brief="Scope: src/a.py. Accept: tests green.")
+    ticket = svc.add_ticket("pool-1", "demo", "Fix the thing", brief="Scope: src/a.py. Accept: tests green.", source=SRC)
     assert ticket["state"] == "open"
     assert ticket["title"] == "Fix the thing"
     assert "src/a.py" in ticket.get("brief", "")
@@ -179,7 +183,8 @@ def test_full_flow_claim_fetch_complete(tmp_path):
     transport = FakeTransport()
     maint = ensure_identity(tmp_path / "m")
     contrib = ensure_identity(tmp_path / "a")
-    create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
+    create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off",
+                owner_discord_user_id=OWNER)
     conn.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
                  " VALUES ('demo','pool-1','Demo',0)")
     for ident, role in ((maint, "maintainer"), (contrib, "member")):
@@ -194,8 +199,8 @@ def test_full_flow_claim_fetch_complete(tmp_path):
     maint_svc = _service(conn, gateway, maint, transport)
     work_svc = _service(conn, gateway, contrib, transport)
 
-    ticket = maint_svc.add_ticket("pool-1", "demo", "Add hello", brief="Scope: hello.txt")
-    claimed = work_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"])
+    ticket = maint_svc.add_ticket("pool-1", "demo", "Add hello", brief="Scope: hello.txt", source=SRC)
+    claimed = work_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"], source=SRC)
     assert claimed["state"] == "active"
     assert "start" not in claimed  # Phase 2: claim no longer returns a 'start' key
 
@@ -208,24 +213,24 @@ def test_full_flow_claim_fetch_complete(tmp_path):
     subprocess.run(["git", "-C", str(src), "add", "."], check=True)
     subprocess.run(["git", "-C", str(src), "commit", "-q", "-m", "v1"], check=True)
 
-    added = maint_svc.add_repo("pool-1", "demo", str(src))
+    added = maint_svc.add_repo("pool-1", "demo", str(src), source=SRC)
     assert added["ok"] and added["version"] == 1 and added["state"] == "accepted"
 
-    fetched = work_svc.fetch_repo("demo")
+    fetched = work_svc.fetch_repo("demo", source=SRC)
     assert fetched["ok"] and fetched["repo_id"] == "demo"
     manifest = json.loads(fetched["manifest_json"])
     assert manifest["repo_id"] == "demo" and manifest["version"] == 1
     assert fetched["manifest_hash"] and "transfer_ticket" in fetched
 
-    completed = work_svc.complete(ticket["ticket_id"])
+    completed = work_svc.complete(ticket["ticket_id"], source=SRC)
     assert completed["state"] == "completed"
     assert get_ticket(conn, ticket["ticket_id"])["state"] == "completed"
 
-    tasks = work_svc.fetch_task_list()
+    tasks = work_svc.fetch_task_list(source=SRC)
     assert tasks["ok"]
     assert ticket["ticket_id"] not in [t["ticket_id"] for t in tasks["tasks"]]
 
-    repos = work_svc.fetch_repo_list()
+    repos = work_svc.fetch_repo_list(source=SRC)
     assert repos["ok"]
     demo = [r for r in repos["repos"] if r["repo_id"] == "demo"]
     assert demo and demo[0]["accepted_version"] == 1
@@ -234,14 +239,14 @@ def test_full_flow_claim_fetch_complete(tmp_path):
 def test_freeze_via_service_blocks_claim_and_ticket(conn, tmp_path):
     ident = ensure_identity(tmp_path / "b")
     svc = _service(conn, None, ident)
-    svc.freeze("pool-1", True)
+    svc.freeze("pool-1", True, source=SRC)
     with pytest.raises(ClaimRefused, match="frozen"):
-        svc.add_ticket("pool-1", "demo", "Nope")
-    svc.freeze("pool-1", False)
-    ticket = svc.add_ticket("pool-1", "demo", "Again")
-    svc.freeze("pool-1", True)
+        svc.add_ticket("pool-1", "demo", "Nope", source=SRC)
+    svc.freeze("pool-1", False, source=SRC)
+    ticket = svc.add_ticket("pool-1", "demo", "Again", source=SRC)
+    svc.freeze("pool-1", True, source=SRC)
     with pytest.raises(ClaimRefused, match="frozen"):
-        svc.claim(ticket["ticket_id"], declared_paths=["src/a.py"])
+        svc.claim(ticket["ticket_id"], declared_paths=["src/a.py"], source=SRC)
 
 
 # --- command-handler smoke tests (one per command) --------------------------
@@ -359,7 +364,7 @@ def test_command_handlers_smoke(tmp_path):
 def test_add_ticket_records_thread_ref_from_source(conn, tmp_path):
     ident = ensure_identity(tmp_path / "a")
     svc = _service(conn, None, ident)
-    src = {"chat_id": "chat-1", "thread_id": "th-1", "guild_id": "g-1"}
+    src = {"chat_id": "chat-1", "thread_id": "th-1", "guild_id": "g-1", "user_id": OWNER}
     ticket = svc.add_ticket("pool-1", "demo", "Threaded", brief="b", source=src)
     assert ticket["thread_ref"] and "chat-1" in ticket["thread_ref"]
     assert ticket["thread_ref_parts"]["chat_id"] == "chat-1"
@@ -370,8 +375,8 @@ def test_add_ticket_records_thread_ref_from_source(conn, tmp_path):
 def test_claim_returns_notice_text_and_queues_for_next_command(conn, tmp_path):
     ident = ensure_identity(tmp_path / "a")
     svc = _service(conn, None, ident)
-    ticket = svc.add_ticket("pool-1", "demo", "Claimable", brief="b")
-    claim = svc.claim(ticket["ticket_id"], declared_paths=["src/a.py"])
+    ticket = svc.add_ticket("pool-1", "demo", "Claimable", brief="b", source=SRC)
+    claim = svc.claim(ticket["ticket_id"], declared_paths=["src/a.py"], source=SRC)
     assert claim["notice"] and "claimed" in claim["notice"]
     queued = svc.drain_notices()
     assert queued and any("claimed" in q for q in queued)
@@ -381,7 +386,7 @@ def test_claim_returns_notice_text_and_queues_for_next_command(conn, tmp_path):
 def test_notice_queue_surfaces_on_next_command(conn, tmp_path):
     ident = ensure_identity(tmp_path / "a")
     svc = _service(conn, None, ident)
-    svc.freeze("pool-1", True)
+    svc.freeze("pool-1", True, source=SRC)
     # freeze queued a notice; next drain (via handler) surfaces it
     queued = svc.drain_notices()
     assert any("frozen" in q for q in queued)

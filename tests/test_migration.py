@@ -77,5 +77,8 @@ def test_migration_is_not_destructive():
     init_ledger(c)
     tables = {r[0] for r in c.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"remote_repos", "pool_chats"} <= tables
+    # WO-019: pool_chats is no longer created; remote_repos is kept for
+    # back-compat. No destructive migration either way.
+    assert "remote_repos" in tables
+    assert "pool_chats" not in tables
     assert c.execute("SELECT COUNT(*) FROM tickets").fetchone()[0] == len(OLD_TO_NEW)

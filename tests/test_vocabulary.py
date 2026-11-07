@@ -98,7 +98,6 @@ def test_authz_paths_do_not_read_identities_or_members():
         T.PoolService._require_pool_authorized,
         T.PoolService._is_bound_maintainer,
         T.PoolService._check_not_frozen,
-        T.PoolService._is_authorized_or_legacy,
         L.is_owner,
         L.is_authorized,
     ]

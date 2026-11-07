@@ -563,29 +563,13 @@ class PoolService:
             return None
 
     def _require_owner(self, pool_id, source) -> None:
-        # Legacy bare fixtures (no owner/whitelist rows) skip the check;
-        # whitelisted pools are strict (production path).
-        try:
-            _pool = self._conn.execute("SELECT owner_discord_user_id FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
-            _has = _pool is not None and _pool[0]
-            _n = self._conn.execute("SELECT COUNT(*) FROM pool_authorized WHERE pool_id=?", (pool_id,)).fetchone()[0]
-        except Exception:
-            _has, _n = False, 0
-        if not _has and not _n:
-            return
+        # No legacy skip: absence of an owner row = refusal.
         user_id = self._discord_user(source)
         if user_id is None or not L.is_owner(self._conn, pool_id, user_id):
             raise PermissionError(f"not authorized for pool {pool_id} — ask the maintainer")
 
     def _require_authorized(self, pool_id, source) -> None:
-        try:
-            _pool = self._conn.execute("SELECT owner_discord_user_id FROM pools WHERE pool_id=?", (pool_id,)).fetchone()
-            _has = _pool is not None and _pool[0]
-            _n = self._conn.execute("SELECT COUNT(*) FROM pool_authorized WHERE pool_id=?", (pool_id,)).fetchone()[0]
-        except Exception:
-            _has, _n = False, 0
-        if not _has and not _n:
-            return
+        # No legacy skip: absence of whitelist rows = refusal.
         user_id = self._discord_user(source)
         if user_id is None or not L.is_authorized(self._conn, pool_id, user_id):
             raise PermissionError(f"not authorized for pool {pool_id} — ask the maintainer")
@@ -672,23 +656,6 @@ class PoolService:
         bound = self._resolve_pool(None, source=source)
         self._require_pool_authorized(bound, source)
         return self._project_rows(bound)
-
-    def _is_authorized_or_legacy(self, pool_id, source) -> bool:
-        """True when the caller may read *pool_id*: authorized, or the
-        pool is a legacy bare fixture with no whitelist rows."""
-        try:
-            _pool = self._conn.execute(
-                "SELECT owner_discord_user_id FROM pools WHERE pool_id=?",
-                (pool_id,)).fetchone()
-            _n = self._conn.execute(
-                "SELECT COUNT(*) FROM pool_authorized WHERE pool_id=?",
-                (pool_id,)).fetchone()[0]
-        except Exception:
-            return False
-        if not (_pool is not None and _pool[0]) and not _n:
-            return True
-        user_id = self._discord_user(source)
-        return user_id is not None and L.is_authorized(self._conn, pool_id, user_id)
 
     def _project_rows(self, pool_id) -> list:
         rows = []

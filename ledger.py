@@ -113,21 +113,18 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS pool_chats (
-    chat_id TEXT NOT NULL,
-    guild_id TEXT,
-    thread_id TEXT,
-    pool_id TEXT NOT NULL REFERENCES pools(pool_id),
-    PRIMARY KEY (chat_id, guild_id, thread_id)
-);
+-- pool_chats surface removed (WO-019): the table is no longer created or
+-- read. Old DBs keep it on disk unread; no DROP migration.
 -- NOTE (2109 Phase 2): the peers / imported_* / trust-anchor tables are
 -- GONE — no import, no peer trust, no anchors. Reads are fetch commands
 -- on the pool's own gateway (/fetch repo + /fetch repo --manifest). Existing DBs keep
 -- the old tables on disk and they are simply never read again (no
 -- destructive migration); new DBs never create them.
 --
--- remote_repos SURVIVES only as the human-readable --link operator note
--- (OD5): a link is never a fetch source. /pool fetch is the real path.
+-- remote_repos is DEAD (WO-019): /add-repo --link is rejected, so nothing
+-- writes this table and nothing reads it. Kept via CREATE TABLE IF NOT
+-- EXISTS for back-compat only (old DBs keep it on disk unread; no
+-- destructive migration).
 CREATE TABLE IF NOT EXISTS remote_repos (
     pool_id TEXT NOT NULL,
     repo_id TEXT NOT NULL,
@@ -166,7 +163,7 @@ CREATE TABLE IF NOT EXISTS push_grants (
 
 TABLES = ("pools", "members", "identities", "repos", "repo_versions",
           "manifest_chain", "tickets", "claims", "file_claims", "audits",
-          "events", "pool_chats", "remote_repos", "pool_authorized", "pool_memberships", "pool_gateways",
+          "events", "remote_repos", "pool_authorized", "pool_memberships", "pool_gateways",
           "push_grants")
 
 
@@ -837,50 +834,7 @@ def remove_member(conn, pool_id, key_id) -> dict:
             "limitation": REVOCATION_LIMITATION}
 
 
-# --- Gateway-native: pool chats, discord identity, queued notices ------------
-
-def bind_pool_chat(conn, chat_id, guild_id, thread_id, pool_id) -> None:
-    conn.execute(
-        "INSERT OR REPLACE INTO pool_chats (chat_id, guild_id, thread_id, pool_id)"
-        " VALUES (?,?,?,?)",
-        (str(chat_id), str(guild_id) if guild_id is not None else None,
-         str(thread_id) if thread_id is not None else None, pool_id))
-    conn.commit()
-
-
-def get_pool_for_chat(conn, chat_id, guild_id=None, thread_id=None):
-    """Resolve bound pool for a chat; thread binding wins, then guild+chat."""
-    if chat_id is None:
-        return None
-    if thread_id is not None:
-        row = conn.execute(
-            "SELECT pool_id FROM pool_chats WHERE chat_id=? AND thread_id=?",
-            (str(chat_id), str(thread_id))).fetchone()
-        if row:
-            return row[0]
-    if guild_id is not None:
-        row = conn.execute(
-            "SELECT pool_id FROM pool_chats WHERE chat_id=? AND guild_id=?",
-            (str(chat_id), str(guild_id))).fetchone()
-        if row:
-            return row[0]
-    row = conn.execute(
-        "SELECT pool_id FROM pool_chats WHERE chat_id=? LIMIT 1",
-        (str(chat_id),)).fetchone()
-    return row[0] if row else None
-
-
-def lookup_key_by_discord_user(conn, user_id):
-    if user_id is None:
-        return None
-    try:
-        row = conn.execute(
-            "SELECT key_id FROM identities WHERE discord_user_id=?",
-            (str(user_id),)).fetchone()
-    except Exception:
-        return None
-    return row[0] if row else None
-
+# --- Gateway-native: discord identity, queued notices ------------------------
 
 def bind_discord_user(conn, key_id, user_id) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(identities)")}
@@ -1056,11 +1010,8 @@ def peek_notices(conn, pool_id=None):
     return out
 
 
-# --- Operator link note (OD5, survives 2109 Phase 2) -------------------------
-# remote_repos holds ONLY the human-readable --link pointer recorded at
-# /add-repo --link. It is NEVER a fetch source: /pool fetch is the real
-# read path. A link is a note for a human, nothing more. The table stays
-# on disk; the add_repo --link branch writes it via inline SQL in
-# tickets.py (no ledger remote-repo API remains).
+# --- Operator link note (OD5): DEAD (WO-019) --------------------------------
+# remote_repos is unread: /add-repo --link is rejected, so nothing writes
+# or reads this table. It stays on disk unread; no ledger API for it remains.
 
 

@@ -121,6 +121,8 @@ def test_state_migration_idempotent():
         assert get_ticket(c, tid)["state"] == want, tid
     kinds2 = [r[0] for r in c.execute("SELECT kind FROM events WHERE kind='state_migrated_2_6_0'")]
     assert kinds2 == kinds
-    # Old tables stay on disk (no destructive migration).
+    # Old tables stay on disk (no destructive migration). pool_chats is no
+    # longer created (WO-019); remote_repos is kept for back-compat.
     tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"remote_repos", "pool_chats"} <= tables
+    assert "remote_repos" in tables
+    assert "pool_chats" not in tables

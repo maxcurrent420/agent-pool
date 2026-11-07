@@ -411,8 +411,12 @@ def _handle_add_repo(ctx, raw: str, *, source=None, session_id="", session_key="
     Re-running submits a NEW version. --path is required.
     """
     try:
-        svc = _service_for(ctx, source=source)
         pos, opts, _flags = _parse_args(raw)
+        if "link" in opts or "link" in _flags:
+            raise ValueError(
+                "add-repo: --link is not supported; use /add-repo --path <checkout>"
+            )
+        svc = _service_for(ctx, source=source)
         repo_id = pos[0] if pos else opts.get("repo", "")
         path = opts.get("path", "")
         if not repo_id and path:

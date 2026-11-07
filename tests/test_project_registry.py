@@ -18,11 +18,14 @@ from nacl.encoding import RawEncoder
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ledger import (ClaimRefused, add_member, create_pool, create_ticket,
+from ledger import (ClaimRefused, add_member, authorize_user, create_pool, create_ticket,
                     get_repo, init_ledger, set_global_frozen)
 from tickets import PoolService, PoolNotLocalError
 from transport import FakeTransport
 from identity import ensure_identity
+
+OWNER = "owner-1"
+SRC = {"user_id": OWNER}
 
 
 def _memdb():
@@ -48,7 +51,8 @@ def _world(tmp_path):
     conn = _memdb()
     maint = ensure_identity(tmp_path / "m")
     member = ensure_identity(tmp_path / "a")
-    create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off")
+    create_pool(conn, "pool-1", "Team", maint.key_id, relay_url="off",
+                owner_discord_user_id=OWNER)
     for ident, role in ((maint, "maintainer"), (member, "member")):
         conn.execute(
             "INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, created_at)"
@@ -91,7 +95,7 @@ def test_migration_adds_repo_columns_to_prechange_db():
 def test_registry_row_upsert_not_ignore(tmp_path):
     conn, maint, _member, svc, _svc2 = _world(tmp_path)
     src = _git_repo(tmp_path / "src")
-    out = svc.add_repo("pool-1", "demo", str(src), display_name="Demo Project")
+    out = svc.add_repo("pool-1", "demo", str(src), display_name="Demo Project", source=SRC)
     assert out["ok"] and out["version"] == 1 and out["state"] == "accepted"
     row = get_repo(conn, "demo")
     assert row["path"] == str(src.resolve())
@@ -102,7 +106,7 @@ def test_registry_row_upsert_not_ignore(tmp_path):
     subprocess.run(["git", "-C", str(src), "add", "."], check=True)
     subprocess.run(["git", "-C", str(src), "commit", "-q", "-m", "v2"], check=True)
     src2 = _git_repo(tmp_path / "src2")
-    out2 = svc.add_repo("pool-1", "demo", str(src2), display_name="Demo Renamed")
+    out2 = svc.add_repo("pool-1", "demo", str(src2), display_name="Demo Renamed", source=SRC)
     assert out2["version"] == 2
     row = get_repo(conn, "demo")
     assert row["path"] == str(src2.resolve()) and row["display_name"] == "Demo Renamed"
@@ -120,7 +124,7 @@ def test_add_repo_contributor_refused(tmp_path):
     conn, _maint, _member, _svc1, member_svc = _world(tmp_path)
     src = _git_repo(tmp_path / "src")
     with pytest.raises(PermissionError):
-        member_svc.add_repo("pool-1", "demo", str(src))
+        member_svc.add_repo("pool-1", "demo", str(src), source=SRC)
     assert conn.execute(
         "SELECT COUNT(*) FROM repo_versions WHERE repo_id='demo'").fetchone()[0] == 0
     assert conn.execute(
@@ -130,7 +134,7 @@ def test_add_repo_contributor_refused(tmp_path):
 def test_add_repo_accepted_version_in_chain(tmp_path):
     conn, _maint, _member, svc, _svc2 = _world(tmp_path)
     src = _git_repo(tmp_path / "src")
-    out = svc.add_repo("pool-1", "demo", str(src))
+    out = svc.add_repo("pool-1", "demo", str(src), source=SRC)
     versions = conn.execute(
         "SELECT version, state FROM repo_versions WHERE repo_id='demo'").fetchall()
     assert [(v[0], v[1]) for v in versions] == [(1, "accepted")]
@@ -145,10 +149,10 @@ def test_add_repo_accepted_version_in_chain(tmp_path):
 def test_pool_list_projects_and_counts(tmp_path):
     _conn, _maint, _member, svc, _svc2 = _world(tmp_path)
     src = _git_repo(tmp_path / "src")
-    svc.add_repo("pool-1", "demo", str(src))
-    svc.add_ticket("pool-1", "demo", "One")
-    svc.add_ticket("pool-1", "demo", "Two")
-    projects = svc.list_projects("pool-1")
+    svc.add_repo("pool-1", "demo", str(src), source=SRC)
+    svc.add_ticket("pool-1", "demo", "One", source=SRC)
+    svc.add_ticket("pool-1", "demo", "Two", source=SRC)
+    projects = svc.list_projects("pool-1", source=SRC)
     assert len(projects) == 1
     p = projects[0]
     assert p["repo_id"] == "demo" and p["accepted_version"] == 1
@@ -158,8 +162,8 @@ def test_pool_list_projects_and_counts(tmp_path):
 
 def test_pool_list_marks_repo_without_bytes(tmp_path):
     conn, _maint, _member, svc, _svc2 = _world(tmp_path)
-    svc.add_ticket("pool-1", "bare", "Bare ticket")  # repo row, no bytes
-    projects = svc.list_projects("pool-1")
+    svc.add_ticket("pool-1", "bare", "Bare ticket", source=SRC)  # repo row, no bytes
+    projects = svc.list_projects("pool-1", source=SRC)
     assert len(projects) == 1
     assert projects[0]["accepted_version"] is None
     assert "no bytes submitted yet" in projects[0]["note"]
@@ -188,14 +192,14 @@ def test_pool_list_refuses_a_pool_this_gateway_does_not_host(tmp_path):
 
 def test_task_list_repo_filter_and_cross_pool_refusal(tmp_path):
     conn, _maint, _member, svc, _svc2 = _world(tmp_path)
-    svc.add_ticket("pool-1", "demo", "Demo task")
-    svc.add_ticket("pool-1", "other", "Other task")
-    rows = svc.list_tickets(repo_id="demo")
+    svc.add_ticket("pool-1", "demo", "Demo task", source=SRC)
+    svc.add_ticket("pool-1", "other", "Other task", source=SRC)
+    rows = svc.list_tickets(repo_id="demo", source=SRC)
     assert [t["title"] for t in rows] == ["Demo task"]
     # Phase 1: a foreign pool id is refused (pool_not_local), even with a
     # repo filter; an unknown repo is a clean error.
     with pytest.raises(PoolNotLocalError):
-        svc.list_tickets(pool_id="pool-foreign", repo_id="demo")
+        svc.list_tickets(pool_id="pool-foreign", repo_id="demo", source=SRC)
     with pytest.raises(ValueError, match="unknown repo"):
         svc.list_tickets(repo_id="nope")
 
@@ -223,14 +227,14 @@ def test_add_repo_non_member_refused(tmp_path):
 def test_freeze_blocks_add_repo_and_task_add_but_not_listings(tmp_path):
     _conn, _maint, _member, svc, _svc2 = _world(tmp_path)
     src = _git_repo(tmp_path / "src")
-    svc.freeze("pool-1", True)
+    svc.freeze("pool-1", True, source=SRC)
     with pytest.raises(ClaimRefused, match="frozen"):
-        svc.add_repo("pool-1", "demo", str(src))
+        svc.add_repo("pool-1", "demo", str(src), source=SRC)
     with pytest.raises(ClaimRefused, match="frozen"):
-        svc.add_ticket("pool-1", "demo", "Nope")
-    assert svc.list_projects("pool-1") == []  # reads still work
-    svc.freeze("pool-1", False)
-    assert svc.add_repo("pool-1", "demo", str(src))["ok"]
+        svc.add_ticket("pool-1", "demo", "Nope", source=SRC)
+    assert svc.list_projects("pool-1", source=SRC) == []  # reads still work
+    svc.freeze("pool-1", False, source=SRC)
+    assert svc.add_repo("pool-1", "demo", str(src), source=SRC)["ok"]
 
 
 def test_global_freeze_blocks_add_repo(tmp_path):
@@ -238,51 +242,55 @@ def test_global_freeze_blocks_add_repo(tmp_path):
     set_global_frozen(conn, True)
     src = _git_repo(tmp_path / "src")
     with pytest.raises(ClaimRefused, match="frozen"):
-        svc.add_repo("pool-1", "demo", str(src))
+        svc.add_repo("pool-1", "demo", str(src), source=SRC)
 
 
 # --- claim without paths + bulk claim ----------------------------------------
 
 def test_claim_without_paths_is_whole_ticket(tmp_path):
     _conn, _maint, _member, svc, _svc2 = _world(tmp_path)
-    ticket = svc.add_ticket("pool-1", "demo", "Whole ticket")
-    claim = svc.claim(ticket["ticket_id"])
+    ticket = svc.add_ticket("pool-1", "demo", "Whole ticket", source=SRC)
+    claim = svc.claim(ticket["ticket_id"], source=SRC)
     assert claim["state"] == "active" and claim["whole_ticket"] is True
     assert json.loads(claim["declared_paths_json"]) == ["*"]
 
 
 def test_whole_ticket_blocks_path_claim_and_vice_versa(tmp_path):
     conn, _maint, _member, svc, member_svc = _world(tmp_path)
-    t1 = svc.add_ticket("pool-1", "demo", "First")
-    t2 = svc.add_ticket("pool-1", "demo", "Second")
-    member_svc.claim(t1["ticket_id"])  # whole-ticket
+    # First-claim key binding is per Discord user: the member service
+    # presents its own key, so it drives its own whitelisted user.
+    authorize_user(conn, "pool-1", "member-1")
+    member_src = {"user_id": "member-1"}
+    t1 = svc.add_ticket("pool-1", "demo", "First", source=SRC)
+    t2 = svc.add_ticket("pool-1", "demo", "Second", source=SRC)
+    member_svc.claim(t1["ticket_id"], source=member_src)  # whole-ticket
     with pytest.raises(ClaimRefused, match="overlap"):
-        svc.claim(t2["ticket_id"], declared_paths=["src/a.py"])
+        svc.claim(t2["ticket_id"], declared_paths=["src/a.py"], source=SRC)
     # Reverse: a live path claim blocks a whole-ticket claim on same repo.
-    member_svc.release(t1["ticket_id"])
-    svc.claim(t2["ticket_id"], declared_paths=["src/a.py"])
+    member_svc.release(t1["ticket_id"], source=member_src)
+    svc.claim(t2["ticket_id"], declared_paths=["src/a.py"], source=SRC)
     with pytest.raises(ClaimRefused, match="overlap"):
-        svc.claim(t1["ticket_id"])
+        svc.claim(t1["ticket_id"], source=SRC)
 
 
 def test_claim_any_claims_up_to_n_open_tickets(tmp_path):
     _conn, _maint, _member, svc, member_svc = _world(tmp_path)
-    t1 = svc.add_ticket("pool-1", "demo", "One")
-    t2 = svc.add_ticket("pool-1", "other", "Two")
-    t3 = svc.add_ticket("pool-1", "other", "Three")
-    out = member_svc.claim_any(pool_id="pool-1", max_tasks=2)
+    t1 = svc.add_ticket("pool-1", "demo", "One", source=SRC)
+    t2 = svc.add_ticket("pool-1", "other", "Two", source=SRC)
+    t3 = svc.add_ticket("pool-1", "other", "Three", source=SRC)
+    out = member_svc.claim_any(pool_id="pool-1", max_tasks=2, source=SRC)
     assert out["count"] == 2
     claimed_ids = {c["ticket_id"] for c in out["claimed"]}
     assert claimed_ids == {t1["ticket_id"], t2["ticket_id"]}
-    remaining = [t for t in svc.list_tickets(pool_id="pool-1", state="open")]
+    remaining = [t for t in svc.list_tickets(pool_id="pool-1", state="open", source=SRC)]
     assert [t["ticket_id"] for t in remaining] == [t3["ticket_id"]]
 
 
 def test_claim_any_respects_repo_filter(tmp_path):
     _conn, _maint, _member, svc, member_svc = _world(tmp_path)
-    svc.add_ticket("pool-1", "demo", "Demo task")
-    svc.add_ticket("pool-1", "other", "Other task")
-    out = member_svc.claim_any(repo_id="other", max_tasks=5)
+    svc.add_ticket("pool-1", "demo", "Demo task", source=SRC)
+    svc.add_ticket("pool-1", "other", "Other task", source=SRC)
+    out = member_svc.claim_any(repo_id="other", max_tasks=5, source=SRC)
     assert out["count"] == 1 and out["claimed"][0]["repo_id"] == "other"
 
 
@@ -352,33 +360,33 @@ def test_handler_smoke_new_surface(tmp_path):
         ctx = _FakeCtx()
         plugin.register(ctx)
         # /add-repo without --path: clear error, not a crash.
-        out = json.loads(ctx.commands["add-repo"]("widget-api"))
+        out = json.loads(ctx.commands["add-repo"]("widget-api", source=SRC))
         assert out["ok"] is False and "--path" in out["error"]
         # Full flow through the flat commands.
         out = json.loads(ctx.commands["add-repo"](
-            f"widget-api --path {src} --pool pool-1 --name 'Widget API'"))
+            f"widget-api --path {src} --pool pool-1 --name 'Widget API'", source=SRC))
         assert out["ok"] and out["repo_id"] == "widget-api" and out["version"] == 1
         assert out["state"] == "accepted"
         # repo_id derived from --path basename when omitted.
-        out = json.loads(ctx.commands["add-repo"](f"--path {src} --pool pool-1"))
+        out = json.loads(ctx.commands["add-repo"](f"--path {src} --pool pool-1", source=SRC))
         assert out["ok"] and out["repo_id"] == "src" and out["version"] == 1
         out = json.loads(ctx.commands["task_add"](
-            '--repo widget-api --pool pool-1 --title "Add health endpoint" --brief "GET /healthz"'))
+            '--repo widget-api --pool pool-1 --title "Add health endpoint" --brief "GET /healthz"', source=SRC))
         assert out["ok"] and out["state"] == "open"
         tid = out["ticket_id"]
-        out = json.loads(ctx.commands["task_list"]("--repo widget-api --pool pool-1"))
+        out = json.loads(ctx.commands["task_list"]("--repo widget-api --pool pool-1", source=SRC))
         assert [t["ticket_id"] for t in out["tickets"]] == [tid]
-        out = json.loads(ctx.commands["pool"]("list --pool pool-1"))
+        out = json.loads(ctx.commands["pool"]("list --pool pool-1", source=SRC))
         assert out["ok"] and out["projects"]
         assert {p["repo_id"] for p in out["projects"]} >= {"widget-api", "src"}
         # Claim without paths (whole-ticket).
-        out = json.loads(ctx.commands["claim"](tid))
+        out = json.loads(ctx.commands["claim"](tid, source=SRC))
         assert out["ok"] and out["claim"]["whole_ticket"] is True
         # Bulk claim: no open tickets left -> count 0, still ok.
-        out = json.loads(ctx.commands["claim"]("--any-project --max-tasks 2 --pool pool-1"))
+        out = json.loads(ctx.commands["claim"]("--any-project --max-tasks 2 --pool pool-1", source=SRC))
         assert out["ok"] and out["count"] == 0
         # /pool usage string now includes remove and list.
-        out = json.loads(ctx.commands["pool"]("bogus"))
+        out = json.loads(ctx.commands["pool"]("bogus", source=SRC))
         assert "remove" in out["usage"] and "list" in out["usage"]
     finally:
         plugin._service_for = original
@@ -389,11 +397,11 @@ def test_claim_after_add_flow_fetch(tmp_path):
     signed manifest (Phase 2 fetch surface; FakeTransport)."""
     conn, maint, _member, maint_svc, member_svc = _world(tmp_path)
     src = _git_repo(tmp_path / "src")
-    maint_svc.add_repo("pool-1", "demo", str(src))
-    ticket = maint_svc.add_ticket("pool-1", "demo", "Add hello")
-    member_svc.claim(ticket["ticket_id"])  # whole-ticket claim
+    maint_svc.add_repo("pool-1", "demo", str(src), source=SRC)
+    ticket = maint_svc.add_ticket("pool-1", "demo", "Add hello", source=SRC)
+    member_svc.claim(ticket["ticket_id"], source=SRC)  # whole-ticket claim
     # Fetch path: latest accepted signed manifest for the repo.
-    out = maint_svc.fetch_repo("demo")
+    out = maint_svc.fetch_repo("demo", source=SRC)
     assert out["ok"] and out["repo_id"] == "demo"
     assert out["transfer_ticket"]  # transfer ticket present
     manifest = json.loads(out["manifest_json"])
