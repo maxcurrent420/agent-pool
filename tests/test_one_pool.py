@@ -39,7 +39,7 @@ def world():
 def test_second_register_refused():
     _c, svc = world()
     with pytest.raises(ValueError, match="one pool per gateway"):
-        svc.register_pool("pool-2", "Second", discord_user_id="owner-2")
+        svc.register_pool("pool-2", "Second", maintainer_discord_user_id="owner-2")
 
 
 def test_create_pool_second_refused_at_ledger():
@@ -110,12 +110,12 @@ def test_owner_mismatch_refused():
                       caller_signing_key=SigningKey.generate())
     with pytest.raises(ValueError) as exc:
         svc.register_pool("pool-1", "Team", key_id="agent:other",
-                          discord_user_id="owner-1")
+                          maintainer_discord_user_id="owner-1")
     assert str(exc.value) == "register refused: maintainer must be the gateway owner"
     assert L.list_local_pools(c) == []
     # The gateway identity itself registers fine and is recorded as the
     # owner gateway.
-    out = svc.register_pool("pool-1", "Team", discord_user_id="owner-1")
+    out = svc.register_pool("pool-1", "Team", maintainer_discord_user_id="owner-1")
     assert out["maintainer"] == "agent:gateway"
     row = c.execute("SELECT owner_gateway_key_id FROM pools WHERE pool_id='pool-1'").fetchone()
     assert row[0] == "agent:gateway"
@@ -199,7 +199,7 @@ def test_push_deliver_non_maintainer_refused(tmp_path):
     member_svc = PoolService(conn, transport, caller_key_id=member.key_id,
                              caller_signing_key=member.signing_key,
                              caller_box_sk=member.box_sk)
-    maint_svc.register_pool("pool-1", "Team", discord_user_id="owner-1")
+    maint_svc.register_pool("pool-1", "Team", maintainer_discord_user_id="owner-1")
     sync_whitelist(conn, "pool-1", ["member-1"])
     add_member(conn, "pool-1", member.key_id, role="member",
                box_pubkey_hex=member.box_pk.encode(RawEncoder).hex(),

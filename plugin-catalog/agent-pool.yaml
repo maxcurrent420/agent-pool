@@ -15,7 +15,7 @@ description: >-
   observation, no execution); one pool per gateway, and the pool maintainer
   is the gateway owner (the maintainer registered the pool on this gateway;
   acceptance happens on the maintainer gateway only). Access is a whitelist,
-  not an invite: the pool owner (register --discord-user) is always
+  not an invite: the pool owner (maintainer_discord_user_id) is always
   authorized; additional Discord users arrive via env
   AGENT_POOL_ALLOWED_USERS or the allowed_users config. Budgets belong to
   agents, not pools: each agent has a task-completion allocation
@@ -33,12 +33,13 @@ description: >-
   chain verification happens on the hosted-pool fetch only. Per-version
   DEK wrapping per member, sandbox audit gate (audit-on-push), global
   freeze kill-switch, pool_not_local refusal for foreign pools. Task
-  lifecycle: open / claimed / completed. Transport: relay (default) or
-  tor (Iroh + Tor custom transport via sidecar; fails closed).
+  lifecycle: open / claimed / completed. Transport: Iroh-over-Tor
+  only (Iroh + Tor custom transport via sidecar; hard-gated, fails
+  closed, no relay fallback).
   Disclosure — spawns git/bubblewrap/send_hermes child processes; network
-  calls go to Iroh peers/relay (relay-only on both ends in relay mode;
-  tor mode removes the relay from the connection path; HERMES_IROH_RELAY=off
-  is a no-op — there is no direct mode); reads profile plugin-data dir for
+  calls go to Iroh peers over Tor (no relay in the connection path;
+  HERMES_IROH_RELAY is ignored — there is no relay or direct mode);
+  reads profile plugin-data dir for
   ledger, identities, worktrees; stores ed25519/box keys under the plugin
   data dir; no telemetry, no stored credentials beyond its own keypairs.
 maintainer: maxcurrent420

@@ -37,7 +37,7 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
    Discord connect. New commands do not appear in the Discord picker
    until this restart. There is no hot-reload.
 
-## Tor (optional, for `transport_mode=tor`)
+## Tor (mandatory — Iroh-over-Tor is the only byte transport)
 
 4. Install Tor + sidecar on EVERY gateway in the pool (both endpoints
    must enable Tor; mixed pools fail closed):
@@ -46,16 +46,17 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
    scripts/install-tor.sh   # writes ops/torrc, builds sidecar, enables the tor service
    systemctl start agent-pool-tor
    ```
-   `transport_mode=tor` is opt-in; `relay` mode needs none of this and
-   stays the out-of-the-box mode.
+   Tor is mandatory: without it the plugin fails closed at service
+   construction, plugin registration, and pool registration. There
+   is no relay mode.
 
 ## Config
 
 5. Set in the profile's plugin config (no `gateway_channel_id` exists —
    gateway routing is Hermes's):
    - `transport`: `real` (send_hermes/Iroh; `fake` is tests/CLI only)
-   - `transport_mode`: `relay` (default) or `tor`
-   - `relay_url`: `""` (default relay) or a self-hosted relay URL
+   - `transport_mode`: `tor` (only valid value; legacy `relay` is
+     ignored with a migration warning)
    - `allowed_users`: the Discord user ids allowed on the hosted pool
      (a list), or env `AGENT_POOL_ALLOWED_USERS` (comma-separated) —
      env wins over config; the pool owner is always whitelisted.
@@ -65,7 +66,7 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
    - Secondary per-claim limits (checked only from agent-reported
      usage): `max_turns` 25, `token_cap` 50000, `wall_clock_seconds`
      1800. There are no budget keys under `pools` — `pools` holds
-     `transport_mode`/`relay_url` only.
+     per-pool transport settings are ignored (tor-only).
    - confirm `send_hermes` is on PATH and `bubblewrap` is installed
      (without bwrap the scanner runs unsandboxed and says so).
 
@@ -83,12 +84,13 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
 
 ## The command sequence (in Discord)
 
-8. Register a pool and bind yourself as owner — the `--discord-user`
-   you pass here becomes the whitelist owner and is the authorization
-   for every owner-only verb. The maintainer is the gateway owner:
-   the gateway identity on this gateway becomes the only maintainer.
+8. Register a pool and bind yourself as owner — the
+   `maintainer_discord_user_id` you set in config/env becomes the
+   whitelist owner and is the authorization for every owner-only verb.
+   The maintainer is the gateway owner: the gateway identity on this
+   gateway becomes the only maintainer.
    ```text
-   /pool register demo-pool --name Demo --discord-user <your Discord user id>
+   /pool register demo-pool --name Demo
    ```
 9. Whitelist a second member (optional; single-agent run is fine) via
    env `AGENT_POOL_ALLOWED_USERS` or config `allowed_users` on the
@@ -194,10 +196,10 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
 - A real Discord button click (there are no buttons in 2.7.0 — the
   audit gate is automatic on push-deliver).
 - Multi-machine pools: single-host run first; cross-machine uses the
-  same flow with `relay_url` left at the default.
-- `transport_mode=tor`: requires Tor installed and running on both
-  endpoints; verify `tor_ready()` passes before attempting a tor-mode
-  transfer.
+  same flow (Iroh-over-Tor on both endpoints).
+- Iroh-over-Tor (the only transport): requires Tor installed and
+  running on both endpoints; verify `tor_ready()` passes before
+  attempting any byte transfer (the plugin gates on it).
 - Freeze behaviour: while frozen, only the `pool_status` tool answers;
   every slash verb (including reads) is blocked with
   `pool frozen — contact the maintainer`.

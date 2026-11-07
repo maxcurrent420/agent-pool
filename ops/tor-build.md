@@ -30,14 +30,14 @@ adds `--transport tor` to both argv forms and emits **no relay flags**.
 
 **BUILT and verified live.** The tor-enabled binary is installed at
 `~/.local/bin/send_hermes-tor` (the stock `send_hermes` is untouched,
-so the interconnect plugin's relay transfers are unaffected). The
+so the interconnect plugin's transfers are unaffected). The
 build tree is a patched clone of the pinned upstream
 (`github.com/rahlquist/sendme` @ `c700cbc…`):
 
 - `Cargo.toml`: + `iroh-tor-transport = "=0.1.0"` (which enables iroh's
   `unstable-custom-transports` feature against iroh 1.0.0 — the same
   line as the hermes-iroh sidecar pin).
-- `src/main.rs`: `TransportMode` enum (`relay` default / `tor`;
+- `src/main.rs`: `TransportMode` enum (`tor`;
   `direct` rejected at parse), `--transport`, `--tor-socks-port`
   (9055), `--tor-control-port` (9051) on `CommonArgs`. In tor mode
   both `send()` and `receive()` build the endpoint from
@@ -67,7 +67,7 @@ tor_binary: /home/maxcurrent/.local/bin/send_hermes-tor   # or install as send_h
 
 (The `scripts/install-tor.sh` route installs the same binary as
 `/usr/local/bin/send_hermes`; the separate `send_hermes-tor` name
-here is deliberate so relay-mode hosts keep working unchanged.)
+here is deliberate so non-agent-pool hosts keep working unchanged.)
 
 ## Build steps (option (A), operator-executed)
 
@@ -90,18 +90,17 @@ cd send_hermes && git checkout c700cbcaedb8f626716b8769dcbc5571ec64d088
 # In send_hermes's Cargo.toml:
 #   iroh = { version = "<sendme-0.36.0's pinned iroh>", features = ["unstable-custom-transports"] }
 #   iroh-tor-transport = "=0.1.0"
-# Add a `--transport <relay|tor>` flag to `send`/`receive` that
+# Add a `--transport tor` flag to `send`/`receive` that
 # constructs the endpoint with
 #   TorCustomTransport::builder().build(secret_key)
-# when --transport tor is given (and --ticket-type relay / --relay
-# become no-ops-or-errors in that mode: the ticket must be a Tor
-# hidden-service ticket, not a relay ticket).
+# when --transport tor is given (no relay flags are emitted in
+# that mode: the ticket must be a Tor hidden-service ticket).
 cargo build --release
 sudo install -m 755 target/release/send_hermes /usr/local/bin/send_hermes
 send_hermes send --help   # must list --transport
 ```
 
-## Verify before setting `transport_mode: tor`
+## Verify Tor before starting the plugin (mandatory)
 
 ```sh
 send_hermes send --help | grep -- --transport   # sidecar is tor-enabled
@@ -114,15 +113,15 @@ systemctl status agent-pool-tor                 # daemon up
 Then set per-gateway plugin config:
 
 ```yaml
-transport_mode: tor        # opt-in; default stays relay until proven
+transport_mode: tor        # only valid value; the default (mandatory)
 tor_control_port: 9051
 tor_socks_port: 9055
 tor_binary: ""             # empty = tor-enabled send_hermes on PATH (option A)
 ```
 
-`relay` stays the explicit fallback mode an operator can return to at
-any time — but the switch is always explicit config, never an automatic
-downgrade from tor.
+There is no relay fallback to return to: the former relay mode was
+removed entirely. Changing the transport requires forking and editing
+the source (see `docs/fallback-transport.md`).
 
 ## Limitations engineered around (from the iroh Tor docs)
 
@@ -141,7 +140,7 @@ downgrade from tor.
 ## Per-transfer vs long-lived (Q5)
 
 Phase 3 ships **per-transfer** spawning: `send_hermes` runs as a
-per-transfer provider behind `script -qefc`, exactly as relay mode
+per-transfer provider behind `script -qefc`, exactly as before
 does today. Building a Tor endpoint (onion service) per transfer is
 slow; if measured onion-setup latency is unacceptable, the follow-up
 is the long-lived unit `ops/systemd/agent-pool-sendhermes.service`

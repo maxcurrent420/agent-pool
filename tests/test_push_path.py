@@ -90,7 +90,7 @@ def world(tmp_path):
     other_svc = PoolService(conn, transport, caller_key_id=other.key_id,
                             caller_signing_key=other.signing_key,
                             caller_box_sk=other.box_sk)
-    maint_svc.register_pool(POOL, "Team", discord_user_id=OWNER)
+    maint_svc.register_pool(POOL, "Team", maintainer_discord_user_id=OWNER)
     _whitelist(conn, POOL, MEMBER_USER, member)
     _whitelist(conn, POOL, OTHER_USER, other)
     src = _git_src(tmp_path / "src")
@@ -265,3 +265,48 @@ def test_push_build_bundle_returns_manifest_json(tmp_path):
     assert "manifest_json" in bundle
     assert json.loads(bundle["manifest_json"]) == bundle["manifest"]
     assert bundle["manifest"]["transfer_ticket"] in bundle["manifest_json"]
+
+
+def test_push_deliver_returns_agent_prompt_on_accept(tmp_path):
+    w = world(tmp_path)
+    _commit_change(w["src"], "hello.txt", "hello push v2\n")
+    grant, bundle = _grant_and_bundle(w)
+    manifest = bundle["manifest"]
+    out = w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
+                                      manifest, source=_member_source())
+    assert out["ok"] is True
+    prompt = out["agent_prompt"]
+    assert prompt["event"] == "push_accepted"
+    assert prompt["ephemeral"] is True
+    assert prompt["ticket_id"] == w["ticket_id"]
+    assert prompt["transfer_ticket"]
+    assert prompt["transfer_ticket"] == out["manifest"]["transfer_ticket"]
+    assert json.loads(prompt["manifest_json"]) == out["manifest"]
+    assert prompt["version"] == 2
+    assert "approve merge" in prompt["prompt"]
+    assert "complete" in prompt["prompt"]
+
+
+def test_merge_approved_requires_owner(tmp_path):
+    w = world(tmp_path)
+    _commit_change(w["src"], "hello.txt", "hello push v2\n")
+    grant, bundle = _grant_and_bundle(w)
+    manifest = bundle["manifest"]
+    w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
+                                manifest, source=_member_source())
+    with pytest.raises(PermissionError, match="not authorized"):
+        w["maint_svc"].merge_approved(w["ticket_id"], approved_by_user_id=MEMBER_USER)
+
+
+def test_merge_approved_records_event(tmp_path):
+    w = world(tmp_path)
+    _commit_change(w["src"], "hello.txt", "hello push v2\n")
+    grant, bundle = _grant_and_bundle(w)
+    manifest = bundle["manifest"]
+    w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
+                                manifest, source=_member_source())
+    out = w["maint_svc"].merge_approved(w["ticket_id"], approved_by_user_id=OWNER)
+    assert out == {"ok": True, "merged": True, "ticket_id": w["ticket_id"], "version": 2}
+    kinds = [r[0] for r in w["conn"].execute(
+        "SELECT kind FROM events WHERE kind IN ('merge_approved','merge_completed')")]
+    assert kinds == ["merge_approved", "merge_completed"]

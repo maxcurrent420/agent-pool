@@ -3,8 +3,8 @@
 **Version 2.7.0** · MIT · community plugin for Hermes Agent (≥ 0.22.0).
 
 A pool is a small team of agents sharing repos. Repos propagate as
-BLAKE3-verified, end-to-end encrypted bundles over Iroh (with an optional
-Tor anonymity layer); coordination (tasks, claims, freezes) travels only
+BLAKE3-verified, end-to-end encrypted bundles over Iroh over Tor
+(Tor is mandatory — Iroh-over-Tor is the only byte transport); coordination (tasks, claims, freezes) travels only
 through the Hermes gateway via Discord. The plugin never imports `discord`
 and never posts to Discord itself — it returns content for Hermes to post.
 
@@ -53,7 +53,7 @@ whitelist of Discord user ids:
 - Source: env `AGENT_POOL_ALLOWED_USERS` (comma-separated Discord user
   ids) or config `allowed_users` (a list). Env wins over config when
   both are set.
-- The pool owner (from `/pool register --discord-user`) is always
+- The pool owner (from `maintainer_discord_user_id` in config/env) is always
   whitelisted.
 - `ledger.sync_whitelist` syncs the whitelist into `pool_authorized`:
   it inserts missing users and never deletes existing rows. Removal is
@@ -110,8 +110,10 @@ pre-existing multi-pool DB is refused for management verbs until the
 operator removes the extras; rows are never auto-deleted.
 
 Agents *interact* with multiple pools (fetch lists, claim, release,
-push) by commands the platform routes to those pools' own gateways,
-recording each in the `pool_gateways` table.
+push) by telling the agent which Discord bot/gateway to address; that
+gateway's plugin answers from its own ledger. `pool_gateways` is a
+local notebook of foreign pools refused, not a routing table. Each
+interaction is recorded in the `pool_gateways` table.
 
 ## Task lifecycle
 
@@ -140,7 +142,7 @@ branch {branch}`; the agent cleans up.
 
 An agent is allocated a maximum number of tasks it may complete on the
 pool. There are no pool-level budget keys; the `pools` config holds
-`transport_mode`/`relay_url` only.
+`pools` transport settings are ignored (see Transport privacy).
 
 Allocation precedence: env `AGENT_POOL_TASK_ALLOCATIONS`
 (comma-separated `key_id=N`) > config `agent_task_allocations`
@@ -178,6 +180,19 @@ paths; the agent on the gateway does the pull/push.
   hash, and refuses with `fetch refused: manifest signature does not verify`.
 - Full chain verification happens on the hosted-pool `fetch()`. There
   is no local-pool branch in the download path.
+- Worktrees use Iroh for push/pull: claim hands the agent a worktree
+  path, branch, and base ref but no bytes (claim does not deliver
+  bytes); the pull chain is the separate fetch-manifest then download
+  steps, and push uses the same Iroh transport as fetch.
+- On a clean push accept, `push_deliver` returns an ephemeral
+  (gateway-only) `agent_prompt` payload carrying the accepted
+  manifest's `transfer_ticket` (the Iroh download link), `manifest_json`,
+  version, and a prompt asking the agent to notify the user that tasks
+  are complete and to merge after approval. The plugin never posts to
+  Discord and never merges; merge requires explicit approval recorded
+  by `merge_approved` (gateway-owner only). In the mixed case where
+  the contributor is not the maintainer, the maintainer must re-run
+  `/fetch repo` to obtain the accepted manifest.
 
 ## Freeze scope
 
@@ -186,30 +201,36 @@ verb is blocked with `pool frozen — contact the maintainer`. This
 includes read verbs — read-only queries do not survive a freeze.
 
 Two honest caveats: the wrapper guard is best-effort (an exception
-inside the guard falls through to the handler), and verbs that cannot
-resolve a pool skip the freeze check.
+inside the guard falls through to the handler), and verbs run before
+any pool exists (e.g. register) or naming a foreign pool skip the
+freeze check; there is nothing to resolve.
 
 ## Passive plumbing
 
 The plugin answers fetch/claim/release/push commands on its own
-gateway; the platform routes commands across gateways; agents pull
-and push over the configured transport. No timers, no observation, no
-execution, no Discord posting.
+gateway. The user tells the agent which Discord bot/gateway to address;
+that gateway's plugin answers from its own ledger. `pool_gateways` is a
+local notebook of foreign pools refused, not a routing table. Agents
+pull and push over the configured transport. No timers, no
+observation, no execution, no Discord posting.
 
 ## Transport privacy
 
-Substrate: Iroh (endpoint, relay, transfer tickets, end-to-end
-encryption) — unchanged. Anonymity layer: Iroh's Tor custom transport
-via the sidecar, opt-in per pool.
+Substrate: Iroh (endpoint, transfer tickets, end-to-end
+encryption) over Tor — Iroh-over-Tor is the only byte transport. There
+is no relay fallback and no relay option; a fork must edit source to
+change the transport (see `docs/fallback-transport.md`).
 
-- `transport_mode: relay` (default) — transfers are relay-only on both
-  sender and receiver; the peer learns no IP; the relay sees both
-  peers' IPs + metadata, never plaintext. Explicit fallback.
-- `transport_mode: tor` — Iroh Tor custom transport over hidden
-  services; neither peer learns the other's IP; no relay in the
-  connection path. Both endpoints must enable Tor; `tor_ready()` fails
-  closed and never silently downgrades to relay.
-- `direct` mode does not exist and cannot be constructed.
+- `transport_mode: tor` (default, only valid value) — Iroh Tor custom
+  transport over hidden services; neither peer learns the other's IP;
+  no relay in the connection path. Both endpoints must enable Tor;
+  `tor_ready()` is a hard gate at service construction, plugin
+  registration, and pool registration, and fails closed with no
+  fallback.
+- `relay` and `direct` modes do not exist and cannot be constructed;
+  selecting them is rejected. A legacy top-level `transport_mode=relay`
+  in plugin config is ignored (treated as tor) with a migration warning
+  in `pool_status`; per-pool transport settings are ignored.
 
 Residuals (stated honestly):
 
@@ -224,8 +245,8 @@ Residuals (stated honestly):
    over time).
 6. Discord visibility (endpoint/ticket metadata travels in command
    replies; bytes never do).
-7. `relay` fallback mode still routes through an Iroh relay that sees
-   both endpoints' IPs + metadata (never plaintext).
+7. (Removed) The former relay fallback mode no longer exists; there
+   is no relay in the connection path to see endpoint IPs.
 
 ControlPort is cookie-auth-disabled and bound to `127.0.0.1` only
 (`ops/torrc`).
@@ -265,8 +286,8 @@ ControlPort is cookie-auth-disabled and bound to `127.0.0.1` only
 
 | Key | Default | Notes |
 |---|---|---|
-| `transport_mode` | `relay` | `relay` or `tor` (see Transport privacy) |
-| `relay_url` | `""` | Iroh relay URL; empty = default relay; `off` rejected |
+| `transport_mode` | `tor` | `tor` only (see Transport privacy) |
+| `relay_url` | `""` | Deprecated and ignored (no relay transport) |
 | `tor_control_port` | `9051` | 127.0.0.1 only |
 | `tor_socks_port` | `9055` | operator tooling |
 | `tor_binary` | `""` | optional sidecar path; empty = tor-enabled send_hermes |
@@ -276,14 +297,14 @@ ControlPort is cookie-auth-disabled and bound to `127.0.0.1` only
 | `max_turns` | `25` | secondary per-claim limit, checked only from agent-reported usage |
 | `token_cap` | `50000` | secondary per-claim limit, checked only from agent-reported usage |
 | `wall_clock_seconds` | `1800` | secondary per-claim limit, checked only from agent-reported usage |
-| `pools` | `{}` | per-pool transport settings only (`transport_mode`, `relay_url`) |
+| `pools` | `{}` | Deprecated and ignored (tor-only for every pool) |
 | `transport` | `real` | `real` (send_hermes/Iroh) or `fake` (in-memory, tests/CLI) |
 
 The code default for `transport` is `real`, matching `plugin.yaml`: an
 unset key runs the real transport. Set `transport: fake` only for
 tests/CLI.
 
-Env vars: `HERMES_IROH_RELAY`, `HERMES_IROH_STATE_DIR`,
+Env vars: `HERMES_IROH_STATE_DIR`,
 `HERMES_IROH_SEND_TIMEOUT`, `HERMES_IROH_FETCH_TIMEOUT`,
 `AGENT_POOL_DATA_DIR`, `AGENT_POOL_ALLOWED_USERS`,
 `AGENT_POOL_TASK_ALLOCATIONS`, `AGENT_POOL_WORKTREE_ROOT`.
@@ -292,10 +313,12 @@ Env vars: `HERMES_IROH_RELAY`, `HERMES_IROH_STATE_DIR`,
 
 1. `pip` deps: `pynacl>=1.5,<2`, `blake3>=0.4,<2`.
 2. `send_hermes` binary on PATH (hermes-iroh-interconnect sendme fork).
-3. Tor (optional, for `transport_mode=tor`):
+3. Tor (mandatory — Iroh-over-Tor is the only byte transport):
    `apt install tor` + `scripts/install-tor.sh` (writes `ops/torrc`,
    builds the tor-enabled sidecar, enables the tor service). Both
-   endpoints in a pool must enable Tor; fail closed until then.
+   endpoints in a pool must enable Tor; the plugin fails closed at
+   service construction, plugin registration, and pool registration
+   until then. No relay fallback exists.
 4. Symlink the plugin into `~/.hermes/plugins/agent-pool`.
 
 ## Tests / Demo
@@ -312,6 +335,6 @@ Env vars: `HERMES_IROH_RELAY`, `HERMES_IROH_STATE_DIR`,
 - `docs/architecture.md` — command-surface chain, Tor-routed Iroh
   flow, one-pool model + `pool_gateways`.
 - `docs/threat-model.md` — anonymity/residual-risk, guarantees.
-- `docs/fallback-transport.md` — relay fallback, Radicle seed, Tor
-  ceilings.
+- `docs/fallback-transport.md` — why there is no relay fallback
+  (fork-only escape hatch), Radicle seed, Tor ceilings.
 - `scripts/live-discord-check.md` — operator runbook.

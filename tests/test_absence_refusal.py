@@ -64,6 +64,9 @@ def test_pools_config_is_transport_only():
     doc = yaml.safe_load((Path(__file__).parent.parent / "plugin.yaml").read_text())
     pools = doc["config_schema"]["pools"]
     assert pools["description"] == (
-        "Per-pool settings keyed by pool_id (transport_mode, relay_url only)"
+        "Deprecated and ignored: per-pool transport settings have no effect — "
+        "Iroh-over-Tor is the only transport for every pool. Legacy "
+        "transport_mode=relay entries are ignored with a migration warning; "
+        "remove them."
     )
     assert "budget" not in pools["description"].lower()

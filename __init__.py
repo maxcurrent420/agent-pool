@@ -36,31 +36,45 @@ def _cfg(ctx, key, default):
         return default
 
 
+def _legacy_relay_pools(ctx):
+    """Pool ids (plus ``"<global>"``) whose config still names the
+    removed relay transport. Those entries are ignored (treated as
+    tor) and reported as a migration warning by ``_pool_status``."""
+    legacy = []
+    raw = _cfg(ctx, "transport_mode", "tor") if ctx else "tor"
+    if str(raw or "").strip().lower() == "relay":
+        legacy.append("<global>")
+    pools_cfg = _cfg(ctx, "pools", {}) if ctx else {}
+    if isinstance(pools_cfg, dict):
+        for pid, cfg in pools_cfg.items():
+            if isinstance(cfg, dict) and str(
+                    cfg.get("transport_mode", "") or "").strip().lower() == "relay":
+                legacy.append(str(pid))
+    return legacy
+
+
 def _transport_config(ctx):
     """Resolve (mode, relay_url, per_pool) from plugin config.
 
-    Precedence (documented in plugin.yaml):
-    1. per-pool ``pools.<pool_id>.transport_mode`` / ``relay_url``
-    2. top-level ``transport_mode`` (default ``relay``) / ``relay_url``
-    3. ``HERMES_IROH_RELAY`` env var (inside the transport; an empty
-       config relay_url means "unset" so the env still applies)
-    An env ``off`` is a no-op in every mode (direct does not exist, so
-    there is nothing to fall back to); ``_pool_status`` says so and
-    states that transfers are relay-only on both ends.
+    Iroh-over-Tor is the only byte transport: mode is always ``tor``.
+    A legacy top-level ``transport_mode=relay`` is ignored (treated
+    as tor, see ``_legacy_relay_pools``); any other non-tor value
+    raises via ``normalize_mode``. Per-pool ``transport_mode`` /
+    ``relay_url`` overrides are ignored entirely — ``per_pool`` is
+    always empty and ``relay_url`` is always ``""`` (retained in the
+    return shape for callers; the key is deprecated/ignored).
+    ``HERMES_IROH_RELAY`` is ignored: no relay flags are ever emitted.
     """
-    base_mode = _cfg(ctx, "transport_mode", "relay") if ctx else "relay"
-    base_relay = _cfg(ctx, "relay_url", "") if ctx else ""
-    pools_cfg = _cfg(ctx, "pools", {}) if ctx else {}
-    per_pool: dict = {}
-    if isinstance(pools_cfg, dict):
-        for pid, cfg in pools_cfg.items():
-            if not isinstance(cfg, dict):
-                continue
-            mode = cfg.get("transport_mode", base_mode)
-            relay = cfg.get("relay_url", base_relay)
-            if mode != base_mode or relay != base_relay:
-                per_pool[pid] = {"transport_mode": mode, "relay_url": relay}
-    return base_mode, base_relay, per_pool
+    try:
+        from .transport import normalize_mode
+    except ImportError:
+        from transport import normalize_mode
+    raw = _cfg(ctx, "transport_mode", "tor") if ctx else "tor"
+    if str(raw or "").strip().lower() == "relay":
+        mode = "tor"  # legacy relay config: ignored, migration warning
+    else:
+        mode = normalize_mode(raw)
+    return mode, "", {}
 
 
 def _tor_config(ctx):
@@ -88,9 +102,12 @@ def _pool_status(args=None, **kwargs):
     """Report plugin config + ledger/identity readiness. Always returns JSON."""
     ctx = kwargs.get("ctx")
     try:
-        relay_url = _cfg(ctx, "relay_url", "") if ctx else ""
-        mode, _mode_relay, per_pool = _transport_config(ctx)
+        mode, _relay_url, per_pool = _transport_config(ctx)
+        # relay_url is deprecated/ignored: no relay in the connection
+        # path. Kept as "" for shape compatibility.
+        relay_url = ""
         env_relay = os.environ.get("HERMES_IROH_RELAY", "").strip()
+        legacy_relay = _legacy_relay_pools(ctx)
         budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
             ("max_turns", 25), ("max_tasks_per_day", 5),
             ("token_cap", 50000), ("wall_clock_seconds", 1800))}
@@ -102,12 +119,8 @@ def _pool_status(args=None, **kwargs):
                       "tor: onion-routed via Iroh Tor custom transport "
                       "(sidecar + tor daemon); peer learns no IP, no "
                       "relay in the connection path; both endpoints "
-                      "must enable Tor"
-                      if mode == "tor" else
-                      "relay-only on both sender and receiver: the peer "
-                      "learns no IP; the relay sees both peers' IPs and "
-                      "transfer metadata but never plaintext; there is "
-                      "no direct mode and no way to opt into one"),
+                      "must enable Tor; Iroh-over-Tor is the only byte "
+                      "transport"),
                   "pool_transports": per_pool,
                   "budgets": budgets,
                   # Budgets belong to agents, not pools: max_tasks_per_day
@@ -128,32 +141,41 @@ def _pool_status(args=None, **kwargs):
                       "usage (pool_report_usage); no pool-level budgets"),
                   "ledger": "ready", "identity": "ready",
                   "queued_notices": []}
-        if mode == "tor":
-            # Surface tor readiness (probe is bounded, never raises).
-            control, socks, tor_binary = _tor_config(ctx)
-            status["tor"] = {"control_port": control, "socks_port": socks,
-                             "binary": tor_binary or "send_hermes (PATH)"}
+        # Tor is the only transport: always surface readiness.
+        control, socks, tor_binary = _tor_config(ctx)
+        status["tor"] = {"control_port": control, "socks_port": socks,
+                         "binary": tor_binary or "send_hermes (PATH)"}
+        try:
             try:
-                try:
-                    from .transport import tor_ready as _tor_ready
-                except ImportError:
-                    from transport import tor_ready as _tor_ready
-                status["tor"]["ready"] = _tor_ready(
-                    control_port=control, socks_port=socks,
-                    binary=tor_binary)
-            except Exception as exc:
-                status["tor"]["ready"] = {"ok": False,
-                                          "error": str(exc)[:300]}
-                status["transport_warning"] = (
-                    f"transport_mode=tor but the Tor anonymity layer is "
-                    f"not ready: {str(exc)[:200]} — tor transfers fail "
-                    "closed; tor mode never falls back to relay.")
-        if mode != "tor" and env_relay.lower() in {"off", "disabled", "none"}:
+                from .transport import tor_ready as _tor_ready
+            except ImportError:
+                from transport import tor_ready as _tor_ready
+            status["tor"]["ready"] = _tor_ready(
+                control_port=control, socks_port=socks,
+                binary=tor_binary)
+        except Exception as exc:
+            status["tor"]["ready"] = {"ok": False,
+                                      "error": str(exc)[:300]}
             status["transport_warning"] = (
-                f"HERMES_IROH_RELAY={env_relay} is set but it is a no-op: "
-                "transfers are relay-only on both ends and the env var "
-                "cannot strip the anonymity layer (there is no direct "
-                "mode). The peer learns no IP.")
+                f"Tor anonymity layer is not ready: {str(exc)[:200]} — "
+                "byte transfers fail closed; Iroh-over-Tor is the only "
+                "byte transport (no relay fallback). Start the unit "
+                "named in the error (systemctl start agent-pool-tor) "
+                "and install the tor sidecar (scripts/install-tor.sh).")
+        if legacy_relay:
+            status["migration_warning"] = (
+                "ignored legacy relay transport config for: "
+                + ", ".join(legacy_relay)
+                + " — treated as tor; remove transport_mode=relay / "
+                "relay_url from config (Iroh-over-Tor is the only "
+                "byte transport).")
+        if env_relay:
+            status["transport_warning"] = (
+                (status.get("transport_warning", "") + " ")
+                .strip()
+                + f"HERMES_IROH_RELAY={env_relay} is ignored: no relay "
+                "flags are emitted; Iroh-over-Tor is the only byte "
+                "transport.").strip()
         try:
             svc = _service_for(ctx)
             status["queued_notices"] = svc.drain_notices()
@@ -197,6 +219,19 @@ def _whitelist_user_ids(ctx):
     return []
 
 
+def _maintainer_discord_user_id(ctx):
+    """Resolve maintainer Discord id: env beats config.
+
+    Source order: ``AGENT_POOL_MAINTAINER_DISCORD_USER_ID`` when
+    non-empty, else the ``maintainer_discord_user_id`` config key.
+    """
+    env = os.environ.get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "")
+    if env.strip():
+        return env.strip()
+    cfg = _cfg(ctx, "maintainer_discord_user_id", "") if ctx else ""
+    return str(cfg).strip() if cfg else ""
+
+
 def _service_for(ctx, source=None):
     """Build a PoolService from the plugin context. Raises with a clear msg."""
     try:
@@ -222,25 +257,26 @@ def _service_for(ctx, source=None):
     data_dir = L.default_db_path().parent
     identity = ensure_identity(data_dir)
     transport_name = _cfg(ctx, "transport", "real") if ctx else "real"
-    mode, relay_url, per_pool = _transport_config(ctx)
-    # An empty relay_url in config means "unset" (env/CLI default apply);
-    # a non-empty one beats the env var. A non-empty "off" is rejected by
-    # the transport constructor (relay-only cannot be opted out of).
-    relay_arg = str(relay_url).strip() or None
-
-    def _make(m, r):
-        if transport_name == "fake":
-            return FakeTransport(transport_mode=m)
-        control, socks, tor_binary = _tor_config(ctx)
-        return RealSendHermesTransport(
-            transport_mode=m, relay_url=r,
+    mode, _relay_url, _per_pool = _transport_config(ctx)
+    control, socks, tor_binary = _tor_config(ctx)
+    if transport_name == "fake":
+        # Test-only backend: exempt from the tor gate (documented).
+        transport = FakeTransport(transport_mode=mode)
+    else:
+        # Hard gate at service construction: tor_ready() must pass
+        # before any real transport is built. Raises TorNotReady
+        # naming the unit to start — fail closed, no fallback.
+        try:
+            from .transport import tor_ready as _gate_tor_ready
+        except ImportError:
+            from transport import tor_ready as _gate_tor_ready
+        _gate_tor_ready(control_port=control, socks_port=socks,
+                        binary=tor_binary)
+        transport = RealSendHermesTransport(
+            transport_mode=mode,
             tor_control_port=control, tor_socks_port=socks,
             tor_binary=tor_binary)
-
-    transport = _make(mode, relay_arg)
-    overrides = {pid: _make(cfg["transport_mode"],
-                             str(cfg["relay_url"]).strip() or None)
-                 for pid, cfg in per_pool.items()}
+    overrides: dict = {}
     budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
         ("max_turns", 25), ("max_tasks_per_day", 5),
         ("token_cap", 50000), ("wall_clock_seconds", 1800))}
@@ -253,7 +289,8 @@ def _service_for(ctx, source=None):
                        caller_box_sk=identity.box_sk, budget_defaults=budgets,
                        pool_resolver=pool_resolver,
                        transport_overrides=overrides,
-                       agent_task_allocations=agent_task_allocations)
+                       agent_task_allocations=agent_task_allocations,
+                       maintainer_discord_user_id=_maintainer_discord_user_id(ctx))
 
 
 # ---------------------------------------------------------------------------
@@ -338,9 +375,8 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
         if sub == "register":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             out = svc.register_pool(pool_id, opts.get("name", pool_id),
-                                    relay_url=opts.get("relay_url", ""),
                                     source=source,
-                                    discord_user_id=opts.get("discord_user", ""))
+                                    maintainer_discord_user_id=getattr(svc, "_maintainer_discord_user_id", ""))
         elif sub == "members":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             out = {"ok": True, "pool_id": pool_id, "members": svc.members(pool_id, source=source)}
@@ -652,7 +688,7 @@ def _pool_report_usage(args=None, **kwargs):
 
 _POOL_STATUS_SCHEMA = {
     "name": "pool_status",
-    "description": ("Report Agent Pool plugin status: relay URL, agent-level "
+    "description": ("Report Agent Pool plugin status: tor transport, agent-level "
                     "task allocation and optional reported-usage limits, "
                     "and ledger/identity readiness."),
     "parameters": {"type": "object", "properties": {}},
@@ -704,7 +740,7 @@ def _wrap_command(handler, ctx):
                 # Freeze control is owner-only (see _require_owner below);
                 # unfreeze runs while frozen, freeze/unfreeze never bypass authz.
                 is_freeze_ctl = (handler.__name__ == "_handle_pool" and sub == "freeze")
-                # Resolve pool best-effort from raw args.
+                # Look up the hosted pool best-effort (or None).
                 pool_id = (opts.get("pool") or opts.get("pool_id") or opts.get("pool-id") or "")
                 resolved = None
                 try:
@@ -826,7 +862,23 @@ def _wrap_command(handler, ctx):
 
 
 def register(ctx):
-    """Wire the full gateway-native surface. Fail-soft."""
+    """Wire the full gateway-native surface.
+
+    Hard tor gate for the real backend: tor_ready() must pass at
+    plugin registration or TorNotReady is raised as a clear startup
+    error (fail closed, no fallback). The fake backend (tests/CLI
+    only) is exempt. Tool/command wiring itself remains fail-soft.
+    """
+    _transport_name = _cfg(ctx, "transport", "real") if ctx else "real"
+    if _transport_name != "fake":
+        try:
+            from .transport import tor_ready as _gate_tor_ready
+        except ImportError:
+            from transport import tor_ready as _gate_tor_ready
+        _control, _socks, _tor_binary = _tor_config(ctx)
+        # Raises TorNotReady naming the unit — surfaced, not swallowed.
+        _gate_tor_ready(control_port=_control, socks_port=_socks,
+                        binary=_tor_binary)
     try:
         ctx.register_tool(name="pool_status", toolset="agent_pool",
                           schema=_POOL_STATUS_SCHEMA,

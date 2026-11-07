@@ -322,7 +322,7 @@ def _load_plugin():
 
 class _FakeCtx:
     def __init__(self):
-        self.tools, self.commands, self.config = {}, {}, {"relay_url": "off"}
+        self.tools, self.commands, self.config = {}, {}, {"transport": "fake"}
         self.state = {}
 
     def register_tool(self, name, toolset, schema, handler):

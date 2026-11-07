@@ -89,7 +89,8 @@ class PoolService:
                  transport=None, caller_key_id: str = "", caller_signing_key=None,
                  caller_box_sk=None, budget_defaults=None, pool_resolver=None,
                  gateway=None, transport_overrides=None,
-                 agent_task_allocations=None, worktree_root=None):
+                 agent_task_allocations=None, worktree_root=None,
+                 maintainer_discord_user_id=None):
         # Backwards-compat: old call sites passed (conn, gateway, transport).
         # Duck-type: anything with post_notice is a legacy gateway (ignored).
         if args:
@@ -106,10 +107,10 @@ class PoolService:
             raise TypeError("PoolService no longer takes a gateway adapter")
         self._conn = conn
         self._transport = transport
-        # Per-pool transport overrides (transport_mode/relay_url from the
-        # plugin ``pools`` config); pools absent here use the top-level
-        # transport. Built once by _service_for, never mutated.
-        self._transport_overrides: dict = dict(transport_overrides or {})
+        # Per-pool transport overrides are removed: Iroh-over-Tor is
+        # the only byte transport, so overrides are always empty.
+        # Any passed overrides are ignored (legacy config).
+        self._transport_overrides: dict = {}
         self._caller_key_id = caller_key_id
         self._caller_sk = caller_signing_key
         self._caller_box_sk = caller_box_sk
@@ -121,6 +122,15 @@ class PoolService:
         self._agent_task_allocations = dict(agent_task_allocations or {})
         self._env_task_allocations = _parse_env_allocations(
             os.environ.get("AGENT_POOL_TASK_ALLOCATIONS", ""))
+        # Maintainer Discord id from config (threaded in by _service_for);
+        # AGENT_POOL_MAINTAINER_DISCORD_USER_ID env beats config.
+        _maint_env = os.environ.get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "").strip()
+        if _maint_env:
+            self._maintainer_discord_user_id = _maint_env
+        else:
+            self._maintainer_discord_user_id = (
+                str(maintainer_discord_user_id).strip()
+                if maintainer_discord_user_id else "")
         # The agent's configured checkout root for per-ticket worktrees.
         self._worktree_root = (
             worktree_root
@@ -162,6 +172,9 @@ class PoolService:
 
     def _resolve_pool(self, pool_id=None, source=None) -> str:
         """The hosted pool is THE single pool (one pool per gateway).
+
+        This is a lookup-or-refuse of the single hosted pool, not a
+        selection among candidates. There is no pool selection to perform.
 
         No pool named -> the one hosted pool. An explicit --pool naming
         anything but the hosted pool is refused (pool_not_local) naming
@@ -220,8 +233,7 @@ class PoolService:
         """Hosted-pool repo list: repos + latest accepted version + available
         (unclaimed) tasks + gateway addressing (the /fetch repo list verb).
 
-        Runs on the pool's own gateway (the ledger lives there; the
-        platform routes the command to the addressed pool's gateway).
+        Runs on the pool's own gateway (the ledger lives there).
         A foreign pool id is refused (pool_not_local) but recorded in
         ``pool_gateways`` so the agent can differentiate the pools it
         interacts with (interaction, not management).
@@ -392,19 +404,18 @@ class PoolService:
 
     def _gateway_addressing(self, pool_id) -> dict:
         """Transport addressing for this gateway's hosted pool (endpoint
-        id; under Tor, the hidden-service identity)."""
+        id; under Tor, the hidden-service identity). transport_addr is
+        intentionally empty and the destination bot is named by the user."""
         try:
             prop = self._propagator(pool_id)
             info = prop._transport_info()
         except Exception:
             info = {"transport_mode": "", "relay_url": ""}
-        row = self._conn.execute("SELECT relay_url FROM pools WHERE pool_id=?",
-                                 (pool_id,)).fetchone()
-        relay_url = (row[0] or "") if row is not None else ""
+        # Ledger relay_url column is legacy/ignored (no relay transport).
         return {"endpoint": pool_id,
                 "transport_addr": "",
                 "transport_mode": info.get("transport_mode", ""),
-                "relay_url": info.get("relay_url") or relay_url,
+                "relay_url": "",
                 "transport_note": info.get("transport_note", "")}
 
     def _enforce_reply_guard(self, out: dict) -> None:
@@ -442,12 +453,22 @@ class PoolService:
 
     # -- pool membership ----------------------------------------------------
 
-    def register_pool(self, pool_id, name, relay_url="", key_id=None,
-                      source=None, discord_user_id=None) -> dict:
+    def register_pool(self, pool_id, name, *, relay_url="", source=None,
+                      maintainer_discord_user_id="", key_id=None) -> dict:
+        # Hard tor gate: a real transport (one with _require_tor_ready)
+        # must probe tor_ready() before registration. FakeTransport
+        # (test-only) has no such method and is exempt. Fail closed.
+        _gate = getattr(self._transport, "_require_tor_ready", None)
+        if callable(_gate):
+            _gate()
         if L.is_global_frozen(self._conn):
             raise L.ClaimRefused(L.FROZEN_MESSAGE)
+        discord_user_id = (
+            str(maintainer_discord_user_id).strip()
+            or getattr(self, "_maintainer_discord_user_id", "")
+            or os.environ.get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "").strip())
         if not discord_user_id:
-            raise ValueError("register needs --discord-user <id>: the whitelist is the auth")
+            raise ValueError("register needs maintainer_discord_user_id: set it in config or AGENT_POOL_MAINTAINER_DISCORD_USER_ID")
         maintainer = key_id or self._caller_key_id
         if not maintainer:
             raise ValueError("register needs a maintainer key_id")
@@ -455,7 +476,8 @@ class PoolService:
         # must be this gateway's identity. No second owner / second pool.
         if maintainer != self._caller_key_id:
             raise ValueError("register refused: maintainer must be the gateway owner")
-        L.create_pool(self._conn, pool_id, name, maintainer, relay_url=relay_url, owner_discord_user_id=discord_user_id, owner_gateway_key_id=self._caller_key_id)
+        # relay_url is legacy/ignored; the column remains for compat.
+        L.create_pool(self._conn, pool_id, name, maintainer, relay_url="", owner_discord_user_id=discord_user_id, owner_gateway_key_id=self._caller_key_id)
         # Record the maintainer's box pubkey so submit wraps the DEK for the
         # maintainer too (fixes "maintainer has no wrapped DEK" at audit).
         _irow = self._conn.execute(
@@ -1151,6 +1173,8 @@ class PoolService:
                   f"{manifest['repo_id']} v{accepted['manifest']['version']} "
                   f"({accepted['manifest_hash'][:12]})")
         self._queue_notice(resolved, notice, kind="ticket_completed")
+        agent_prompt = self._notify_push_accepted(
+            resolved, updated["ticket_id"], accepted["manifest"])
         return {"ok": True, "pool_id": resolved, "ticket_id": updated["ticket_id"],
                 "state": updated["state"], "repo_id": manifest["repo_id"],
                 "version": accepted["manifest"]["version"],
@@ -1159,7 +1183,79 @@ class PoolService:
                 "transfer_id": accepted.get("transfer_id", ""),
                 "dek_rotated": accepted.get("dek_rotated", False),
                 "report_hash": aud["report_hash"],
-                "audit_id": aud["audit_id"], "notice": notice}
+                "audit_id": aud["audit_id"], "notice": notice,
+                "agent_prompt": agent_prompt}
+
+    def _notify_push_accepted(self, pool_id, ticket_id, accepted_manifest) -> dict:
+        """Ephemeral (gateway-only) payload for the Hermes agent on accept.
+
+        The plugin is passive: it never posts to Discord. This payload is
+        returned in the push_deliver result so the agent that invoked the
+        command receives it and is prompted to notify the user that tasks
+        are complete and to merge after approval. Bytes still move via
+        the transport; the transfer_ticket is the Iroh download link for
+        the new accepted version. In the mixed case the maintainer must
+        re-run /fetch repo to obtain the accepted manifest.
+        """
+        version = accepted_manifest.get("version")
+        transfer_ticket = accepted_manifest.get("transfer_ticket", "")
+        prompt = (
+            f"Tasks for ticket {ticket_id} are complete. New version {version} "
+            f"is available over Iroh (transfer_ticket above). Pending maintainer "
+            f"approval to merge into the canonical checkout. Reply 'approve merge' "
+            f"to proceed; on approval run: git fetch <local bundle path> && "
+            f"git merge --ff-only <branch> (agent executes).")
+        return {
+            "event": "push_accepted",
+            "ephemeral": True,
+            "pool_id": pool_id,
+            "ticket_id": ticket_id,
+            "transfer_ticket": transfer_ticket,
+            "manifest_json": json.dumps(accepted_manifest, sort_keys=True),
+            "version": version,
+            "prompt": prompt,
+        }
+
+    def merge_approved(self, ticket_id, *, approved_by_user_id,
+                       pool_id=None, source=None) -> dict:
+        """Record a maintainer merge decision (gateway-owner only).
+
+        The plugin never merges and never auto-merges: the agent runs the
+        actual local git merge after explicit user approval; this records
+        the approval and emits merge_completed.
+        """
+        ticket = self.show_ticket(ticket_id)
+        resolved = self._resolve_pool(pool_id or ticket["pool_id"], source=source)
+        self._check_not_frozen(resolved)
+        if not approved_by_user_id or not L.is_owner(
+                self._conn, resolved, str(approved_by_user_id)):
+            raise PermissionError(
+                f"not authorized for pool {resolved} — ask the maintainer")
+        row = self._conn.execute(
+            "SELECT owner_gateway_key_id, maintainer_key_id FROM pools WHERE pool_id=?",
+            (resolved,)).fetchone()
+        owner_gateway = (row[0] if row and row[0] else
+                         row[1] if row else None)
+        if owner_gateway != self._caller_key_id:
+            raise PermissionError(
+                "gateway identity changed: caller is not the pool's owner gateway — "
+                "re-register the pool to continue")
+        version = None
+        try:
+            _vrow = self._conn.execute(
+                "SELECT MAX(version) FROM repo_versions WHERE repo_id=? AND state='accepted'",
+                (ticket["repo_id"],)).fetchone()
+            version = _vrow[0] if _vrow else None
+        except Exception:
+            version = None
+        L.record_event(self._conn, resolved, "merge_approved",
+                       {"ticket_id": ticket_id, "version": version,
+                        "approved_by_user_id": str(approved_by_user_id)})
+        L.record_event(self._conn, resolved, "merge_completed",
+                       {"ticket_id": ticket_id, "version": version,
+                        "approved_by_user_id": str(approved_by_user_id)})
+        return {"ok": True, "merged": True, "ticket_id": ticket_id,
+                "version": version}
 
     # -- budget usage reporting (secondary, agent-reported) --------------------
     # Turns/tokens/wall-clock are recorded only when the agent reports them.
@@ -1255,7 +1351,7 @@ class PoolService:
         # submit/audit legitimately run as the (possibly non-maintainer)
         # caller.
         return RepoPropagator(
-            self._conn, self._transport_overrides.get(pool_id, self._transport),
+            self._conn, self._transport,
             pool_id=pool_id,
             maintainer_key_id=maintainer_id, maintainer_signing_key=maintainer_sk,
             members=members)

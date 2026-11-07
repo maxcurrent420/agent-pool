@@ -17,15 +17,15 @@ config_schema:
   relay_url:
     type: str
     default: ""
-    description: "Iroh relay URL (empty = default n0 relay). An explicit non-empty value beats the HERMES_IROH_RELAY env var; empty means unset (env still applies). 'off'/'none'/'disabled' is rejected in every mode (transfers are always relay-only; there is no direct mode). Point both ends at a self-hosted/trusted relay here (global or per-pool) for a stronger anonymity layer"
+    description: "Deprecated and ignored: Iroh-over-Tor is the only byte transport and no relay flags are ever emitted, so a relay URL has no effect. Retained only so legacy config does not error; remove it."
   transport_mode:
     type: str
-    default: "relay"
-    description: "Repo-byte transport privacy. 'relay': transfers are always relay-only on BOTH sender and receiver (relay-only ticket + relay-only endpoint policy, so the peer learns no IP; the relay still sees both peers' IPs + metadata, never plaintext). This is the explicit fallback mode. 'tor' (opt-in): Iroh Tor custom transport via the tor-enabled send_hermes sidecar (option (A), scripts/install-tor.sh) — connection paths onion-routed, neither peer learns the other's IP, no relay in the connection path. Both endpoints must enable Tor; tor-ready probe fails closed (systemctl start agent-pool-tor) and never falls back to relay. There is no direct mode and no way to opt into one; 'direct' or any other value is rejected. Per-pool: pools.<pool_id>.transport_mode/_relay_url overrides this. HERMES_IROH_RELAY=off is a no-op in relay mode and irrelevant in tor mode (no relay flags are emitted)."
+    default: "tor"
+    description: "Repo-byte transport: 'tor' only — Iroh Tor custom transport via the tor-enabled send_hermes sidecar (option (A), scripts/install-tor.sh); connection paths are onion-routed, neither peer learns the other's IP, and there is no relay in the connection path. Both endpoints must enable Tor; the tor_ready() probe is a hard gate at service construction, plugin registration, and pool registration and fails closed (systemctl start agent-pool-tor) — there is no relay fallback and no relay option. Any other value, including legacy 'relay' at the transport layer, is rejected; a legacy top-level transport_mode=relay in plugin config is ignored (treated as tor) with a migration warning in pool_status. Fork the source to change the transport. HERMES_IROH_RELAY is ignored."
   tor_control_port:
     type: int
     default: 9051
-    description: "Tor control port (127.0.0.1 only, CookieAuthentication 0, ops/torrc). Probed by tor_ready() before every tor-mode transfer; failure names 'systemctl start agent-pool-tor' and fails closed."
+    description: "Tor control port (127.0.0.1 only, CookieAuthentication 0, ops/torrc). Probed by tor_ready() at service construction, plugin registration, and before every transfer; failure names 'systemctl start agent-pool-tor' and fails closed."
   tor_socks_port:
     type: int
     default: 9055
@@ -57,12 +57,17 @@ config_schema:
   pools:
     type: dict
     default: {}
-    description: "Per-pool settings keyed by pool_id (transport_mode, relay_url only)"
+    description: "Deprecated and ignored: per-pool transport settings have no effect — Iroh-over-Tor is the only transport for every pool. Legacy transport_mode=relay entries are ignored with a migration warning; remove them."
   allowed_users:
     type: list
     default: []
-    description: "Discord user ids allowed on the hosted pool (whitelist). Env AGENT_POOL_ALLOWED_USERS (comma-separated) wins over this config when both are set; the pool owner (register --discord-user) is always whitelisted. Empty = owner only."
+    description: "Discord user ids allowed on the hosted pool (whitelist). Env AGENT_POOL_ALLOWED_USERS (comma-separated) wins over this config when both are set; the pool owner (from maintainer_discord_user_id config/env) is always whitelisted. Empty = owner only."
+  maintainer_discord_user_id:
+    type: str
+    default: ""
+    description: "Discord user id of the pool maintainer/owner for the gateway's hosted pool. Required to register a pool; used as the owner on /pool register. Env AGENT_POOL_MAINTAINER_DISCORD_USER_ID (or reuse of the gateway allowlist's single owner) wins when set."
   transport:
     type: str
     default: "real"
-    description: "Bundle transport: real (send_hermes/Iroh) or fake (in-memory, tests/CLI)"
+    description: "Bundle transport: real (send_hermes/Iroh over Tor, gated by tor_ready()) or fake (in-memory, tests/CLI only; exempt from the tor gate)"
+

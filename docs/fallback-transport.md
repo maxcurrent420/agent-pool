@@ -1,22 +1,27 @@
-# Fallback transport — when Iroh / send_hermes is not enough
+# Transport — Iroh-over-Tor is the only byte transport (fork-only escape hatch)
 
-The primary transport is Iroh QUIC via `hermes-iroh-interconnect`
-(`send_hermes`): peer-to-peer, no server to run, BLAKE3-verified bearer
+The only byte transport is Iroh QUIC over Tor via
+`hermes-iroh-interconnect` (`send_hermes` rebuilt with the Tor custom
+transport): peer-to-peer, no server to run, BLAKE3-verified bearer
 tickets. Known ceilings (stated without pinned throughput numbers —
-actual speed depends on the relay/Tor path, network conditions, and
+actual speed depends on the Tor path, network conditions, and
 repo size): the sender must stay alive during transfer; repos well
 above the gigabyte range are out of scope for the current design.
 
-`transport_mode=relay` remains the documented fallback mode (relay-only
-on both ends; the peer learns no IP, the relay sees both peers' IPs +
-metadata, never plaintext). `transport_mode=tor` (Iroh + Tor custom
-transport via the sidecar) is the anonymity-upgraded mode; it is opt-in
-and fails closed if Tor is not ready. The mode is explicit config —
-never an automatic downgrade.
+There is no relay fallback and no relay option. `transport_mode=tor`
+is the only valid value; `tor_ready()` is a hard gate at service
+construction, plugin registration, and pool registration and fails
+closed. To use any other transport (including re-adding a relay) you
+must fork and edit the source (`VALID_MODES` / `normalize_mode` in
+`transport.py`, the argv builders, and the tor gate) — there is no
+config flip that downgrades the transport. A legacy top-level
+`transport_mode=relay` in plugin config is ignored (treated as tor)
+with a migration warning in `pool_status`; per-pool transport
+settings are ignored.
 
 Tor ceilings (stated honestly):
 - Throughput: Tor adds latency and hops; expect lower throughput than
-  the relay path. No numeric throughput is claimed in these docs.
+  the Tor path. No numeric throughput is claimed in these docs.
 - Bootstrap latency: building a Tor endpoint (onion service) per
   transfer is slow; the current design spawns per transfer (minimal
   change); a long-lived sidecar is the follow-up if latency is
@@ -24,8 +29,8 @@ Tor ceilings (stated honestly):
 - Experimental-transport status: Iroh's custom transport API and the
   Tor transport crate are experimental ("Expect breaking changes").
   The sidecar build pins exact Iroh + crate versions; the README
-  documents the upgrade procedure. `transport_mode=tor` is opt-in
-  config until proven on this host.
+  documents the upgrade procedure. `transport_mode=tor` is the
+  only transport (mandatory) on this host.
 
 If the Iroh spike had failed (or on a network where QUIC/UDP is
 blocked), the plan's fallbacks were, in order. Migration note: the
@@ -56,7 +61,7 @@ Discord carries paths, and the agent on the gateway does the pull/push.
 - **What:** serve repos over I2P using the documented git-over-I2P
   pattern: a git daemon (or `git http-backend`) bound to an eepsite,
   fetched with `git clone i2p://…` through the I2P proxy.
-- **Why it fits:** no central relay at all, end-to-end encrypted by
+- **Why it fits:** no central server at all, end-to-end encrypted by
   I2P's design, NAT traversal built in; the manifest chain + DEK layer
   is transport-agnostic and would sit on top unchanged.
 - **Costs:** lower throughput than Iroh on a LAN (I2P garlic routing
@@ -69,8 +74,8 @@ Discord carries paths, and the agent on the gateway does the pull/push.
 ## Decision rule
 
 - Iroh works (sender online windows are acceptable, repos in the
-  sub-gigabyte range) → **stay on Iroh** (relay mode is the
-  out-of-the-box fallback; Tor mode upgrades anonymity).
+  sub-gigabyte range) → **stay on Iroh-over-Tor** (the only byte
+  transport; install Tor and the tor sidecar on every gateway).
 - Need store-and-forward / TCP-only / bigger repos → **Radicle seed**.
 - No server, QUIC blocked, I2P already present → **git-over-I2P**.
 

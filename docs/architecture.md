@@ -67,7 +67,7 @@ the env/config whitelist of Discord user ids:
 
 - Env `AGENT_POOL_ALLOWED_USERS` (comma-separated) wins over config
   `allowed_users` (a list); the pool owner from
-  `/pool register --discord-user` is always whitelisted.
+  `maintainer_discord_user_id` config/env is always whitelisted.
 - `ledger.sync_whitelist` syncs the whitelist into `pool_authorized`:
   inserts missing users, never deletes. Removal is `/pool remove`.
 - Key attribution is first-claim binding in `pool_memberships`: a
@@ -115,8 +115,9 @@ verb is blocked with `pool frozen — contact the maintainer`,
 including read verbs. Read-only queries do not survive a freeze.
 
 Caveats, stated honestly: the wrapper guard is best-effort — an
-exception inside the guard falls through to the handler; and verbs
-that cannot resolve a pool skip the freeze check. Freeze/unfreeze
+exception inside the guard falls through to the handler; and verbs run
+before any pool exists (e.g. register) or naming a foreign pool skip
+the freeze check; there is nothing to resolve. Freeze/unfreeze
 commands themselves are owner-only and are never blocked by the freeze
 they control.
 
@@ -147,18 +148,16 @@ exhaustion.
 
 ## Tor-routed Iroh flow
 
-Substrate: Iroh (endpoint, relay, transfer tickets, end-to-end
-encryption) — unchanged. Anonymity layer: Iroh Tor custom transport
-via the sidecar.
+Substrate: Iroh (endpoint, transfer tickets, end-to-end
+encryption) over Tor — Iroh-over-Tor is the only byte transport.
 
-- `transport_mode: relay` (default) — transfers are relay-only on both
-  sender and receiver; the peer learns no IP; the relay sees both
-  peers' IPs + metadata, never plaintext.
-- `transport_mode: tor` (opt-in) — Iroh Tor custom transport over
-  hidden services; neither peer learns the other's IP; no relay in the
-  connection path. Both endpoints must enable Tor; `tor_ready()` fails
-  closed and never silently downgrades to relay.
-- `direct` mode does not exist.
+- `transport_mode: tor` (default, only valid value) — Iroh Tor custom
+  transport over hidden services; neither peer learns the other's IP;
+  no relay in the connection path. Both endpoints must enable Tor;
+  `tor_ready()` is a hard gate at service construction, plugin
+  registration, and pool registration, and fails closed with no
+  fallback.
+- `relay` and `direct` modes do not exist and cannot be constructed.
 
 Fetch (read): the fetch handler dispatches to `fetch_repo_list`,
 `fetch_task_list`, `fetch_repo`, and `fetch_repo_download` on the
@@ -214,10 +213,10 @@ There is no local-pool branch in the download path.
 ## Why Iroh QUIC + `send_hermes` bearer tickets
 
 See the fallback-transport document. Summary: no third-party
-gatekeeper; relay sees ciphertext + routing metadata only; transfers
-are always relay-only on both ends; ticket = bearer capability for
+gatekeeper; the network sees ciphertext + routing metadata only;
+transfers are always Iroh-over-Tor; ticket = bearer capability for
 ciphertext only; per-version DEK rotation on top. Radicle and
-git-over-I2P are documented fallbacks.
+git-over-I2P are documented deployment alternatives.
 
 ## Exact network path of repo bytes
 
@@ -226,14 +225,14 @@ git-over-I2P are documented fallbacks.
    SecretBox) encrypts it — DEKs never reused across versions.
 3. DEK wrapped per current member (sealed box).
 4. Ciphertext → `send_hermes` provider (transport).
-5. Transfers are **always relay-only on both ends** (no direct mode).
+5. Transfers are **always Iroh-over-Tor** (no relay, no direct mode).
 6. Receiver fetch: chain + signature verify on the hosted-pool path,
    or manifest-signature + ACL verify on the download path → Iroh
    fetch → BLAKE3 verify vs manifest `content_hash` → DEK unwrap →
    decrypt → `git clone` into `worktree-v<N>`.
 
 No throughput figure is claimed here: transfer speed depends on the
-relay/Tor path, network conditions, and repo size, and is not pinned
+Tor path, network conditions, and repo size, and is not pinned
 to a number in these docs.
 
 ## What the plugin does vs what Hermes does

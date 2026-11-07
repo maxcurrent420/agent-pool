@@ -306,3 +306,33 @@ def test_catalog_lists_both_tools_and_current_version():
         "catalog version must be 2.7.0")
     caps = data.split("provides_tools:")[1].split("provides_hooks:")[0]
     assert "pool_status" in caps and "pool_report_usage" in caps
+
+
+# --- Corrections gates: phrasing, pool wording, ephemeral push -------------
+
+def test_no_platform_routes_phrasing():
+    for fname in ("README.md", "tickets.py", "docs/architecture.md",
+                  "docs/threat-model.md"):
+        text = (ROOT / fname).read_text()
+        assert "platform routes" not in text, f"{fname} still says platform routes"
+
+
+def test_no_resolve_a_pool_in_docs():
+    for fname in DOC_FILES:
+        text = (ROOT / fname).read_text()
+        assert "resolve a pool" not in text, f"{fname} still says resolve a pool"
+
+
+def test_no_discord_user_flag_in_docs_or_commands():
+    for fname in ("README.md", "docs/architecture.md", "docs/threat-model.md"):
+        assert "--discord-user" not in (ROOT / fname).read_text(), fname
+    init_src = (ROOT / "__init__.py").read_text()
+    assert "--discord-user" not in init_src
+    assert 'opts.get("discord_user"' not in init_src
+
+
+def test_no_plugin_side_discord_post():
+    for fname in PROD_FILES + ("replies.py",):
+        src = (ROOT / fname).read_text()
+        assert "post_message" not in src, f"{fname} posts to Discord"
+        assert "ctx.post" not in src, f"{fname} posts via ctx"

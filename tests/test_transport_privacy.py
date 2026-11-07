@@ -1,14 +1,12 @@
-"""Transport privacy tests: transport_mode (relay/tor).
+"""Transport privacy tests: Iroh-over-Tor is the only byte transport.
 
-Covers the argv evidence for relay mode (relay-only on both ends) and
-tor mode (``--transport tor``, no relay flags at all), proof that direct
-cannot be selected (rejected at construction; the pure builders can never
-emit an addresses ticket or "--relay disabled" under any env/config
-combination), the tor fail-closed probe (``tor_ready`` — no silent relay
-fallback), config plumbing (plugin config + per-pool override +
-tor_control_port/tor_socks_port/tor_binary), pool_status surfacing, the
-mode echo in submit results, and a full submit->accept->fetch round trip
-in relay mode (crypto/ACL path unchanged — FakeTransport carrier).
+Covers argv evidence (always ``--transport tor``, no relay flags ever),
+proof that relay/direct cannot be selected (rejected at construction),
+the tor fail-closed probe (``tor_ready`` — no fallback), config plumbing
+(plugin default tor, legacy relay ignored with migration warning,
+per-pool overrides ignored, tor ports/binary), pool_status surfacing,
+the mode echo in submit results, and a full submit->accept->fetch
+round trip (crypto/ACL path unchanged — FakeTransport carrier).
 """
 import json
 import os
@@ -25,61 +23,25 @@ from ledger import add_member, create_pool, init_ledger
 from propagation import Member, RepoPropagator
 from transport import (
     FakeTransport, RealSendHermesTransport, TorNotReady,
-    TransportConfigError, mode_note, normalize_mode, tor_ready,
+    TransportConfigError, VALID_MODES, mode_note, normalize_mode, tor_ready,
 )
 from identity import ensure_identity
 
 
 # --- argv evidence (pure builders, no subprocess) ---------------------------
 
-def test_relay_mode_uses_relay_ticket(monkeypatch):
-    monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
-    t = RealSendHermesTransport(transport_mode="relay")
-    cmd = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
-    assert cmd[:3] == ["/bin/true", "send", "--no-progress"]
-    assert "--ticket-type" in cmd and cmd[cmd.index("--ticket-type") + 1] == "relay"
-    assert "addresses" not in cmd
-    assert "--relay" not in cmd or cmd[cmd.index("--relay") + 1] != "disabled"
+def test_only_tor_is_a_valid_mode():
+    assert VALID_MODES == ("tor",)
+    assert normalize_mode("") == "tor"
+    assert normalize_mode("tor") == "tor"
+    assert normalize_mode(" TOR ") == "tor"
 
 
-def test_relay_mode_custom_relay_url(monkeypatch):
-    monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
-    t = RealSendHermesTransport(transport_mode="relay",
-                                relay_url="https://relay.example.lan")
-    cmd = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
-    assert cmd[cmd.index("--relay") + 1] == "https://relay.example.lan"
-    assert cmd[cmd.index("--ticket-type") + 1] == "relay"
-
-
-def test_relay_mode_never_direct_even_with_env_off(monkeypatch):
-    monkeypatch.setenv("HERMES_IROH_RELAY", "off")
-    t = RealSendHermesTransport(transport_mode="relay")
-    cmd = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
-    assert cmd[cmd.index("--ticket-type") + 1] == "relay"
-    # Env "off" must not become "--relay disabled" NOR "--relay off".
-    assert "disabled" not in cmd and "addresses" not in cmd and "off" not in cmd
-    fcmd = t._fetch_cmd("/bin/true", "blobticket")
-    assert "disabled" not in fcmd
-
-
-def test_relay_mode_rejects_explicit_relay_off():
-    for off in ("off", "none", "disabled"):
-        with pytest.raises(TransportConfigError):
-            RealSendHermesTransport(transport_mode="relay", relay_url=off)
-    # Rejected in every mode, including tor.
-    with pytest.raises(TransportConfigError):
-        RealSendHermesTransport(transport_mode="tor", relay_url="off")
-
-
-@pytest.mark.parametrize("mode", ["direct", "wireless", "addresses", "none",
-                                  "off", "lan", "holepunch", ""])
-def test_direct_mode_cannot_be_selected(mode):
-    # Direct is not a config value, not a fallback, not an alias: any
-    # mode other than relay/tor — including "direct" itself — is
-    # rejected at construction, and "" means the relay default.
-    if mode == "":
-        assert normalize_mode("") == "relay"
-        return
+@pytest.mark.parametrize("mode", ["relay", "direct", "wireless", "addresses",
+                                  "none", "off", "lan", "holepunch"])
+def test_relay_and_direct_cannot_be_selected(mode):
+    # Relay/direct are not config values or fallbacks: rejected at
+    # construction by normalize_mode and both transports.
     with pytest.raises(TransportConfigError):
         normalize_mode(mode)
     with pytest.raises(TransportConfigError):
@@ -88,32 +50,56 @@ def test_direct_mode_cannot_be_selected(mode):
         FakeTransport(transport_mode=mode)
 
 
-@pytest.mark.parametrize("env", [None, "", "off", "none", "disabled",
-                                 "default", "n0",
+def test_relay_url_kwarg_is_gone():
+    # No relay option remains: passing relay_url is a TypeError.
+    with pytest.raises(TypeError):
+        RealSendHermesTransport(transport_mode="tor", relay_url="https://relay.example.lan")
+    with pytest.raises(TypeError):
+        FakeTransport(transport_mode="tor", relay_url="https://relay.example.lan")
+    assert not hasattr(FakeTransport(), "relay_url")
+    assert not hasattr(RealSendHermesTransport(), "relay_url")
+
+
+def test_tor_mode_send_argv(monkeypatch):
+    monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
+    t = RealSendHermesTransport(transport_mode="tor")
+    cmd = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
+    assert cmd[:3] == ["/bin/true", "send", "--no-progress"]
+    assert cmd[cmd.index("--transport") + 1] == "tor"
+    assert "--relay" not in cmd and "--ticket-type" not in cmd
+    assert "addresses" not in cmd and "disabled" not in cmd
+
+
+def test_tor_mode_fetch_argv(monkeypatch):
+    monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
+    t = RealSendHermesTransport(transport_mode="tor",
+                                tor_socks_port=9055, tor_control_port=9051)
+    cmd = t._fetch_cmd("/bin/true", "blobticket")
+    assert cmd[:3] == ["/bin/true", "receive", "blobticket"]
+    assert cmd[cmd.index("--transport") + 1] == "tor"
+    assert cmd[cmd.index("--tor-socks-port") + 1] == "9055"
+    assert cmd[cmd.index("--tor-control-port") + 1] == "9051"
+    assert "--relay" not in cmd
+    assert "addresses" not in cmd and "disabled" not in cmd
+
+
+@pytest.mark.parametrize("env", [None, "", "off",
                                  "https://relay.example.lan"])
-@pytest.mark.parametrize("relay_url", [None, "", "https://relay.example.lan"])
-def test_argv_never_contains_direct_branches(monkeypatch, env, relay_url):
-    # Sweep every env/config combination: the pure builders can never
-    # emit "--relay disabled" or an addresses ticket.
+def test_tor_mode_never_emits_relay_flags(monkeypatch, env):
+    # Even with HERMES_IROH_RELAY set, tor argv never emits relay flags.
     if env is None:
         monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
     else:
         monkeypatch.setenv("HERMES_IROH_RELAY", env)
-    t = RealSendHermesTransport(transport_mode="relay", relay_url=relay_url)
+    t = RealSendHermesTransport(transport_mode="tor")
     for cmd in (t._send_cmd("/bin/true", Path("/tmp/x.enc")),
                 t._fetch_cmd("/bin/true", "blobticket")):
-        assert "addresses" not in cmd
-        assert "disabled" not in cmd
-        if "--relay" in cmd:
-            assert cmd[cmd.index("--relay") + 1] not in {
-                "disabled", "off", "none", "addresses"}
-    send = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
-    assert send[send.index("--ticket-type") + 1] == "relay"
+        assert cmd[cmd.index("--transport") + 1] == "tor"
+        assert "--relay" not in cmd and "--ticket-type" not in cmd
+        assert "addresses" not in cmd and "disabled" not in cmd
 
 
 def _fake_sidecar(tmp_path, *, tor_capable: bool):
-    """A fake sidecar binary: answers 'send --help' (with --transport
-    only when tor_capable)."""
     script = tmp_path / "fake-send_hermes"
     help_line = "--transport <TRANSPORT>" if tor_capable else "--relay <RELAY>"
     script.write_text(
@@ -129,71 +115,19 @@ def _fake_sidecar(tmp_path, *, tor_capable: bool):
     return str(script)
 
 
-def test_tor_mode_send_argv(monkeypatch):
-    monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
-    t = RealSendHermesTransport(transport_mode="tor")
-    cmd = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
-    assert cmd[:3] == ["/bin/true", "send", "--no-progress"]
-    assert cmd[cmd.index("--transport") + 1] == "tor"
-    # Tor mode: NO relay flags at all — the onion path is the transport.
-    assert "--relay" not in cmd and "--ticket-type" not in cmd
-    assert "addresses" not in cmd and "disabled" not in cmd
-
-
-def test_tor_mode_fetch_argv(monkeypatch):
-    monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
-    t = RealSendHermesTransport(transport_mode="tor",
-                                tor_socks_port=9055, tor_control_port=9051)
-    cmd = t._fetch_cmd("/bin/true", "blobticket")
-    assert cmd[:3] == ["/bin/true", "receive", "blobticket"]
-    assert cmd[cmd.index("--transport") + 1] == "tor"
-    # Tor ports are forwarded so the sidecar matches ops/torrc (the
-    # iroh-tor-transport defaults are 9050 socks / 9051 control).
-    assert cmd[cmd.index("--tor-socks-port") + 1] == "9055"
-    assert cmd[cmd.index("--tor-control-port") + 1] == "9051"
-    assert "--relay" not in cmd
-    assert "addresses" not in cmd and "disabled" not in cmd
-
-
-@pytest.mark.parametrize("env", [None, "", "off",
-                                 "https://relay.example.lan"])
-@pytest.mark.parametrize("relay_url", [None, "",
-                                       "https://relay.example.lan"])
-def test_tor_mode_never_emits_relay_flags(monkeypatch, env, relay_url):
-    # Even with a relay configured, tor argv never silently drops to
-    # relay: no --relay, no --ticket-type, ever.
-    if env is None:
-        monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
-    else:
-        monkeypatch.setenv("HERMES_IROH_RELAY", env)
-    t = RealSendHermesTransport(transport_mode="tor", relay_url=relay_url)
-    for cmd in (t._send_cmd("/bin/true", Path("/tmp/x.enc")),
-                t._fetch_cmd("/bin/true", "blobticket")):
-        assert cmd[cmd.index("--transport") + 1] == "tor"
-        assert "--relay" not in cmd and "--ticket-type" not in cmd
-        assert "addresses" not in cmd and "disabled" not in cmd
-
-
 def test_tor_mode_fails_closed_when_probe_fails(monkeypatch, tmp_path):
-    # tor_ready() failure (daemon/sidecar not up) must fail closed with
-    # the unit name — and the argv must never silently drop the tor flag
-    # and use relay instead.
     import transport as transport_mod
 
     def _boom(**kwargs):
         raise TorNotReady(
             "tor transport unavailable: Tor control port 127.0.0.1:9051 "
             "is not reachable. Start the Tor daemon: systemctl start "
-            "agent-pool-tor. tor mode fails closed — it never falls "
-            "back to relay.")
+            "agent-pool-tor.")
 
     monkeypatch.setattr(transport_mod, "tor_ready", _boom)
-    t = RealSendHermesTransport(transport_mode="tor",
-                                relay_url="https://relay.example.lan")
-    # The pure tor argv still carries the flag (no silent downgrade)...
+    t = RealSendHermesTransport(transport_mode="tor")
     send = t._send_cmd("/bin/true", Path("/tmp/x.enc"))
     assert send[send.index("--transport") + 1] == "tor"
-    # ...but no transfer may spawn while the probe fails.
     with pytest.raises(TorNotReady, match="agent-pool-tor"):
         t.send(Path("/tmp/x.enc"))
     with pytest.raises(TorNotReady, match="agent-pool-tor"):
@@ -212,15 +146,12 @@ def test_tor_ready_binary_without_tor_flag(tmp_path):
 
 
 def test_tor_ready_control_port_down(tmp_path):
-    # Tor-capable binary but no daemon listening: fail closed naming
-    # the unit to start.
     binary = _fake_sidecar(tmp_path, tor_capable=True)
     with pytest.raises(TorNotReady, match="agent-pool-tor"):
         tor_ready(binary=binary, control_port=59999, timeout=0.5)
 
 
 def test_tor_ready_ok(tmp_path):
-    # Tor-capable binary + a fake control port answering 250 OK.
     import socket
     import threading
 
@@ -245,8 +176,6 @@ def test_tor_ready_ok(tmp_path):
 
 
 def test_fake_transport_tor_passthrough(tmp_path):
-    # FakeTransport accepts tor mode so tests can drive the tor code
-    # path in-memory (no daemon/sidecar needed).
     t = FakeTransport(transport_mode="tor")
     src = tmp_path / "payload.bin"
     src.write_bytes(b"tor-bytes")
@@ -260,26 +189,24 @@ def test_mode_note_tor():
     note = mode_note("tor")
     assert "onion-routed" in note and "no relay" in note
     assert "unavailable" not in note
-    relay_note = mode_note("relay")
-    assert "relay-only" in relay_note
+    with pytest.raises(TransportConfigError):
+        mode_note("relay")
 
 
-def test_pool_status_tor_mode_surfaces_probe(tmp_path, monkeypatch):
-    # tor mode in pool_status: tor block present, readiness probed,
-    # failure is fail-closed copy naming the unit (no relay fallback).
+def test_pool_status_tor_mode_surfaces_probe(monkeypatch):
     monkeypatch.setattr("transport.tor_ready",
                         lambda **kw: (_ for _ in ()).throw(
                             TorNotReady("tor transport unavailable: "
                                         "systemctl start agent-pool-tor")))
     plugin = _load_plugin()
     status = json.loads(plugin._pool_status(
-        ctx=_Ctx({"transport_mode": "tor", "transport": "real"})))
+        ctx=_Ctx({"transport": "fake"})))
     assert status["transport_mode"] == "tor"
     assert status["tor"]["control_port"] == 9051
     assert status["tor"]["socks_port"] == 9055
     assert status["tor"]["ready"]["ok"] is False
     assert "agent-pool-tor" in status["tor"]["ready"]["error"]
-    assert "fails closed" in status["transport_warning"] or "fail closed" in status["transport_warning"]
+    assert "fail" in status["transport_warning"]
     assert "onion-routed" in status["transport_privacy"]
 
 
@@ -310,41 +237,51 @@ def _load_plugin():
     return mod
 
 
-def test_config_default_is_relay():
+def test_config_default_is_tor():
     plugin = _load_plugin()
-    ctx = _Ctx({"transport": "real"})
+    ctx = _Ctx({"transport": "fake"})
     mode, relay, per_pool = plugin._transport_config(ctx)
-    assert mode == "relay"
+    assert mode == "tor"
     assert relay == "" and per_pool == {}
     status = json.loads(plugin._pool_status(ctx=ctx))
-    assert status["transport_mode"] == "relay"
-    assert "transport_warning" not in status
+    assert status["transport_mode"] == "tor"
+    assert status["relay_url"] == ""
 
 
-def test_pool_status_warns_env_off_in_relay(monkeypatch):
-    monkeypatch.setenv("HERMES_IROH_RELAY", "off")
+def test_legacy_relay_config_ignored_with_migration_warning():
     plugin = _load_plugin()
-    status = json.loads(plugin._pool_status(ctx=_Ctx({"transport_mode": "relay"})))
-    assert status["transport_mode"] == "relay"
-    assert "HERMES_IROH_RELAY=off" in status["transport_warning"]
+    ctx = _Ctx({"transport": "fake", "transport_mode": "relay",
+                "pools": {"pool-old": {"transport_mode": "relay"}}})
+    mode, relay, per_pool = plugin._transport_config(ctx)
+    assert mode == "tor" and relay == "" and per_pool == {}
+    status = json.loads(plugin._pool_status(ctx=ctx))
+    assert status["transport_mode"] == "tor"
+    assert "migration_warning" in status
+    assert "<global>" in status["migration_warning"]
+    assert "pool-old" in status["migration_warning"]
 
 
-def test_per_pool_override_precedence():
+def test_per_pool_overrides_ignored():
     plugin = _load_plugin()
     ctx = _Ctx({"transport_mode": "relay", "relay_url": "",
-                "pools": {"pool-custom-relay": {
+                "pools": {"pool-custom": {
                                       "transport_mode": "relay",
                                       "relay_url": "https://relay.example.lan"},
                           "pool-same": {"transport_mode": "relay"}}})
     mode, relay, per_pool = plugin._transport_config(ctx)
-    assert mode == "relay"
-    assert per_pool == {"pool-custom-relay": {
-        "transport_mode": "relay",
-        "relay_url": "https://relay.example.lan"}}
-    # pool-same matches top-level -> no override entry needed.
+    assert mode == "tor"
+    assert per_pool == {}
+    assert relay == ""
 
 
-# --- submit echo + round trip in relay mode ---------------------------------
+def test_invalid_plugin_mode_rejected():
+    plugin = _load_plugin()
+    ctx = _Ctx({"transport_mode": "direct"})
+    with pytest.raises(TransportConfigError):
+        plugin._transport_config(ctx)
+
+
+# --- submit echo + round trip ------------------------------------------------
 
 def _world(tmp_path, transport):
     import subprocess
@@ -390,13 +327,13 @@ def _world(tmp_path, transport):
 
 def test_submit_result_carries_mode_and_roundtrip(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_IROH_RELAY", raising=False)
-    w = _world(tmp_path, FakeTransport(transport_mode="relay"))
+    w = _world(tmp_path, FakeTransport(transport_mode="tor"))
     res = w["prop"].submit(
         repo_path=w["src"], repo_id="demo", version=1,
         submitter=w["members"][w["maint"].key_id],
         submitter_signing_key=w["maint"].signing_key)
-    assert res["transport_mode"] == "relay"
-    assert "peer IP not disclosed" in res["transport_note"]
+    assert res["transport_mode"] == "tor"
+    assert "onion-routed" in res["transport_note"]
     assert res["state"] == "accepted"
 
     fetched = w["prop"].fetch(
@@ -408,7 +345,5 @@ def test_submit_result_carries_mode_and_roundtrip(tmp_path, monkeypatch):
 
 
 def test_submit_result_direct_note_rejected(tmp_path):
-    # There is no direct submit path: constructing the carrier with a
-    # direct mode fails before any bytes move.
     with pytest.raises(TransportConfigError):
         FakeTransport(transport_mode="direct")

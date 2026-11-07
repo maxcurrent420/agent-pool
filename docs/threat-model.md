@@ -4,9 +4,9 @@ Stated honestly. Anything not listed here as a guarantee is not one.
 
 ## What the design guarantees
 
-1. **The relay / network cannot read repo content.** Bundles are
+1. **The network cannot read repo content.** Bundles are
    encrypted with a per-version random DEK (NaCl SecretBox) before
-   they leave the sender. The Iroh relay sees only ciphertext and
+   they leave the sender. The network sees only ciphertext and
    routing metadata. BLAKE3 hashes are verified client-side on every
    fetch; a corrupted or substituted bundle fails verification.
 2. **Only versions accepted on the maintainer gateway are fetchable
@@ -52,8 +52,9 @@ Stated honestly. Anything not listed here as a guarantee is not one.
    verbs — read-only queries do not survive a freeze. The
    `pool_status` tool still answers. Caveats: the wrapper guard is
    best-effort (an exception inside the guard falls through to the
-   handler), and verbs that cannot resolve a pool skip the freeze
-   check.
+   handler), and verbs run before any pool exists (e.g. register) or
+   naming a foreign pool skip the freeze check; there is nothing to
+   resolve.
 8. **Maintainer == gateway owner.** The user who runs the gateway owns
    the pool on that gateway. Registration refuses
    `register refused: maintainer must be the gateway owner`; owner
@@ -90,8 +91,8 @@ Stated honestly. Anything not listed here as a guarantee is not one.
 - **Tickets are bearer capabilities for ciphertext only.** Treat a
   leaked ticket as leaking ciphertext, not plaintext. Still: don't
   post tickets in public channels.
-- **Peer IP exposure is mode-conditional.** See "Anonymity / residual
-  risk" below for the full Tor/relay analysis.
+- **Peer IP exposure:** Iroh-over-Tor is the only byte transport.
+  See "Anonymity / residual risk" below.
 - **Maintainer gateway key compromise = pool compromise.** Acceptance
   is a signature over the manifest by the maintainer gateway; whoever
   holds that signing key can accept anything. Protect it like a root
@@ -104,7 +105,8 @@ Stated honestly. Anything not listed here as a guarantee is not one.
   ledger and worktrees on a member's machine are plaintext. Protect
   the machine.
 - **The whitelist is the authorization boundary.** A pool answers only
-  to the Discord ids it recorded: the owner (register --discord-user)
+  to the Discord ids it recorded: the owner (from maintainer_discord_user_id
+  config/env)
   and the env/config whitelist (`AGENT_POOL_ALLOWED_USERS` /
   `allowed_users`; env wins; `sync_whitelist` inserts, never deletes).
   *Absence of a record = refusal, on every verb*, with
@@ -160,18 +162,15 @@ What Tor does NOT hide (stated honestly):
 6. **Discord visibility.** Endpoint/ticket metadata travels in command
    replies, visible to the chat and to Discord (bytes never do — that
    rule is unchanged).
-7. **`relay` fallback mode (operator choice) still routes through an
-   Iroh relay** that sees both endpoints' IPs + metadata (never
-   plaintext). Tor mode removes the relay from the connection path;
-   relay mode is for "I trust my relay" deployments. The mode is
-   explicit config — never an automatic downgrade.
+7. **There is no relay in the connection path.** Iroh-over-Tor is
+   the only byte transport: no relay fallback, no relay option. A
+   fork must edit source to change this (see
+   `docs/fallback-transport.md`).
 
-**Relay residual (mode-conditional):**
-- `transport_mode=tor`: no relay in the connection path; neither peer
-  learns the other's IP.
-- `transport_mode=relay`: the relay sees both peers' IPs, EndpointIds,
-  and connection timing/size metadata — never plaintext (QUIC/TLS +
-  NaCl SecretBox).
+**Transport residual:**
+- `transport_mode=tor` (only mode): no relay in the connection path;
+  neither peer learns the other's IP. The Tor network still sees
+  Tor-client traffic (see items 1-6 above).
 
 **ControlPort cookie auth is local-only:** cookie authentication is
 disabled, but the ControlPort binds `127.0.0.1` only (`ops/torrc`), so
@@ -183,8 +182,8 @@ no remote host can reach it.
   a mis-whitelisted Discord id is the boundary case.
 - The per-version DEK wrap is the byte-authorization boundary (only a
   member with a wrapped key can decrypt fetched bytes).
-- The relay sees both peers' IPs — but only in `relay` mode; Tor mode
-  removes it.
+- There is no relay in the connection path: Iroh-over-Tor is the
+  only byte transport.
 - Tor is not the transport in the sense of hiding identity:
   application-layer identity (which agent) is still known to the pool
   operator.

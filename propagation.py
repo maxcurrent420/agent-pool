@@ -232,13 +232,14 @@ class RepoPropagator:
         return key_id in self._members
 
     def _transport_info(self) -> dict:
-        """Effective transport mode + relay + privacy note for replies."""
-        mode = getattr(self._transport, "transport_mode", "unknown")
-        relay = getattr(self._transport, "relay_url", "")
-        if callable(relay):
-            relay = relay()
+        """Effective transport mode + privacy note for replies.
+
+        Iroh-over-Tor is the only byte transport; ``relay_url`` is
+        retained as "" for shape compatibility (legacy/ignored).
+        """
+        mode = getattr(self._transport, "transport_mode", "tor")
         return {"transport_mode": mode,
-                "relay_url": relay or "",
+                "relay_url": "",
                 "transport_note": mode_note(mode)}
 
     def _last_chain_hash(self, repo_id: str) -> str | None:

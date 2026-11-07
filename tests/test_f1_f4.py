@@ -52,8 +52,8 @@ def test_F2_maintainer_self_wrap_at_register(tmp_path):
               ("agent:maint", maint_sk.verify_key.encode().hex(), "abcd"*8, 0))
     c.commit()
     svc=PoolService(c, caller_key_id="agent:maint", caller_signing_key=maint_sk)
-    # Register requires --discord-user: the whitelist IS the auth (2109).
-    svc.register_pool("pool-1","Team", discord_user_id="maint-123")
+    # Register requires maintainer_discord_user_id from config/env: the whitelist IS the auth (2109).
+    svc.register_pool("pool-1","Team", maintainer_discord_user_id="maint-123")
     rows=list_members(c,"pool-1")
     m=[r for r in rows if r["key_id"]=="agent:maint"][0]
     assert m["box_pubkey_hex"]=="abcd"*8

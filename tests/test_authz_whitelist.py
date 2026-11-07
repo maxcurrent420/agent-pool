@@ -70,7 +70,7 @@ def world(tmp_path):
                       caller_signing_key=maint.signing_key,
                       caller_box_sk=maint.box_sk)
     # The owner registers (whitelist row written at register).
-    svc.register_pool("pool-1", "Team", discord_user_id=OWNER)
+    svc.register_pool("pool-1", "Team", maintainer_discord_user_id=OWNER)
     # Phase 1: tickets always mint open (no auto-approve toggle).
     # ... and whitelists the friend (env/config whitelist, synced here).
     whitelist_member(conn, "pool-1", FRIEND, friend)
@@ -298,7 +298,7 @@ def test_empty_whitelist_refuses(tmp_path):
          maint.box_pk.encode(RawEncoder).hex()))
     svc = PoolService(conn, FakeTransport(), caller_key_id=maint.key_id,
                       caller_signing_key=maint.signing_key, caller_box_sk=maint.box_sk)
-    svc.register_pool("pool-1", "Team", discord_user_id=OWNER)
+    svc.register_pool("pool-1", "Team", maintainer_discord_user_id=OWNER)
     import ledger as L
     # Syncing an empty whitelist authorizes nobody beyond the owner.
     L.sync_whitelist(conn, "pool-1", [])

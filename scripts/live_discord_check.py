@@ -79,7 +79,7 @@ def main():
         "1. ln -s /home/maxcurrent/Documents/AntiGravityProjects/agent-pool ~/.hermes/plugins/agent-pool",
         "2. hermes plugins enable agent-pool",
         "3. Restart the gateway (slash sync adapter.py:1556-1558)",
-        "4. Config: transport=real, transport_mode=relay|tor, budgets (no gateway_channel_id)",
+        "4. Config: transport=real, transport_mode=tor (only value), budgets (no gateway_channel_id)",
         "5. Discord: bot allowlist contains tester; 10 commands in picker",
         "6. /pool register demo-pool --name Demo --discord-user <id>",
         "7. Whitelist the member: AGENT_POOL_ALLOWED_USERS=<discord id> (or config allowed_users), then restart/reload the gateway",

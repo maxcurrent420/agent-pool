@@ -73,7 +73,7 @@ def world(tmp_path):
     member_svc = PoolService(conn, transport, caller_key_id=member.key_id,
                              caller_signing_key=member.signing_key,
                              caller_box_sk=member.box_sk)
-    maint_svc.register_pool(POOL, "Team", discord_user_id=OWNER)
+    maint_svc.register_pool(POOL, "Team", maintainer_discord_user_id=OWNER)
     _whitelist(conn, POOL, MEMBER_USER, member)
     src = _git_src(tmp_path / "src")
     maint_svc.add_repo(POOL, REPO, str(src), display_name="Demo",
@@ -108,8 +108,8 @@ def test_fetch_repo_list_carries_available_tasks_and_addressing(tmp_path):
     assert avail["claimed"] is False
     gw = out["gateway"]
     assert gw["endpoint"] == POOL
-    assert gw["transport_mode"] == "relay"
-    assert "relay_url" in gw and "transport_note" in gw
+    assert gw["transport_mode"] == "tor"
+    assert gw["relay_url"] == "" and "transport_note" in gw and "onion-routed" in gw["transport_note"]
 
 
 def test_fetch_task_list_claimed_status_and_claimant(tmp_path):
@@ -211,7 +211,7 @@ def _finder_with_recorded_signer(w, tmp_path, host_unrelated_pool=False):
                        caller_signing_key=w["member"].signing_key,
                        caller_box_sk=w["member"].box_sk)
     if host_unrelated_pool:
-        find.register_pool("pool-local", "Local", discord_user_id=MEMBER_USER)
+        find.register_pool("pool-local", "Local", maintainer_discord_user_id=MEMBER_USER)
     return find
 
 

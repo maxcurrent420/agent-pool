@@ -272,7 +272,7 @@ def _load_plugin():
 
 class _FakeCtx:
     def __init__(self):
-        self.tools, self.commands, self.config = {}, {}, {"relay_url": "off"}
+        self.tools, self.commands, self.config = {}, {}, {"transport": "fake"}
         self.state = {}
 
     def register_tool(self, name, toolset, schema, handler):
@@ -311,11 +311,13 @@ def test_command_handlers_smoke(tmp_path):
     plugin._service_for = lambda ctx, source=None: svc
     try:
         ctx = _FakeCtx()
+        ctx.config["maintainer_discord_user_id"] = "owner-1"
         plugin.register(ctx)
+        svc._maintainer_discord_user_id = "owner-1"
         # Whitelist model: register requires the owner discord id, and
         # every owner-only verb below is driven by that same id.
         OWNER = {"user_id": "owner-1"}
-        out = json.loads(ctx.commands["pool"]("register pool-1 --name Team --discord-user owner-1"))
+        out = json.loads(ctx.commands["pool"]("register pool-1 --name Team"))
         assert out["ok"] and out["maintainer"] == ident.key_id
         out = json.loads(ctx.commands["pool"]("auto-approve on --pool pool-1", source=OWNER))
         assert out["ok"] is False  # deleted in Phase 1

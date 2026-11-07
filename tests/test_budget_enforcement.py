@@ -92,7 +92,7 @@ def world(tmp_path, *, budget_defaults=None, agent_task_allocations=None):
     member_svc = PoolService(conn, transport, caller_key_id=member.key_id,
                              caller_signing_key=member.signing_key,
                              caller_box_sk=member.box_sk, **kw)
-    maint_svc.register_pool(POOL, "Team", discord_user_id=OWNER)
+    maint_svc.register_pool(POOL, "Team", maintainer_discord_user_id=OWNER)
     _whitelist(conn, POOL, MEMBER_USER, member)
     src = _git_src(tmp_path / "src")
     maint_svc.add_repo(POOL, REPO, str(src), display_name="Demo",
@@ -281,7 +281,7 @@ def test_pool_report_usage_tool_registered(tmp_path):
 
     class FakeCtx:
         def __init__(self):
-            self.tools, self.commands, self.config = {}, {}, {}
+            self.tools, self.commands, self.config = {}, {}, {"transport": "fake"}
 
         def register_tool(self, name, toolset, schema, handler):
             self.tools[name] = handler

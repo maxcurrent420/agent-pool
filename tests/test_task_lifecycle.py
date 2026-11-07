@@ -99,7 +99,7 @@ def test_ledger_release_and_complete_guards():
 def test_second_register_refused_and_foreign_pool_refused(tmp_path):
     c, svc = world()
     with pytest.raises(ValueError, match="one pool per gateway"):
-        svc.register_pool("pool-2", "Second", discord_user_id="owner-2")
+        svc.register_pool("pool-2", "Second", maintainer_discord_user_id="owner-2")
     with pytest.raises(PoolNotLocalError) as exc:
         svc._resolve_pool("pool-foreign")
     assert "pool-foreign is not hosted by this gateway" in str(exc.value)
