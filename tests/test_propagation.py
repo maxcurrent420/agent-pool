@@ -148,7 +148,11 @@ def test_contributor_push_audit_accept_chain(world):
     aud = world["prop"].audit(
         manifest=manifest, maintainer=world["members"][world["maint_id"]])
     assert aud["report"]["verdict"] == "clean"
-    assert "bwrap" in aud["report"]["sandbox"] or "fallback" in aud["report"]["sandbox"]
+    # Both scan layers are in the report: the keyword sandbox scan moved
+    # under "static"; the mandatory real-ClamAV verdict is "clamav".
+    assert "bwrap" in aud["report"]["static"]["sandbox"] or "fallback" in aud["report"]["static"]["sandbox"]
+    assert aud["report"]["clamav"]["engine"] == "clamav"
+    assert aud["report"]["clamav"]["verdict"] == "clean"
     assert aud["report_hash"] == blake3_hash(json.dumps(aud["report"], sort_keys=True).encode())
 
     acc = world["prop"].accept(

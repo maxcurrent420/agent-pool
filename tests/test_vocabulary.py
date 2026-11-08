@@ -226,6 +226,7 @@ def test_docs_state_current_contracts():
         "register refused: maintainer must be the gateway owner",
         "gateway identity changed: caller is not the pool's owner gateway",
         "push deliver refused: only the pool maintainer gateway may accept",
+        "add-repo deliver refused: only the pool maintainer gateway may accept",
         "agent budget exhausted:",
         "budget exhausted:",
         "fetch refused: manifest signature does not verify",
@@ -336,3 +337,26 @@ def test_no_plugin_side_discord_post():
         src = (ROOT / fname).read_text()
         assert "post_message" not in src, f"{fname} posts to Discord"
         assert "ctx.post" not in src, f"{fname} posts via ctx"
+
+
+# --- add-repo link-flow gates ----------------------------------------------
+
+def test_add_repo_link_flow_documented_and_catalog_shaped():
+    """The add-repo link flow modes (--deliver / approve / submissions)
+    are documented in the README; the command catalog keeps the single
+    add-repo entry (the command count does not change)."""
+    readme = (ROOT / "README.md").read_text()
+    for needle in ("/add-repo --deliver", "/add-repo approve",
+                   "/add-repo submissions", "awaiting approval",
+                   "contributor-add.py", "add_repo_build_bundle",
+                   "add_repo_deliver", "add_repo_approve",
+                   "add_repo_submissions", "repo_submission_refused"):
+        assert needle in readme, f"README missing add-repo link flow: {needle!r}"
+    data = (ROOT / "plugin-catalog" / "agent-pool.yaml").read_text()
+    caps = data.split("provides_commands:")[1].split("provides_hooks:")[0]
+    entries = [ln.strip("- ").strip() for ln in caps.splitlines()
+               if ln.strip().startswith("-")]
+    assert entries.count("add-repo") == 1, entries
+    assert len(entries) == 10, entries
+    yaml = (ROOT / "plugin.yaml").read_text()
+    assert "add-repo" in yaml

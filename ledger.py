@@ -387,6 +387,47 @@ def append_manifest(conn, repo_id, signed_manifest, manifest_hash_value) -> None
     conn.commit()
 
 
+def record_submission(conn, repo_id, version, manifest_hash_value,
+                      manifest_json) -> None:
+    """Record a submitted (awaiting approval) repo version.
+
+    Writes ONLY the repo_versions row with state 'submitted' — never a
+    manifest_chain row, so the later owner approval can append the
+    accepted manifest without violating UNIQUE(repo_id, version).
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO repo_versions (repo_id, version, manifest_json, manifest_hash, state)"
+        " VALUES (?,?,?,?,?)",
+        (repo_id, int(version), manifest_json, manifest_hash_value, "submitted"))
+    conn.commit()
+
+
+def list_submissions(conn, repo_id=None) -> list:
+    """Submitted (awaiting approval) repo versions, newest first."""
+    if repo_id:
+        rows = conn.execute(
+            "SELECT * FROM repo_versions WHERE state='submitted' AND repo_id=?"
+            " ORDER BY repo_id, version DESC", (repo_id,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM repo_versions WHERE state='submitted'"
+            " ORDER BY repo_id, version DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_submission(conn, repo_id, version=None):
+    """The latest submitted version for a repo, or a specific version."""
+    if version is not None:
+        row = conn.execute(
+            "SELECT * FROM repo_versions WHERE repo_id=? AND version=?"
+            " AND state='submitted'", (repo_id, int(version))).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM repo_versions WHERE repo_id=? AND state='submitted'"
+            " ORDER BY version DESC LIMIT 1", (repo_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def create_ticket(conn, ticket_id, pool_id, repo_id, title, brief="",
                   budget=None, thread_ref=None, state="open") -> None:
     if state not in TICKET_STATES:
@@ -920,6 +961,14 @@ def consume_push_grant(conn, token) -> dict | None:
     if cur.rowcount != 1:
         return None
     return get_push_grant(conn, token)
+
+
+def list_push_grants_for_ticket(conn, ticket_id) -> list:
+    """All push grants issued for a ticket (approval consumes them)."""
+    rows = conn.execute(
+        "SELECT * FROM push_grants WHERE ticket_id=? ORDER BY issued_at",
+        (str(ticket_id),)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_latest_accepted_manifest(conn, repo_id) -> dict | None:

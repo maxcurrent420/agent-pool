@@ -259,7 +259,9 @@ def test_push_completing_last_allowed_task_succeeds_then_push_refused(tmp_path):
     w["member_svc"].claim(w["t2"], declared_paths=["src/b.py"], source=SRC_MEMBER)
     (w["src"] / "hello.txt").write_text("hello v2\n")
     out = _push(w, w["t1"])
-    assert out["ok"] is True and out["state"] == "completed"
+    assert out["ok"] is True and out["state"] == "submitted"
+    approved = w["maint_svc"].push_approve(w["t1"], source=SRC_OWNER)
+    assert approved["state"] == "completed"
     row = _budget_row(w["conn"], w["member"].key_id)
     assert row["tasks_completed"] == 1 and row["task_allocation"] == 1
     (w["src"] / "hello.txt").write_text("hello v3\n")

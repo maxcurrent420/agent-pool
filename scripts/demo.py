@@ -15,7 +15,9 @@ repo bytes (manifest signature + wrapped-key ACL + BLAKE3) -> agent
 edits at the claim's worktree_path on the claim's branch -> push via
 the path-based contract (grant on the pool gateway -> push_build_bundle
 with the agent's local repo_path on the contributor side -> deliver
-with manifest_json + transfer ticket + grant) -> task completed ->
+with manifest_json + transfer ticket + grant; deliver audits and
+records the version as submitted, awaiting approval -> agent-driven
+approval accepts it and completes the task) ->
 verify chain + audit.
 
 Push/pull are path-based: Discord carries only paths and manifest JSON;
@@ -90,7 +92,7 @@ def main():
 
         # 1. register pool: the maintainer IS this gateway's identity.
         registered = maint_svc.register_pool(
-            "demo-pool", "Demo Team", discord_user_id="demo-owner")
+            "demo-pool", "Demo Team", maintainer_discord_user_id="demo-owner")
         assert registered["maintainer"] == maint.key_id, registered
         assert registered["owner_discord_user_id"] == "demo-owner", registered
         # Whitelist the worker through the env/config whitelist path
@@ -179,14 +181,20 @@ def main():
         print(f"[{time.time()-t0:5.1f}s] push granted + bundle built "
               f"(transfer {transfer_ticket[:12]}...)")
 
-        # 8. deliver on pool gateway (audit gate + accept + complete)
+        # 8. deliver on pool gateway (audit + record submitted, awaiting
+        # approval), then the agent-driven approval accepts + completes
         delivered = maint_svc.push_deliver(
             transfer_ticket, token, pushed_manifest, pool_id="demo-pool",
             source=owner_source)
-        assert delivered.get("merged") or delivered.get("ok"), delivered
-        assert delivered["state"] == "completed", delivered
-        print(f"[{time.time()-t0:5.1f}s] delivered: "
-              f"{'merged' if delivered.get('merged') else 'ok'}; task completed")
+        assert delivered.get("ok"), delivered
+        assert delivered["state"] == "submitted", delivered
+        print(f"[{time.time()-t0:5.1f}s] delivered: submitted, awaiting "
+              f"approval; agent_prompt event="
+              f"{delivered.get('agent_prompt', {}).get('event')}")
+        approved = maint_svc.push_approve(tid, pool_id="demo-pool",
+                                          source=owner_source)
+        assert approved["state"] == "completed", approved
+        print(f"[{time.time()-t0:5.1f}s] approved: task completed")
 
         # 9. verify: audit verdict + chain + completed task gone from the
         # open/available list

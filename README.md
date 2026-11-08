@@ -15,6 +15,29 @@ base ref, budget, and stop condition (see Agent worktree / branch / budget
 below). The agent performs the git operations at that path and branch;
 the plugin does not run git for the agent.
 
+## Why this exists
+
+Your Hermes agent can already work on a GitHub repo, and your friends'
+agents can work on the same one. But many people do not want to **depend
+on** a third party like GitHub. The reasons range from platform risk
+(accounts, repos, or whole platforms disappearing on someone else's
+decision) to who owns the platform — Microsoft owns GitHub, and your code
+sitting there is a dataset someone else may train an AI on.
+
+This plugin removes that dependency. Coordination travels through a
+messaging gateway you control (Discord via Hermes); code travels as
+encrypted bundles over Iroh over Tor. No forge, no cloud, and no peer
+learns the other's IP address. A pool of agents can review, claim, push,
+approve, and merge repos end to end without any repo ever being uploaded
+to a third party.
+
+That does not lock you out of GitHub. You can still message your Hermes
+gateway and say "push this repo to GitHub" whenever you want a public
+mirror. The point is that others can contribute **off** GitHub — to closed
+or partly closed source projects — without a "Microsoft in the Middle"
+between you and your collaborators, and without exposing your network
+location to anyone.
+
 ## Command surface (10 commands + 2 tools)
 
 Registered in `__init__.py` (`_COMMANDS`); `pool_status` and
@@ -25,7 +48,7 @@ Registered in `__init__.py` (`_COMMANDS`); `pool_status` and
 | `pool` | `register\|members\|remove\|freeze\|list [options]` | bare `/pool` → status JSON |
 | `fetch` | `repo list \| task list [--ticket <id>] \| repo <repo_id> \| repo --manifest <json> [options]` | read surface on the pool gateway |
 | `task` | `add\|list\|show [options]` | tickets mint `open` always |
-| `add-repo` | `<repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]` | register + submit as maintainer |
+| `add-repo` | `<repo_id> --path <abs/path> [options] \| --deliver <transfer_ticket> --manifest <json> [--repo <repo_id>] \| approve <repo_id> [--version N] \| submissions [--repo <repo_id>]` | owner fast path, or link flow + approval queue (see Add-repo below) |
 | `task_add` | `--repo <repo_id> --title "..." [--brief "..."] [--pool <pool_id>]` | flat alias of `/task add` |
 | `task_list` | `[--repo <repo_id>] [--pool <pool_id>] [--state open]` | flat alias of `/task list` |
 | `claim` | `[ticket] [--paths <paths>] [--any-project --max-tasks N] [options]` | whole-ticket (`--paths` omitted) or bulk |
@@ -98,6 +121,8 @@ pool on one gateway.
   `gateway identity changed: caller is not the pool's owner gateway — re-register the pool to continue`
 - `push_deliver` requires the owner gateway:
   `push deliver refused: only the pool maintainer gateway may accept`
+- `add_repo_deliver` requires the owner gateway:
+  `add-repo deliver refused: only the pool maintainer gateway may accept`
 - Cross-gateway interaction (fetch/claim/release/complete against a
   remote pool) is unaffected by the gateway-owner check.
 
@@ -184,15 +209,113 @@ paths; the agent on the gateway does the pull/push.
   path, branch, and base ref but no bytes (claim does not deliver
   bytes); the pull chain is the separate fetch-manifest then download
   steps, and push uses the same Iroh transport as fetch.
-- On a clean push accept, `push_deliver` returns an ephemeral
-  (gateway-only) `agent_prompt` payload carrying the accepted
-  manifest's `transfer_ticket` (the Iroh download link), `manifest_json`,
-  version, and a prompt asking the agent to notify the user that tasks
-  are complete and to merge after approval. The plugin never posts to
-  Discord and never merges; merge requires explicit approval recorded
-  by `merge_approved` (gateway-owner only). In the mixed case where
-  the contributor is not the maintainer, the maintainer must re-run
-  `/fetch repo` to obtain the accepted manifest.
+- On a clean push deliver, `push_deliver` downloads the bytes during the
+  audit but does NOT accept or complete anything: it records the version
+  as `submitted` (awaiting owner approval) and returns an ephemeral
+  (gateway-only) `agent_prompt` payload instructing the agent to notify
+  the operator that the change is awaiting approval (quoting the audit
+  verdict — including the ClamAV verdict — and the audit id), ask for
+  the decision, and act on it. On approval the agent invokes the
+  agent-side accept path (`scripts/pool-approve.py --ticket <id>`,
+  service `push_approve`): the version is accepted (DEK rotation + chain
+  append), the grant is consumed, and the ticket completes. On denial
+  the agent runs `scripts/pool-approve.py --ticket <id> --deny` (service
+  `push_deny`) to record the denial; the ticket stays claimed. There is
+  no approval slash command by design — approval is agent-driven and
+  service-level. The full manifest is NOT part of the deliver reply
+  (replies must stay under the 4096-byte gateway limit). The plugin
+  never posts to Discord and never merges; merging into the canonical
+  checkout is the agent's own git work after approval (the approval
+  itself is recorded by `merge_approved`, gateway-owner only).
+- What awaits approval is always discoverable: `pool_status` carries an
+  `awaiting_approval` list (submitted versions from both ingestion
+  paths, each with its audit verdict and, for pushes, the claimed
+  ticket), and `/add-repo submissions` lists the add-repo queue — so
+  the agent can tell the operator what needs a decision without any
+  approval command.
+
+## Add-repo — link flow + owner approval
+
+`/add-repo` has two ways to get repo bytes onto the pool, and both
+move bytes only over Iroh-over-Tor (Discord carries the manifest JSON
+and the transfer ticket, never repo bytes):
+
+- **Owner fast path** — `/add-repo <repo_id> --path <abs/path>` is the
+  maintainer's own single-command workflow: it registers the project
+  and self-accepts the next version (owner-only).
+- **Link flow** — a contributor submits a repo over the link:
+  1. On the contributor's gateway, the agent runs
+     `scripts/contributor-add.py /path/to/checkout --repo <repo_id>`,
+     which calls `PoolService.add_repo_build_bundle` (which reuses
+     `push_build_bundle` — no duplicated pack/encrypt/send logic),
+     packs, hashes, encrypts, and sends the bundle over
+     Iroh-over-Tor and prints the contributor-signed manifest plus a
+     ready-to-paste deliver command.
+  2. The contributor's agent pastes that command to the maintainer
+     bot: `/add-repo --deliver <transfer_ticket> --manifest <json>
+     --repo <repo_id>` (service: `add_repo_deliver`). The maintainer gateway fetches the bytes over
+     Iroh-over-Tor, verifies the contributor signature, pool
+     membership (ACL), and BLAKE3, runs the sandbox audit, and
+     records the version as `submitted` — awaiting owner approval.
+     It is NOT accepted here, and no `manifest_chain` row is written.
+     A flagged audit keeps the submitted row as evidence and records
+     a `repo_submission_refused` event; a later re-submission mints a
+     fresh version. Refusals:
+     `add-repo deliver refused: only the pool maintainer gateway may accept`.
+  3. The owner promotes the version with
+     `/add-repo approve <repo_id> [--version N]` (owner-only; service:
+     `add_repo_approve`): DEK
+     rotation, the maintainer gateway signs the accepted manifest,
+     and the chain append happens (the stale submitted row is
+     dropped first). Denial is recorded with
+     `scripts/pool-approve.py --repo <repo_id> --deny` (service
+     `add_repo_deny`).
+  4. `/add-repo submissions [--repo <repo_id>]` (service:
+     `add_repo_submissions`) lists the submitted
+     (awaiting approval) queue; `pool_status` surfaces the same queue
+     across both ingestion paths as `awaiting_approval`.
+  5. The deliver reply carries an ephemeral `agent_prompt`: the agent
+     notifies the operator (quoted verdict + audit id), asks for the
+     decision, and on approval invokes the accept path above, then
+     merges the accepted version into the canonical checkout itself
+     with git.
+
+## Workflow C — claim from the contributor gateway
+
+The claim originates on the contributor's gateway (Bot #2) and lands on
+the maintainer gateway (Bot #1) — the contributor's agent sends the
+claim text where Bot #1 can see it, exactly like messaging any other
+bot:
+
+1. **Enroll the contributor's gateway key as a real member.** On the
+   contributor's gateway, `/pool members --mykeys` prints the gateway's
+   public key id + box/verify public keys (public material, safe over
+   Discord). The maintainer gateway enrolls them with
+   `/pool members --enroll <key_id> <box_pubkey_hex>
+   <verify_pubkey_hex>` (owner-only). Existing accepted versions are
+   re-wrapped so the new member holds a DEK entry for them. No local
+   data-dir workaround is needed.
+2. **Claim + pull in one flow** — `scripts/contributor-claim.py
+   TICKET_ID` prints the exact text (`/claim TICKET_ID`) for the
+   contributor's agent to send to Bot #1. Bot #1 validates and replies
+   with the accepted repo's Tor download link (`transfer_ticket`) and
+   the accepted manifest directly — no local ledger lookup on the
+   contributor's machine. (If the manifest exceeds the 4096-byte reply
+   guard, the reply carries a preview + `manifest_hash` plus the
+   `/fetch repo <id>` instruction instead.)
+3. The contributor's agent saves Bot #1's reply and runs
+   `scripts/contributor-claim.py TICKET_ID --reply-file REPLY.json
+   --dest DIR`: the script extracts the link + manifest, downloads the
+   bytes over Iroh-over-Tor, unwraps the DEK, verifies BLAKE3, and
+   git-clones the bundle into `DIR`.
+
+`/fetch repo list` and `/fetch task list` stay maintainer-gateway
+verbs; their answers reach Bot #2 through the maintainer's replies
+(the agent relays them).
+
+`--link` stays rejected: `add-repo: --link is not supported; use
+/add-repo --path <checkout>`. On-disk state is `submitted`; user-facing
+copy says "awaiting approval".
 
 ## Freeze scope
 
@@ -279,8 +402,10 @@ ControlPort is cookie-auth-disabled and bound to `127.0.0.1` only
   /add-repo --path <checkout>`. Re-running `/add-repo` mints a new
   version; members whitelisted after a version have no wrapped key for
   it and wait for the next version.
-- No pending state, no proposal packets, no approval queue. The old
-  chat-binding surface is gone; any old table left on disk is unread.
+- No pending ticket state and no proposal packets. Repo submissions
+  awaiting owner approval are `submitted` repo_versions rows listed by
+  `/add-repo submissions` (not a ticket state). The old chat-binding
+  surface is gone; any old table left on disk is unread.
 
 ## Configuration (`plugin.yaml`)
 
@@ -311,16 +436,68 @@ Env vars: `HERMES_IROH_STATE_DIR`,
 
 ## Install
 
-1. `pip` deps: `pynacl>=1.5,<2`, `blake3>=0.4,<2`.
-2. `send_hermes` binary on PATH (hermes-iroh-interconnect sendme fork).
-3. Tor (mandatory — Iroh-over-Tor is the only byte transport):
+Dependency split (do not mix the two layers):
+
+- **Python deps** (`pynacl>=1.5,<2`, `blake3>=0.4,<2`, declared in
+  `pyproject.toml` with upper bounds) are installed by **Hermes** into the
+  interpreter the gateway actually runs:
+  `hermes plugins validate <plugin-path> --install-deps` or
+  `hermes pm install`. The plugin never installs Python packages itself.
+  If the gateway interpreter cannot import `nacl`/`blake3`, commands fail
+  closed naming exactly these Hermes commands.
+- **System services** (ClamAV + `clamav-daemon`, the Tor daemon, and the
+  tor-enabled `send_hermes` sidecar) are provisioned by the documented
+  first-run bootstrap: `bash scripts/install-deps.sh` (system services
+  only; `--check` reports per-component status without changing anything,
+  `--system-only` skips the gateway-interpreter verify and is what the
+  plugin's one-shot self-provisioning hook invokes). Where privilege
+  escalation is needed, escalate with your usual admin mechanism. The
+  script verifies the gateway interpreter via `/proc/<gateway-pid>/exe`
+  and never guesses a shell interpreter.
+
+Then:
+
+1. `send_hermes` binary on PATH (hermes-iroh-interconnect sendme fork).
+2. Tor (mandatory — Iroh-over-Tor is the only byte transport):
    `apt install tor` + `scripts/install-tor.sh` (writes `ops/torrc`,
    builds the tor-enabled sidecar, enables the tor service). Both
    endpoints in a pool must enable Tor; the plugin fails closed at
    service construction (lazy, first use) and pool registration
    until then — plugin registration itself is pure wiring and loads
    even with Tor down. No relay fallback exists.
-4. Symlink the plugin into `~/.hermes/plugins/agent-pool`.
+3. Symlink the plugin into `~/.hermes/plugins/agent-pool`.
+
+### Per-profile setup (one gateway per profile)
+
+Plugin discovery is per profile (`HERMES_HOME`): a plugin under
+`~/.hermes/plugins/` is visible to the default profile only. A named
+profile needs its own copy (or a symlink) and an explicit enable, and
+its own ledger/identity under its profile plugin-data dir. Each bot
+syncs its slash-command tree from its own profile's enabled plugins,
+so setup is per profile:
+
+- **New profile:** install the plugin, then create the profile from
+  the default so it inherits the install:
+  `hermes profile create <name> --clone --clone-from default`
+  (copies config + plugin install; re-apply that profile's bot token
+  in its `.env` afterwards). Or symlink an existing install in place
+  (below) — symlinking also avoids duplicate plugin-source snapshots.
+- **Existing blank profile (no `config.yaml`, no plugins): enable in
+  place without recreating the profile** (recreating would strip the
+  profile's `.env`, e.g. its bot token):
+  1. Symlink the installed plugin into the profile:
+     `ln -s ~/.hermes/plugins/agent-pool ~/.hermes/profiles/<name>/plugins/agent-pool`
+  2. Enable it: `hermes -p <name> plugins enable agent-pool`
+     (the CLI creates a minimal `config.yaml` if missing).
+  3. Verify: `hermes -p <name> plugins list` shows `agent-pool`
+     enabled. (A copied tree instead of a symlink can trip a
+     duplicate plugin-source name at enable time; the symlink is the
+     reliable in-place route.)
+- **Restart rule:** slash-command trees re-sync only after a gateway
+  restart. After enabling a plugin in a profile, restart that
+  profile's gateway (`hermes -p <name> gateway restart`, or the shared
+  `hermes gateway restart` when profiles share one multiplexer
+  process) before expecting the plugin's commands on that bot.
 
 ## Tests / Demo
 
@@ -331,6 +508,18 @@ Env vars: `HERMES_IROH_STATE_DIR`,
 - `scripts/contributor-push.py` — contributor push step (8b) off Discord:
   `python3 scripts/contributor-push.py /path/to/checkout --repo <repo_id> [--pool <pool_id>] [--json]`
   prints `manifest_json` + `transfer_ticket` + the `/push repo --deliver` command to paste on the pool gateway.
+- `scripts/contributor-add.py` — contributor add-repo step off Discord:
+  `python3 scripts/contributor-add.py /path/to/checkout --repo <repo_id> [--pool <pool_id>] [--version N] [--json]`
+  prints `manifest_json` + `transfer_ticket` + the `/add-repo --deliver` command to paste on the maintainer gateway.
+- `scripts/contributor-claim.py` — Workflow C claim+pull off Discord:
+  `python3 scripts/contributor-claim.py TICKET_ID [--as KEY_ID]` prints
+  the `/claim` text for Bot #1; with `--reply-file REPLY.json --dest DIR`
+  it downloads the accepted bundle from Bot #1's reply over Tor.
+- `scripts/pool-approve.py` — agent-side approval path (no slash
+  command): `python3 scripts/pool-approve.py --ticket TICKET_ID | --repo REPO_ID [--deny]`
+  accepts (and completes, for pushes) or records the denial of a
+  submitted version. Invoked by the gateway agent after the operator
+  decides.
 - `scripts/live-discord-check.md` — operator runbook for a live Discord
   guild.
 

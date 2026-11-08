@@ -101,7 +101,8 @@ class PoolService:
                  caller_box_sk=None, budget_defaults=None, pool_resolver=None,
                  gateway=None, transport_overrides=None,
                  agent_task_allocations=None, worktree_root=None,
-                 maintainer_discord_user_id=None):
+                 maintainer_discord_user_id=None, clamd_socket="",
+                 auto_provision=True):
         # Backwards-compat: old call sites passed (conn, gateway, transport).
         # Duck-type: anything with post_notice is a legacy gateway (ignored).
         if args:
@@ -147,6 +148,10 @@ class PoolService:
             worktree_root
             or _env_get("AGENT_POOL_WORKTREE_ROOT", "").strip()
             or "/tmp/agent-pool-worktrees").rstrip("/")
+        # ClamAV ingestion-scan config (plugin.yaml config_schema keys,
+        # threaded by the plugin host; defaults match plugin.yaml).
+        self._clamd_socket = clamd_socket or "/run/clamav/clamd.ctl"
+        self._auto_provision = bool(auto_provision)
 
     def _allocation_for(self, key_id) -> int:
         """Resolved task allocation for one agent on this pool."""
@@ -998,6 +1003,37 @@ class PoolService:
         claim["budget"] = json.loads(claim.get("budget_json") or "{}")
         claim["stop_condition"] = {"condition": "budget_exhausted",
                                    "enforce": True}
+        # Workflow C: the claim reply carries the accepted repo's Tor
+        # download link + manifest directly, so the contributor needs no
+        # local lookup — everything needed arrives from the pool gateway.
+        # The 4096-byte reply guard is respected: when the full manifest
+        # would overflow it, carry a preview + hash + the /fetch repo
+        # instruction instead (same guard ``replies.py`` enforces).
+        accepted = L.get_latest_accepted_manifest(self._conn, ticket["repo_id"])
+        if accepted is not None:
+            from propagation import manifest_hash as _manifest_hash
+            claim["repo_id"] = ticket["repo_id"]
+            claim["manifest_hash"] = _manifest_hash(accepted)
+            claim["transfer_ticket"] = accepted.get("transfer_ticket", "")
+            candidate = dict(claim)
+            candidate["manifest"] = accepted
+            full = json.dumps({"ok": True, "claim": candidate},
+                              indent=2, sort_keys=True, ensure_ascii=False)
+            if len(full.encode("utf-8")) <= 3400:
+                claim["manifest"] = accepted
+            else:
+                claim["manifest_preview"] = {
+                    "repo_id": accepted.get("repo_id"),
+                    "version": accepted.get("version"),
+                    "content_hash": accepted.get("content_hash"),
+                    "transfer_ticket": accepted.get("transfer_ticket", ""),
+                }
+                claim["manifest_truncated"] = True
+                claim["fetch_instruction"] = (
+                    f"the full accepted manifest exceeds the reply size "
+                    f"limit; run /fetch repo {ticket['repo_id']} on the "
+                    f"pool gateway to obtain it (manifest_hash above "
+                    f"pins the exact version)")
         return claim
 
     def claim_any(self, pool_id=None, repo_id=None, max_tasks=1, key_id=None,
@@ -1162,21 +1198,324 @@ class PoolService:
         result["manifest_json"] = json.dumps(result["manifest"], sort_keys=True)
         return result
 
+    def add_repo_build_bundle(self, repo_path, repo_id, *, version=None,
+                              pool_id=None, source=None) -> dict:
+        """Build a contributor add-repo bundle on the contributor's own
+        gateway: pack -> hash -> DEK wrap -> encrypt -> Iroh-over-Tor send
+        -> contributor-signed submitted manifest, with no ledger write.
+
+        This is the add-repo counterpart of :meth:`push_build_bundle` and
+        reuses it verbatim (no duplicated pack/encrypt/send logic). The
+        returned ``deliver_command`` is what the contributor's agent pastes
+        to the maintainer bot as ``/add-repo --deliver ...``; bytes move
+        only over Iroh-over-Tor, never over Discord.
+        """
+        result = self.push_build_bundle(repo_path, repo_id, version=version,
+                                        pool_id=pool_id, source=source)
+        manifest = result["manifest"]
+        result["deliver_command"] = (
+            f"/add-repo --deliver {manifest['transfer_ticket']} "
+            f"--manifest {result['manifest_json']} --repo {repo_id}")
+        return result
+
+    def add_repo_deliver(self, transfer_ticket, manifest, *, pool_id=None,
+                         source=None, repo_id=None) -> dict:
+        """Deliver a contributor add-repo bundle to the maintainer gateway.
+
+        Fetches the bytes over Iroh-over-Tor, verifies the contributor
+        signature, membership (ACL) and BLAKE3 (inside the audit), runs the
+        sandbox audit, and records a ``submitted`` repo_versions row for
+        later owner approval. A flagged audit keeps the submitted row as
+        evidence and records ``repo_submission_refused``; the version is
+        never accepted here and no manifest_chain row is written.
+        """
+        resolved = self._resolve_pool(pool_id, source=source)
+        self._check_not_frozen(resolved)
+        self._require_authorized(resolved, source)
+        # Maintainer-gateway gate (mirrors push_deliver): only the pool's
+        # owner gateway may receive and audit a submission.
+        _pool_row = self._conn.execute(
+            "SELECT owner_gateway_key_id, maintainer_key_id FROM pools WHERE pool_id=?",
+            (resolved,)).fetchone()
+        _owner_gateway = (_pool_row[0] if _pool_row and _pool_row[0] else
+                          _pool_row[1] if _pool_row else None)
+        if _owner_gateway != self._caller_key_id:
+            raise PermissionError(
+                "add-repo deliver refused: only the pool maintainer gateway may accept")
+        if not manifest:
+            raise ValueError(
+                "add-repo deliver needs the contributor-signed manifest (--manifest <json>)")
+        if manifest.get("transfer_ticket") != transfer_ticket:
+            raise PermissionError(
+                "add-repo deliver refused: manifest transfer_ticket does not match the delivered ticket")
+        if repo_id and manifest.get("repo_id") != repo_id:
+            raise PermissionError(
+                "add-repo deliver refused: manifest repo does not match --repo")
+        prop = self._propagator(resolved)
+        submitter = prop._members.get(manifest.get("submitter_key_id", ""))
+        if submitter is None:
+            raise PermissionError(
+                "add-repo deliver refused: submitter is not a pool member")
+        from propagation import _verify_key
+        if not C.verify_manifest(_verify_key(submitter), manifest):
+            raise RuntimeError("add-repo manifest signature does not verify")
+        maintainer = prop._members.get(prop._maintainer_key_id)
+        if maintainer is None:
+            raise RuntimeError(
+                f"maintainer {prop._maintainer_key_id!r} is not a pool member")
+        aud = prop.audit(manifest=manifest, maintainer=maintainer)
+        report = aud["report"]
+        # Register the project row so the submitted version has a home even
+        # when the repo was never added via the --path fast path.
+        L.upsert_repo(self._conn, manifest["repo_id"], resolved,
+                      name=manifest["repo_id"],
+                      submitter_key_id=manifest.get("submitter_key_id") or None)
+        from propagation import manifest_hash as _manifest_hash
+        m_hash = _manifest_hash(manifest)
+        L.record_submission(self._conn, manifest["repo_id"],
+                            int(manifest["version"]), m_hash,
+                            json.dumps(manifest, sort_keys=True))
+        if report.get("verdict") != "clean":
+            hits = report.get("hits", [])
+            L.record_event(self._conn, resolved, "repo_submission_refused",
+                           {"repo_id": manifest["repo_id"],
+                            "version": manifest.get("version"),
+                            "report_hash": aud["report_hash"], "hits": hits})
+            notice = (f"add-repo submission for {manifest['repo_id']} "
+                      f"v{manifest['version']} recorded as submitted: audit "
+                      f"flagged {len(hits)} hit(s); awaiting approval")
+            return {"ok": False, "repo_id": manifest["repo_id"],
+                    "version": manifest["version"], "state": "submitted",
+                    "manifest_hash": m_hash, "verdict": report.get("verdict"),
+                    "report_hash": aud["report_hash"], "hits": hits,
+                    "notice": notice}
+        notice = (f"add-repo submission {manifest['repo_id']} "
+                  f"v{manifest['version']} recorded as submitted "
+                  f"({m_hash[:12]}); awaiting approval")
+        self._queue_notice(resolved, notice, kind="repo_submitted")
+        agent_prompt = self._notify_repo_submitted(
+            resolved, manifest, aud)
+        return {"ok": True, "repo_id": manifest["repo_id"],
+                "version": manifest["version"], "state": "submitted",
+                "manifest_hash": m_hash, "verdict": report.get("verdict"),
+                "clamav": (report.get("clamav") or {}).get("verdict"),
+                "report_hash": aud["report_hash"], "audit_id": aud["audit_id"],
+                "notice": notice, "agent_prompt": agent_prompt}
+
+    def _notify_repo_submitted(self, pool_id, manifest, aud) -> dict:
+        """Ephemeral (gateway-only) payload for the Hermes agent when an
+        add-repo submission lands as submitted.
+
+        Same shape as the push prompt: notify the operator that the
+        project is awaiting approval, quoting verdict + audit id; on
+        approval invoke the agent-side accept path
+        (``/add-repo approve <repo_id>`` or
+        ``scripts/pool-approve.py --repo <id>`` → :meth:`add_repo_approve`);
+        on denial record it (``scripts/pool-approve.py --repo <id> --deny``
+        → :meth:`add_repo_deny`).
+        """
+        report = aud.get("report") or {}
+        clamav = report.get("clamav") or {}
+        prompt = (
+            f"An add-repo submission for {manifest.get('repo_id')} "
+            f"v{manifest.get('version')} was audited clean "
+            f"(verdict {report.get('verdict')}, ClamAV "
+            f"{clamav.get('verdict', 'unknown')} via "
+            f"{clamav.get('via', 'unknown')}, audit {aud.get('audit_id')}) "
+            f"and is awaiting approval. Notify the operator now, quoting "
+            f"the verdict and audit id, and ask whether to approve. On "
+            f"approval, invoke the agent-side accept path: "
+            f"/add-repo approve {manifest.get('repo_id')} (accepts the "
+            f"version); then merge into the canonical checkout yourself "
+            f"with git. On denial, run scripts/pool-approve.py --repo "
+            f"{manifest.get('repo_id')} --deny to record the denial.")
+        return {
+            "event": "repo_submitted",
+            "ephemeral": True,
+            "pool_id": pool_id,
+            "repo_id": manifest.get("repo_id"),
+            "version": manifest.get("version"),
+            "audit_id": aud.get("audit_id"),
+            "verdict": report.get("verdict"),
+            "clamav_verdict": clamav.get("verdict"),
+            "prompt": prompt,
+        }
+
+    def add_repo_approve(self, repo_id, *, version=None, pool_id=None,
+                         source=None) -> dict:
+        """Owner-only promotion of a submitted repo version to accepted.
+
+        Reuses the propagator accept step: DEK rotation, a maintainer-signed
+        accepted manifest and the chain append. The stale submitted row is
+        dropped by the accept step before the accepted row is appended.
+        """
+        resolved = self._resolve_pool(pool_id, source=source)
+        self._check_not_frozen(resolved)
+        self._require_owner(resolved, source)
+        self._assert_local_owned(resolved, source=source)
+        sub = L.get_submission(self._conn, repo_id, version=version)
+        if sub is None:
+            raise ValueError(
+                f"add-repo approve refused: no submitted version for {repo_id!r}"
+                + (f" v{version}" if version else ""))
+        manifest = json.loads(sub["manifest_json"])
+        prop = self._propagator(resolved)
+        maintainer = prop._members.get(prop._maintainer_key_id)
+        if maintainer is None:
+            raise RuntimeError(
+                f"maintainer {prop._maintainer_key_id!r} is not a pool member")
+        audit_row = self._conn.execute(
+            "SELECT report_hash FROM audits WHERE repo_id=? AND version=?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (repo_id, manifest["version"])).fetchone()
+        if audit_row is None:
+            raise RuntimeError(
+                "add-repo approve refused: no audit on file for this version")
+        accepted = prop.accept(
+            manifest=manifest, report_hash=audit_row[0],
+            maintainer=maintainer,
+            maintainer_signing_key=self._caller_sk)
+        notice = (f"add-repo {repo_id} v{manifest['version']} approved and "
+                  f"accepted ({accepted['manifest_hash'][:12]})")
+        self._queue_notice(resolved, notice, kind="repo_approved")
+        return {"ok": True, "repo_id": repo_id, "pool_id": resolved,
+                "version": manifest["version"], "state": "accepted",
+                "manifest_hash": accepted["manifest_hash"],
+                "transfer_id": accepted.get("transfer_id", ""),
+                "dek_rotated": accepted.get("dek_rotated", False),
+                "report_hash": audit_row[0], "notice": notice}
+
+    def add_repo_submissions(self, *, repo_id=None, pool_id=None,
+                             source=None) -> dict:
+        """List submitted (awaiting approval) repo versions, newest first."""
+        resolved = self._resolve_pool(pool_id, source=source)
+        self._require_pool_authorized(resolved, source)
+        rows = L.list_submissions(self._conn, repo_id=repo_id)
+        return {"ok": True, "pool_id": resolved, "submissions": [
+            {"repo_id": r["repo_id"], "version": r["version"],
+             "state": r["state"], "manifest_hash": r["manifest_hash"]}
+            for r in rows]}
+
+    def awaiting_approval(self, *, pool_id=None, source=None) -> dict:
+        """Discovery surface: every submitted version awaiting owner
+        approval on the hosted pool (both ingestion paths), each with
+        its audit verdict and, for pushes, the claimed ticket waiting on
+        the decision. The gateway agent reads this (via ``pool_status``)
+        to tell the operator what needs a decision; acceptance/denial
+        follow through the agent-side paths (:meth:`push_approve` /
+        :meth:`add_repo_approve` / the deny counterparts). Read-only and
+        authorized (maintainer gateway or whitelisted user)."""
+        resolved = self._resolve_pool(pool_id, source=source)
+        self._require_pool_authorized(resolved, source)
+        items = []
+        for row in L.list_submissions(self._conn):
+            manifest = json.loads(row["manifest_json"])
+            audit = L.get_audit(self._conn, row["repo_id"], row["version"])
+            ticket_id = None
+            for t in self.list_tickets(pool_id=resolved, source=source):
+                if (t["repo_id"] == row["repo_id"]
+                        and t["state"] == "claimed"):
+                    ticket_id = t["ticket_id"]
+                    break
+            items.append({
+                "repo_id": row["repo_id"], "version": row["version"],
+                "state": row["state"],
+                "manifest_hash": row["manifest_hash"],
+                "submitter_key_id": manifest.get("submitter_key_id"),
+                "ticket_id": ticket_id,
+                "audit_id": audit["audit_id"] if audit else None,
+                "verdict": audit["verdict"] if audit else None,
+            })
+        return {"ok": True, "pool_id": resolved, "awaiting_approval": items}
+
+    # -- remote member enrollment (Workflow C) ------------------------------
+
+    def my_keys(self) -> dict:
+        """This gateway's public key material: key id + box/verify public
+        keys. Public keys are safe to carry over Discord; the gateway
+        agent sends them to the pool maintainer, who enrolls them with
+        :meth:`enroll_member`."""
+        verify_hex = ""
+        box_hex = ""
+        try:
+            if self._caller_sk is not None:
+                verify_hex = self._caller_sk.verify_key.encode().hex()
+            if self._caller_box_sk is not None:
+                box_hex = self._caller_box_sk.public_key.encode().hex()
+        except Exception:
+            pass
+        return {"ok": True, "key_id": self._caller_key_id,
+                "verify_key_hex": verify_hex, "box_pubkey_hex": box_hex}
+
+    def enroll_member(self, pool_id, key_id, box_pubkey_hex,
+                      verify_pubkey_hex, *, source=None) -> dict:
+        """Enroll a REMOTE gateway key as a real pool member (owner-only).
+
+        Public key material only (safe over Discord). After enrollment,
+        the latest accepted version of every repo is re-wrapped so the
+        new member holds a DEK entry for existing accepted versions —
+        the same rotation machinery as acceptance, keeping each
+        manifest's ``prev_manifest_hash`` and audit reference.
+        """
+        resolved = self._resolve_pool(pool_id, source=source)
+        self._check_not_frozen(resolved)
+        self._require_owner(resolved, source)
+        self._assert_local_owned(resolved, source=source)
+        if not key_id:
+            raise ValueError("enroll needs a key_id")
+        for label, value in (("box_pubkey_hex", box_pubkey_hex),
+                             ("verify_pubkey_hex", verify_pubkey_hex)):
+            try:
+                raw = bytes.fromhex(value or "")
+            except ValueError:
+                raise ValueError(f"enroll refused: {label} is not hex")
+            if len(raw) != 32:
+                raise ValueError(
+                    f"enroll refused: {label} must be 32 bytes "
+                    f"({len(raw)} given)")
+        L.add_member(self._conn, resolved, key_id, role="member",
+                     box_pubkey_hex=box_pubkey_hex,
+                     verify_pubkey_hex=verify_pubkey_hex)
+        rewrapped = []
+        prop = self._propagator(resolved)
+        maintainer = prop._members.get(prop._maintainer_key_id)
+        if maintainer is None:
+            raise RuntimeError(
+                f"maintainer {prop._maintainer_key_id!r} is not a pool member")
+        repos = [r[0] for r in self._conn.execute(
+            "SELECT DISTINCT repo_id FROM repo_versions WHERE state='accepted'")]
+        for repo_id in repos:
+            manifest = L.get_latest_accepted_manifest(self._conn, repo_id)
+            if manifest is None:
+                continue
+            prop.rewrap_accepted(
+                manifest=manifest, maintainer=maintainer,
+                maintainer_signing_key=self._caller_sk)
+            rewrapped.append(repo_id)
+        notice = (f"member {key_id} enrolled on {resolved} "
+                  f"(rewrapped {len(rewrapped)} accepted version(s))")
+        self._queue_notice(resolved, notice, kind="member_enrolled")
+        return {"ok": True, "pool_id": resolved, "key_id": key_id,
+                "rewrapped_repos": rewrapped, "notice": notice}
+
     def push_deliver(self, transfer_ticket, token, manifest, *,
                      pool_id=None, source=None) -> dict:
         """Deliver a pushed bundle to the pool gateway (the ``/push repo
         --deliver <ticket> --token <grant>`` verb).
 
-        The grant is verified one-time (consumed on success); the ticket
-        must still be claimed by the grant's key (released/completed ⇒
-        refused). The contributor signature, membership and claimant are
-        checked, the bytes are fetched over the configured transport,
-        decrypted with the maintainer's wrapped DEK, BLAKE3-verified and
-        sandbox-audited. Clean ⇒ :meth:`accept` appends the
-        maintainer-signed accepted version and the task completes;
-        flagged ⇒ the push is refused, the task stays claimed, and a
-        ``push_flagged`` event records the scan hits. This synchronous
-        audit is the only gate — there is no queue.
+        The grant is verified (consumed only at approval, never here);
+        the ticket must still be claimed by the grant's key
+        (released/completed ⇒ refused). The contributor signature,
+        membership and claimant are checked, the bytes are fetched over
+        the configured transport, decrypted with the maintainer's
+        wrapped DEK, BLAKE3-verified and audited (ClamAV + keyword).
+        A clean audit records the version as ``submitted`` — awaiting
+        owner approval — and the ticket stays claimed; acceptance and
+        completion happen only through the agent-driven approval path
+        (:meth:`push_approve`), never automatically. A flagged audit
+        refuses the push, the task stays claimed, and a ``push_flagged``
+        event records the scan hits. The grant is NOT consumed by a
+        deliver, so fixing the diff can redeliver.
         """
         resolved = self._resolve_pool(pool_id, source=source)
         self._check_not_frozen(resolved)
@@ -1253,59 +1592,230 @@ class PoolService:
                     "state": ticket["state"], "verdict": report.get("verdict"),
                     "report_hash": aud["report_hash"], "hits": hits,
                     "notice": notice}
-        accepted = prop.accept(
-            manifest=manifest, report_hash=aud["report_hash"],
-            maintainer=maintainer,
-            maintainer_signing_key=self._caller_sk)
-        consumed = L.consume_push_grant(self._conn, token)
-        if consumed is None:
-            raise PermissionError(
-                "push deliver refused: grant was consumed concurrently (replay)")
-        updated = L.complete_ticket(self._conn, ticket["ticket_id"], grant["key_id"])
-        notice = (f"{STATE_MARKER.format(state='completed')} ticket "
-                  f"{updated['ticket_id']} completed by push of "
-                  f"{manifest['repo_id']} v{accepted['manifest']['version']} "
-                  f"({accepted['manifest_hash'][:12]})")
-        self._queue_notice(resolved, notice, kind="ticket_completed")
-        agent_prompt = self._notify_push_accepted(
-            resolved, updated["ticket_id"], accepted["manifest"])
-        return {"ok": True, "pool_id": resolved, "ticket_id": updated["ticket_id"],
-                "state": updated["state"], "repo_id": manifest["repo_id"],
-                "version": accepted["manifest"]["version"],
-                "manifest_hash": accepted["manifest_hash"],
-                "manifest": accepted["manifest"],
-                "transfer_id": accepted.get("transfer_id", ""),
-                "dek_rotated": accepted.get("dek_rotated", False),
+        from propagation import manifest_hash as _manifest_hash
+        m_hash = _manifest_hash(manifest)
+        L.record_submission(self._conn, manifest["repo_id"],
+                            int(manifest["version"]), m_hash,
+                            json.dumps(manifest, sort_keys=True))
+        notice = (f"push for ticket {ticket['ticket_id']} recorded as "
+                  f"submitted ({manifest['repo_id']} "
+                  f"v{manifest['version']}, {m_hash[:12]}); awaiting "
+                  f"approval — acceptance and completion follow the "
+                  f"agent-driven approval path, never automatically")
+        self._queue_notice(resolved, notice, kind="push_submitted")
+        agent_prompt = self._notify_push_submitted(
+            resolved, ticket["ticket_id"], manifest, aud)
+        return {"ok": True, "pool_id": resolved,
+                "ticket_id": ticket["ticket_id"],
+                "state": "submitted", "awaiting_approval": True,
+                "repo_id": manifest["repo_id"],
+                "version": manifest["version"],
+                "manifest_hash": m_hash,
                 "report_hash": aud["report_hash"],
-                "audit_id": aud["audit_id"], "notice": notice,
-                "agent_prompt": agent_prompt}
+                "audit_id": aud["audit_id"], "verdict": report.get("verdict"),
+                "clamav": (report.get("clamav") or {}).get("verdict"),
+                "notice": notice, "agent_prompt": agent_prompt}
 
-    def _notify_push_accepted(self, pool_id, ticket_id, accepted_manifest) -> dict:
-        """Ephemeral (gateway-only) payload for the Hermes agent on accept.
+    def _notify_push_submitted(self, pool_id, ticket_id, manifest,
+                               aud) -> dict:
+        """Ephemeral (gateway-only) payload for the Hermes agent when a
+        push lands as submitted.
 
         The plugin is passive: it never posts to Discord. This payload is
         returned in the push_deliver result so the agent that invoked the
-        command receives it and is prompted to notify the user that tasks
-        are complete and to merge after approval. Bytes still move via
-        the transport; the transfer_ticket is the Iroh download link for
-        the new accepted version. In the mixed case the maintainer must
-        re-run /fetch repo to obtain the accepted manifest.
+        command receives it and is prompted to notify the operator that
+        the change is awaiting approval, ask for the decision, and act
+        on it: on approval invoke the agent-side accept path
+        (``scripts/pool-approve.py --ticket <id>`` → :meth:`push_approve`,
+        which accepts and completes the ticket); on denial run
+        ``scripts/pool-approve.py --ticket <id> --deny`` to record the
+        denial (:meth:`push_deny`). No approval slash command exists by
+        design — approval is agent-driven and service-level.
+        """
+        report = aud.get("report") or {}
+        clamav = report.get("clamav") or {}
+        prompt = (
+            f"A push for ticket {ticket_id} ({manifest.get('repo_id')} "
+            f"v{manifest.get('version')}) was audited clean "
+            f"(verdict {report.get('verdict')}, ClamAV "
+            f"{clamav.get('verdict', 'unknown')} via "
+            f"{clamav.get('via', 'unknown')}, audit {aud.get('audit_id')}) "
+            f"and is awaiting approval. Notify the operator now, quoting "
+            f"the verdict and audit id, and ask whether to approve. On "
+            f"approval, invoke the agent-side accept path: "
+            f"scripts/pool-approve.py --ticket {ticket_id} (accepts the "
+            f"version and completes the ticket); then merge into the "
+            f"canonical checkout yourself with git. On denial, run "
+            f"scripts/pool-approve.py --ticket {ticket_id} --deny to "
+            f"record the denial; the ticket stays claimed.")
+        return {
+            "event": "push_submitted",
+            "ephemeral": True,
+            "pool_id": pool_id,
+            "ticket_id": ticket_id,
+            "repo_id": manifest.get("repo_id"),
+            "version": manifest.get("version"),
+            "audit_id": aud.get("audit_id"),
+            "verdict": report.get("verdict"),
+            "clamav_verdict": clamav.get("verdict"),
+            "prompt": prompt,
+        }
+
+    def push_approve(self, ticket_id, *, pool_id=None, source=None) -> dict:
+        """Agent-driven approval of a submitted push (owner-only).
+
+        Accepts the submitted version (DEK rotation + chain append via
+        the propagator), consumes the ticket's push grants, and completes
+        the ticket. Invoked by the gateway agent after the operator
+        approves (see the ``agent_prompt`` on push_deliver); there is no
+        approval slash command by design.
+        """
+        ticket = self.show_ticket(ticket_id)
+        resolved = self._resolve_pool(pool_id or ticket["pool_id"], source=source)
+        self._check_not_frozen(resolved)
+        self._require_owner(resolved, source)
+        self._assert_local_owned(resolved, source=source)
+        if ticket["state"] != "claimed":
+            raise PermissionError(
+                f"push approve refused: ticket {ticket_id!r} is "
+                f"{ticket['state']!r} (not claimed)")
+        sub = L.get_submission(self._conn, ticket["repo_id"])
+        if sub is None:
+            raise ValueError(
+                f"push approve refused: no submitted version for "
+                f"{ticket['repo_id']!r}")
+        manifest = json.loads(sub["manifest_json"])
+        audit_row = self._conn.execute(
+            "SELECT report_hash, verdict FROM audits WHERE repo_id=? AND version=?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (ticket["repo_id"], manifest["version"])).fetchone()
+        if audit_row is None:
+            raise RuntimeError(
+                "push approve refused: no audit on file for this version")
+        if audit_row[1] != "clean":
+            raise RuntimeError(
+                f"push approve refused: audit verdict is {audit_row[1]!r}, "
+                "not clean")
+        prop = self._propagator(resolved)
+        maintainer = prop._members.get(prop._maintainer_key_id)
+        if maintainer is None:
+            raise RuntimeError(
+                f"maintainer {prop._maintainer_key_id!r} is not a pool member")
+        accepted = prop.accept(
+            manifest=manifest, report_hash=audit_row[0],
+            maintainer=maintainer,
+            maintainer_signing_key=self._caller_sk)
+        for grant in L.list_push_grants_for_ticket(self._conn, ticket_id):
+            if grant.get("consumed_at") is None:
+                L.consume_push_grant(self._conn, grant["token"])
+        updated = L.complete_ticket(self._conn, ticket_id,
+                                    ticket.get("claimant_key_id"))
+        notice = (f"{STATE_MARKER.format(state='completed')} ticket "
+                  f"{updated['ticket_id']} completed by approved push of "
+                  f"{manifest['repo_id']} v{accepted['manifest']['version']} "
+                  f"({accepted['manifest_hash'][:12]})")
+        self._queue_notice(resolved, notice, kind="ticket_completed")
+        agent_prompt = self._notify_push_approved(
+            resolved, updated["ticket_id"], accepted["manifest"])
+        return {"ok": True, "pool_id": resolved,
+                "ticket_id": updated["ticket_id"], "state": updated["state"],
+                "repo_id": manifest["repo_id"],
+                "version": accepted["manifest"]["version"],
+                "manifest_hash": accepted["manifest_hash"],
+                "transfer_id": accepted.get("transfer_id", ""),
+                "dek_rotated": accepted.get("dek_rotated", False),
+                "report_hash": audit_row[0], "notice": notice,
+                "agent_prompt": agent_prompt}
+
+    def push_deny(self, ticket_id, *, pool_id=None, source=None) -> dict:
+        """Record an owner denial of a submitted push (owner-only).
+
+        Drops the submitted version (it leaves the approval queue) and
+        records a ``push_denied`` event; the ticket stays claimed so the
+        contributor can re-push a fixed diff.
+        """
+        ticket = self.show_ticket(ticket_id)
+        resolved = self._resolve_pool(pool_id or ticket["pool_id"], source=source)
+        self._check_not_frozen(resolved)
+        self._require_owner(resolved, source)
+        self._assert_local_owned(resolved, source=source)
+        sub = L.get_submission(self._conn, ticket["repo_id"])
+        if sub is None:
+            raise ValueError(
+                f"push deny refused: no submitted version for "
+                f"{ticket['repo_id']!r}")
+        manifest = json.loads(sub["manifest_json"])
+        self._conn.execute(
+            "DELETE FROM repo_versions WHERE repo_id=? AND version=? AND state='submitted'",
+            (ticket["repo_id"], manifest["version"]))
+        self._conn.commit()
+        L.record_event(self._conn, resolved, "push_denied",
+                       {"ticket_id": ticket_id,
+                        "repo_id": ticket["repo_id"],
+                        "version": manifest["version"]})
+        notice = (f"push for ticket {ticket_id} denied by owner; ticket "
+                  f"stays claimed")
+        self._queue_notice(resolved, notice, kind="push_denied")
+        return {"ok": True, "pool_id": resolved, "ticket_id": ticket_id,
+                "state": "denied", "repo_id": ticket["repo_id"],
+                "version": manifest["version"], "notice": notice}
+
+    def add_repo_deny(self, repo_id, *, version=None, pool_id=None,
+                      source=None) -> dict:
+        """Record an owner denial of a submitted repo version (owner-only).
+
+        Drops the submitted version and records a
+        ``repo_submission_denied`` event.
+        """
+        resolved = self._resolve_pool(pool_id, source=source)
+        self._check_not_frozen(resolved)
+        self._require_owner(resolved, source)
+        self._assert_local_owned(resolved, source=source)
+        sub = L.get_submission(self._conn, repo_id, version=version)
+        if sub is None:
+            raise ValueError(
+                f"add-repo deny refused: no submitted version for {repo_id!r}"
+                + (f" v{version}" if version else ""))
+        manifest = json.loads(sub["manifest_json"])
+        self._conn.execute(
+            "DELETE FROM repo_versions WHERE repo_id=? AND version=? AND state='submitted'",
+            (repo_id, manifest["version"]))
+        self._conn.commit()
+        L.record_event(self._conn, resolved, "repo_submission_denied",
+                       {"repo_id": repo_id, "version": manifest["version"]})
+        notice = (f"add-repo submission {repo_id} "
+                  f"v{manifest['version']} denied by owner")
+        self._queue_notice(resolved, notice, kind="repo_submission_denied")
+        return {"ok": True, "pool_id": resolved, "repo_id": repo_id,
+                "version": manifest["version"], "state": "denied",
+                "notice": notice}
+
+    def _notify_push_approved(self, pool_id, ticket_id, accepted_manifest) -> dict:
+        """Ephemeral (gateway-only) payload for the Hermes agent once an
+        approved push is accepted and the ticket completes.
+
+        The plugin is passive: it never posts to Discord. The agent that
+        ran the approval is prompted to merge into the canonical
+        checkout itself with git (the plugin never merges). The
+        transfer_ticket is the Iroh-over-Tor download link for the new
+        accepted version; ``/fetch repo <id>`` on the pool gateway
+        returns the full accepted manifest when the trimmed reply does
+        not carry it.
         """
         version = accepted_manifest.get("version")
         transfer_ticket = accepted_manifest.get("transfer_ticket", "")
         prompt = (
             f"Tasks for ticket {ticket_id} are complete. New version {version} "
-            f"is available over Iroh (transfer_ticket above). Pending maintainer "
-            f"approval to merge into the canonical checkout. Reply 'approve merge' "
-            f"to proceed; on approval run: git fetch <local bundle path> && "
-            f"git merge --ff-only <branch> (agent executes).")
+            f"is available over Iroh (transfer_ticket above). The operator "
+            f"has approved; merge it into the canonical checkout now with "
+            f"git (agent executes): git fetch <local bundle path> && "
+            f"git merge --ff-only <branch>.")
         return {
-            "event": "push_accepted",
+            "event": "push_approved",
             "ephemeral": True,
             "pool_id": pool_id,
             "ticket_id": ticket_id,
             "transfer_ticket": transfer_ticket,
-            "manifest_json": json.dumps(accepted_manifest, sort_keys=True),
             "version": version,
             "prompt": prompt,
         }
@@ -1455,7 +1965,9 @@ class PoolService:
             self._conn, self._transport,
             pool_id=pool_id,
             maintainer_key_id=maintainer_id, maintainer_signing_key=maintainer_sk,
-            members=members)
+            members=members,
+            clamd_socket=self._clamd_socket,
+            auto_provision=self._auto_provision)
 
     # -- audit -------------------------------------------------------
 

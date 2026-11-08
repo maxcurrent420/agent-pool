@@ -106,6 +106,27 @@ class TorNotReady(RuntimeError):
         super().__init__(detail)
 
 
+def resolve_tor_binary(binary: str | None = None) -> str | None:
+    """Resolve the tor-enabled sidecar binary, in order:
+
+    1. the explicit ``tor_binary`` config value (option (B) sidecar);
+    2. a tor-enabled ``send_hermes-tor`` build on PATH (option (A),
+       ``scripts/install-tor.sh``);
+    3. the stock ``send_hermes`` on PATH — used only when it advertises
+       the tor transport flag (checked by :func:`tor_ready`); a stock
+       binary without the flag still fails closed there.
+
+    Resolution only: no transport is chosen or faked here.
+    """
+    configured = str(binary).strip() if binary else ""
+    if configured:
+        return configured
+    tor_build = shutil.which("send_hermes-tor")
+    if tor_build:
+        return tor_build
+    return shutil.which("send_hermes")
+
+
 def tor_ready(*, control_port: int = _TOR_CONTROL_PORT,
               socks_port: int = _TOR_SOCKS_PORT,
               binary: str | None = None,
@@ -114,8 +135,10 @@ def tor_ready(*, control_port: int = _TOR_CONTROL_PORT,
     fix if it is not usable. There is no fallback transport.
 
     Checks, in order:
-    1. The sidecar binary resolves (``tor_binary`` config or ``send_hermes``
-       on PATH) and supports ``--transport tor`` (``send --help``).
+    1. The sidecar binary resolves via :func:`resolve_tor_binary`
+       (``tor_binary`` config, then a tor-enabled ``send_hermes-tor``
+       build, then the stock ``send_hermes`` on PATH) and supports
+       ``--transport tor`` (``send --help``).
     2. The Tor control port answers on 127.0.0.1 with cookie auth off
        (``AUTHENTICATE`` -> ``250 OK``).
 
@@ -123,7 +146,7 @@ def tor_ready(*, control_port: int = _TOR_CONTROL_PORT,
     there is no long-lived onion identity to check here (Q5 per-transfer
     default). Returns a readiness dict on success.
     """
-    resolved = (str(binary).strip() if binary else "") or shutil.which("send_hermes")
+    resolved = resolve_tor_binary(binary)
     if not resolved or not Path(resolved).is_file():
         raise TorNotReady(
             "tor transport unavailable: no tor-enabled send_hermes sidecar "
@@ -362,10 +385,11 @@ class RealSendHermesTransport(TransportBackend):
 
     @staticmethod
     def binary() -> str | None:
-        return shutil.which("send_hermes")
+        return resolve_tor_binary()
 
     def _resolve_binary(self) -> str | None:
-        """``tor_binary`` config (option (B) sidecar) wins over PATH."""
+        """Tor-enabled sidecar: ``tor_binary`` config (option (B)) wins;
+        otherwise :func:`resolve_tor_binary` (tor build, then stock)."""
         if self.tor_binary:
             return self.tor_binary
         return self.binary()

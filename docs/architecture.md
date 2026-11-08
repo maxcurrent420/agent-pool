@@ -266,10 +266,19 @@ Discord gateway commands; the maintainer's agent is the pool authority.
   Per-profile DB isolation preserved.
 - **Writes (push)**: a contributor's bytes reach the pool only via the
   grant → build → deliver flow (`push_repo` / `push_build_bundle` /
-  `push_deliver`); the deliver step audits and completes the task.
-  The agent on the contributor's gateway builds the bundle from its
-  local checkout path; Discord carries only the manifest JSON,
-  transfer ticket, and grant. No local copy of a foreign pool.
+  `push_deliver`); the deliver step downloads the bytes, audits, and
+  records the version as submitted — acceptance and task completion
+  follow only through the agent-driven approval path (`push_approve`),
+  never automatically. The agent on the contributor's gateway builds
+  the bundle from its local checkout path; Discord carries only the
+  manifest JSON, transfer ticket, and grant. No local copy of a
+  foreign pool.
+- **Claims (Workflow C)**: the claim originates on the contributor's
+  gateway and lands on the maintainer gateway; the maintainer's claim
+  reply carries the accepted repo's Tor download link and manifest
+  directly, so the claimant needs no local lookup. Remote gateway
+  keys enroll as real members (`pool members --enroll` /
+  `--mykeys`), and accepted versions are re-wrapped for them.
 - **Sync is agent-driven** — no plugin timers or background sync.
 - **Authorization is the whitelisted Discord user id, period.** A pool
   records its owner's Discord id at register and whitelisted users

@@ -149,6 +149,125 @@ def _sandbox_scan(clone_dir: Path) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Mandatory ClamAV scan (real engine; never a keyword-only verdict).
+# --------------------------------------------------------------------------
+
+DEFAULT_CLAMD_SOCKET = "/run/clamav/clamd.ctl"
+
+
+class ClamAVUnavailable(RuntimeError):
+    """The ClamAV engine is neither reachable nor installed.
+
+    Callers must provision (one-shot, lockfile-guarded) and re-probe, or
+    fail the audit closed — a keyword-only verdict is never accepted.
+    """
+
+
+def _clamav_signature_version() -> str:
+    try:
+        proc = subprocess.run(["clamscan", "--version"], capture_output=True,
+                              text=True, timeout=30)
+        first = (proc.stdout or "").strip().splitlines()
+        return first[0] if first else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _iter_clone_files(clone_dir: Path):
+    for dirpath, dirnames, filenames in os.walk(clone_dir):
+        dirnames[:] = [d for d in dirnames if d != ".git"]
+        for name in sorted(filenames):
+            yield Path(dirpath) / name
+
+
+def _clamd_instream(clone_dir: Path, socket_path: str) -> list[dict] | None:
+    """Scan via the clamd INSTREAM protocol. Returns the infected list,
+    or None when the daemon socket is unreachable (caller falls back to
+    the clamscan binary)."""
+    import socket as _socket
+    import struct
+    infected: list[dict] = []
+    for full in _iter_clone_files(clone_dir):
+        try:
+            data = full.read_bytes()
+        except OSError:
+            continue
+        rel = str(full.relative_to(clone_dir))
+        # One INSTREAM session per connection (this daemon closes the
+        # connection after each stream scan).
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.settimeout(120)
+        try:
+            sock.connect(socket_path)
+        except OSError:
+            return None
+        try:
+            sock.sendall(b"zINSTREAM\x00")
+            for off in range(0, len(data), 8192):
+                chunk = data[off:off + 8192]
+                sock.sendall(struct.pack("!I", len(chunk)) + chunk)
+            sock.sendall(b"\x00\x00\x00\x00")
+            reply = b""
+            while not reply.endswith(b"\x00"):
+                part = sock.recv(4096)
+                if not part:
+                    break
+                reply += part
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        text = reply.decode("utf-8", errors="replace").strip("\x00").strip()
+        if text.endswith("FOUND"):
+            sig = text.rsplit(":", 1)[-1].replace("FOUND", "").strip()
+            infected.append({"path": rel, "signature": sig})
+    return infected
+
+
+def _clamscan_fallback(clone_dir: Path) -> list[dict] | None:
+    """Scan with the real clamscan binary. Returns the infected list, or
+    None when the binary is absent or the scan errors."""
+    if shutil.which("clamscan") is None:
+        return None
+    proc = subprocess.run(
+        ["clamscan", "-r", "--no-summary", "--stdout", str(clone_dir)],
+        capture_output=True, text=True, timeout=600)
+    infected: list[dict] = []
+    for line in (proc.stdout or "").splitlines():
+        if line.endswith("FOUND"):
+            path, _, sig = line.rpartition(":")
+            infected.append({"path": path.strip(),
+                             "signature": sig.replace("FOUND", "").strip()})
+    if proc.returncode == 2 and not infected:
+        return None
+    return infected
+
+
+def clamav_scan(clone_dir: Path, *,
+                clamd_socket: str = DEFAULT_CLAMD_SOCKET) -> dict:
+    """Real ClamAV verdict for a cloned tree: clamd socket first
+    (``clamd_socket`` config, never hard-coded by callers), then the
+    clamscan binary. Raises :class:`ClamAVUnavailable` when neither
+    engine is usable — callers must not degrade to a keyword-only
+    verdict."""
+    clone_dir = Path(clone_dir)
+    infected = _clamd_instream(clone_dir, clamd_socket)
+    via = "clamd-socket"
+    if infected is None:
+        infected = _clamscan_fallback(clone_dir)
+        via = "clamscan"
+    if infected is None:
+        raise ClamAVUnavailable(
+            "ClamAV engine unavailable (clamd socket unreachable and no "
+            "usable clamscan binary)")
+    return {"engine": "clamav", "via": via,
+            "signature_version": _clamav_signature_version(),
+            "infected": infected,
+            "verdict": "infected" if infected else "clean"}
+
+
+# --------------------------------------------------------------------------
 # Bundle pack / encrypt helpers.
 # --------------------------------------------------------------------------
 
@@ -203,7 +322,9 @@ class RepoPropagator:
     def __init__(self, conn: sqlite3.Connection, *args,
                  transport: TransportBackend = None, gateway=None, pool_id: str,
                  maintainer_key_id: str, maintainer_signing_key,
-                 members: dict[str, Member]):
+                 members: dict[str, Member],
+                 clamd_socket: str = DEFAULT_CLAMD_SOCKET,
+                 auto_provision: bool = True):
         # Positional-compat: old call sites passed (conn, gateway, transport).
         # Gateway is ignored — Hermes posts; propagator only returns content.
         if args:
@@ -231,6 +352,10 @@ class RepoPropagator:
         self._maintainer_key_id = maintainer_key_id
         self._maintainer_sk = maintainer_signing_key
         self._members = members
+        # ClamAV ingestion scan config (config_schema keys, threaded by
+        # the service layer; defaults match plugin.yaml).
+        self._clamd_socket = clamd_socket or DEFAULT_CLAMD_SOCKET
+        self._auto_provision = bool(auto_provision)
         if maintainer_key_id not in members:
             raise ValueError("maintainer must be in the members map")
 
@@ -427,8 +552,58 @@ class RepoPropagator:
             raise RuntimeError("BLAKE3 mismatch: fetched bundle does not match manifest content_hash")
         return plaintext, dek
 
+    def _provision_clamav_once(self) -> bool:
+        """One-shot system provisioning behind a lockfile under the plugin
+        data dir (never in the checkout, never a retry loop): runs only
+        the system steps of scripts/install-deps.sh. Returns True when a
+        provisioning attempt was made (caller re-probes afterwards)."""
+        try:
+            from ledger import default_db_path
+        except ImportError:
+            try:
+                from .ledger import default_db_path
+            except ImportError:
+                return False
+        lockfile = default_db_path().parent / "clamav-provision.attempted"
+        if lockfile.exists():
+            return False
+        script = Path(__file__).resolve().parent / "scripts" / "install-deps.sh"
+        lockfile.write_text("attempted\n")
+        if not script.is_file():
+            return False
+        try:
+            subprocess.run(["bash", str(script), "--system-only"],
+                           capture_output=True, text=True, timeout=900)
+        except Exception:
+            return False
+        return True
+
+    def _clamav_or_fail_closed(self, clone_dir: Path) -> dict:
+        """Mandatory real-engine scan: provision once, then re-probe; a
+        still-absent engine fails the audit closed (never keyword-only)."""
+        try:
+            return clamav_scan(clone_dir, clamd_socket=self._clamd_socket)
+        except ClamAVUnavailable:
+            if self._auto_provision and self._provision_clamav_once():
+                try:
+                    return clamav_scan(clone_dir,
+                                       clamd_socket=self._clamd_socket)
+                except ClamAVUnavailable:
+                    pass
+            raise RuntimeError(
+                "audit refused: ClamAV unavailable — run "
+                "bash scripts/install-deps.sh (system services) and retry; "
+                "a keyword-only verdict is never accepted")
+
     def audit(self, *, manifest: dict, maintainer: Member) -> dict:
-        """Fetch -> verify -> sandboxed static audit. Stores report in ledger."""
+        """Fetch -> verify -> ClamAV + sandboxed static audit.
+
+        Both layers run on the cloned bundle: the real ClamAV engine is
+        the mandatory verdict source (infected refuses; an unavailable
+        engine fails closed after one provisioning attempt); the keyword
+        sandbox scan stays as a supplementary layer whose hits still
+        flag a ClamAV-clean tree. Stores the combined report in the
+        ledger; ``report_hash`` covers both sub-reports."""
         if maintainer.key_id != self._maintainer_key_id:
             raise PermissionError("audit is maintainer-only")
         plaintext, _ = self._decrypt_for_maintainer(manifest, maintainer)
@@ -442,7 +617,12 @@ class RepoPropagator:
             )
             if proc.returncode != 0:
                 raise RuntimeError(f"git clone of bundle failed: {proc.stderr.strip()[:400]}")
-            report = _sandbox_scan(clone_dir)
+            static = _sandbox_scan(clone_dir)
+            clamav = self._clamav_or_fail_closed(clone_dir)
+        verdict = "infected" if clamav["verdict"] == "infected" else static["verdict"]
+        report = {"verdict": verdict, "static": static, "clamav": clamav,
+                  "hits": static.get("hits", []),
+                  "clamav_infected": clamav.get("infected", [])}
         report_hash = blake3_hash(json.dumps(report, sort_keys=True).encode())
         audit_id = f"audit-{manifest['repo_id']}-v{manifest['version']}-{int(time.time())}"
         self._conn.execute(
@@ -523,6 +703,61 @@ class RepoPropagator:
                 "manifest": accepted, "manifest_hash": a_hash,
                 "transfer_id": sent["transfer_id"], "dek_rotated": True,
                 "notice": _n.get("notice", "")}
+
+    def rewrap_accepted(self, *, manifest: dict, maintainer: Member,
+                        maintainer_signing_key) -> dict:
+        """Re-wrap an already-accepted manifest for the CURRENT member
+        set (remote enrollment): fresh DEK, re-encrypt, re-send, and a
+        replacement accepted manifest for the same version — keeping the
+        original ``prev_manifest_hash`` and ``audit_report_hash`` so the
+        chain linkage is unchanged. The new member can then unwrap and
+        fetch existing accepted versions.
+        """
+        if maintainer.key_id != self._maintainer_key_id:
+            raise PermissionError("rewrap is maintainer-only")
+        plaintext, _old_dek = self._decrypt_for_maintainer(manifest, maintainer)
+        if blake3_hash(plaintext) != manifest["content_hash"]:
+            raise RuntimeError("BLAKE3 mismatch on enrollment rewrap")
+        new_dek = secrets.token_bytes(32)
+        ciphertext = encrypt_bundle(plaintext, new_dek)
+        wrapped_keys: dict[str, str] = {}
+        for member_id, member in self._members.items():
+            if not member.box_pubkey_hex:
+                continue
+            pk = PublicKey(bytes.fromhex(member.box_pubkey_hex), encoder=RawEncoder)
+            wrapped_keys[member_id] = wrap_dek(pk, new_dek).hex()
+        with tempfile.TemporaryDirectory(prefix="agentpool-rewrap-") as tmp:
+            cipher_file = Path(tmp) / "bundle.enc"
+            cipher_file.write_bytes(ciphertext)
+            sent = self._transport.send(cipher_file)
+        body = build_manifest(
+            repo_id=manifest["repo_id"], version=manifest["version"],
+            content_hash=manifest["content_hash"],
+            size_bytes=manifest["size_bytes"],
+            signer_key_id=maintainer.key_id,
+            submitter_key_id=manifest["submitter_key_id"],
+            wrapped_keys=wrapped_keys,
+            transfer_ticket=sent["ticket"],
+            audit_report_hash=manifest.get("audit_report_hash"),
+            prev_manifest_hash=manifest.get("prev_manifest_hash"),
+            state="accepted",
+        )
+        signed = sign_manifest(maintainer_signing_key, body)
+        a_hash = manifest_hash(signed)
+        self._conn.execute(
+            "DELETE FROM repo_versions WHERE repo_id=? AND version=?",
+            (manifest["repo_id"], manifest["version"]))
+        self._conn.execute(
+            "DELETE FROM manifest_chain WHERE repo_id=? AND version=?",
+            (manifest["repo_id"], manifest["version"]))
+        self._conn.commit()
+        append_manifest(self._conn, manifest["repo_id"], signed, a_hash)
+        record_event(self._conn, self._pool_id, "rewrapped_for_enrollment",
+                     {"repo_id": manifest["repo_id"],
+                      "version": manifest["version"], "hash": a_hash})
+        return {**self._transport_info(),
+                "manifest": signed, "manifest_hash": a_hash,
+                "transfer_id": sent["transfer_id"]}
 
     # -- fetch ---------------------------------------------------------------
 

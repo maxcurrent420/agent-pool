@@ -195,6 +195,14 @@ def _pool_status(args=None, **kwargs):
         try:
             svc = _service_for(ctx)
             status["queued_notices"] = svc.drain_notices()
+            # Discovery: what is awaiting owner approval on both
+            # ingestion paths (submitted versions), so the agent can
+            # tell the operator without any approval slash command.
+            try:
+                status["awaiting_approval"] = svc.awaiting_approval()[
+                    "awaiting_approval"]
+            except Exception:
+                status["awaiting_approval"] = []
             # Local identity (public values only): key_id, verify key, box pubkey.
             try:
                 status["identity_detail"] = {
@@ -220,6 +228,28 @@ def _pool_status(args=None, **kwargs):
 # ---------------------------------------------------------------------------
 # Service construction (lazy: no DB/identity work at register() time)
 # ---------------------------------------------------------------------------
+
+# Exact remediation for a missing declared Python dependency. Python deps
+# are installed by Hermes into the gateway interpreter's environment, never
+# by the plugin: the plugin must not run its own package installer (it
+# would target the wrong interpreter and violates the fast/offline
+# registration contract). Fail closed naming the Hermes commands.
+DEP_REMEDIATION = (
+    "install the declared Python dependencies into the gateway "
+    "interpreter's environment with Hermes: "
+    "`hermes plugins validate <plugin-path> --install-deps` or "
+    "`hermes pm install`, then restart the gateway. System services "
+    "(ClamAV, Tor daemon, tor-enabled sidecar) are provisioned separately "
+    "with `bash scripts/install-deps.sh` (system services only)."
+)
+
+
+def _missing_dep_error(exc) -> RuntimeError:
+    """Fail-closed error for a missing declared Python dependency."""
+    return RuntimeError(
+        f"agent-pool python dependency unavailable ({exc}); "
+        f"{DEP_REMEDIATION}")
+
 
 def _whitelist_user_ids(ctx):
     """Resolve the pool whitelist (Phase 1): env beats config.
@@ -261,6 +291,18 @@ def _service_for(ctx, source=None):
         from .identity import ensure_identity
         from .tickets import PoolService
         from .transport import FakeTransport, RealSendHermesTransport
+    except ModuleNotFoundError as exc:
+        # A *declared Python dependency* (nacl/blake3) missing from the
+        # gateway interpreter: fail closed naming the Hermes install
+        # commands. Never self-install. (A ModuleNotFoundError naming the
+        # plugin's own package means the relative import itself failed —
+        # fall through to the flat import below.)
+        if exc.name and exc.name.split(".")[0] in ("nacl", "blake3"):
+            raise _missing_dep_error(exc) from exc
+        import ledger as L
+        from identity import ensure_identity
+        from tickets import PoolService
+        from transport import FakeTransport, RealSendHermesTransport
     except ImportError:  # flat import (tests / standalone)
         import ledger as L
         from identity import ensure_identity
@@ -312,7 +354,9 @@ def _service_for(ctx, source=None):
                        pool_resolver=pool_resolver,
                        transport_overrides=overrides,
                        agent_task_allocations=agent_task_allocations,
-                       maintainer_discord_user_id=_maintainer_discord_user_id(ctx))
+                       maintainer_discord_user_id=_maintainer_discord_user_id(ctx),
+                       clamd_socket=_cfg(ctx, "clamd_socket", "/run/clamav/clamd.ctl") if ctx else "/run/clamav/clamd.ctl",
+                       auto_provision=_cfg(ctx, "auto_provision", True) if ctx else True)
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +447,26 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
                                     maintainer_discord_user_id=getattr(svc, "_maintainer_discord_user_id", ""))
         elif sub == "members":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
-            out = {"ok": True, "pool_id": pool_id, "members": svc.members(pool_id, source=source)}
+            if "enroll" in opts:
+                # /pool members --enroll <key_id> <box_hex> <verify_hex>
+                # (owner-only; public key material, safe over Discord).
+                key_id = opts.get("enroll", "")
+                box_hex = rest[0] if len(rest) > 0 else opts.get("box", "")
+                verify_hex = rest[1] if len(rest) > 1 else opts.get("verify", "")
+                if not key_id or not box_hex or not verify_hex:
+                    return _result({"ok": False,
+                                    "error": "usage: /pool members --enroll "
+                                             "<key_id> <box_pubkey_hex> "
+                                             "<verify_pubkey_hex>"})
+                out = svc.enroll_member(
+                    opts.get("pool") or opts.get("pool_id") or None,
+                    key_id, box_hex, verify_hex, source=source)
+            elif "mykeys" in flags or "mykeys" in opts:
+                # Any gateway: print this gateway's public key material
+                # for enrollment on the pool maintainer.
+                out = svc.my_keys()
+            else:
+                out = {"ok": True, "pool_id": pool_id, "members": svc.members(pool_id, source=source)}
         elif sub == "freeze":
             # `/pool freeze` (no pool id, or --global) = GLOBAL kill-switch
             # across every hosted pool; `/pool freeze <pool_id>` = per-pool.
@@ -487,10 +550,18 @@ def _slugify_path(path: str) -> str:
 
 
 def _handle_add_repo(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
-    """``/add-repo <repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]``
+    """``/add-repo`` has three modes:
 
-    Registers the project row and submits its bytes as the next version.
-    Re-running submits a NEW version. --path is required.
+    - ``/add-repo <repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]``
+      — the owner-only fast path: register the project and submit its
+      bytes as the next version (self-accepting). --path is required.
+    - ``/add-repo --deliver <transfer_ticket> --manifest <json> [--repo <repo_id>]``
+      — the link flow: fetch the contributor's bytes over Iroh-over-Tor,
+      verify signature/ACL/BLAKE3, audit, and record the version as
+      submitted (awaiting approval). Bytes move only over the transport.
+    - ``/add-repo approve <repo_id> [--version N]`` — owner-only promotion
+      of a submitted version to accepted (DEK rotation + chain append).
+    - ``/add-repo submissions [--repo <repo_id>]`` — the approval queue.
     """
     try:
         pos, opts, _flags = _parse_args(raw)
@@ -499,12 +570,46 @@ def _handle_add_repo(ctx, raw: str, *, source=None, session_id="", session_key="
                 "add-repo: --link is not supported; use /add-repo --path <checkout>"
             )
         svc = _service_for(ctx, source=source)
+        pool_id = opts.get("pool", "") or opts.get("pool_id", "")
+        sub = pos[0] if pos else ""
+        if opts.get("deliver") is not None:
+            transfer_ticket = opts.get("deliver") or (pos[0] if pos and pos[0] != "deliver" else "")
+            if not transfer_ticket:
+                return _result({"ok": False,
+                                "error": "usage: /add-repo --deliver <transfer_ticket> "
+                                         "--manifest <json> [--repo <repo_id>]"})
+            if not opts.get("manifest"):
+                return _result({"ok": False,
+                                "error": "add-repo deliver needs --manifest <json> "
+                                         "(the contributor-signed submitted manifest)"})
+            try:
+                manifest = json.loads(opts["manifest"])
+            except Exception as exc:
+                return _result({"ok": False, "error": f"bad manifest JSON: {exc}"})
+            out = svc.add_repo_deliver(transfer_ticket, manifest,
+                                       pool_id=pool_id or None,
+                                       source=source,
+                                       repo_id=opts.get("repo") or None)
+            return _result(out, svc, source)
+        if sub == "approve":
+            repo_id = pos[1] if len(pos) > 1 else opts.get("repo", "")
+            if not repo_id:
+                return _result({"ok": False,
+                                "error": "usage: /add-repo approve <repo_id> [--version N]"})
+            version = opts.get("version")
+            out = svc.add_repo_approve(repo_id,
+                                       version=int(version) if version else None,
+                                       pool_id=pool_id or None, source=source)
+            return _result(out, svc, source)
+        if sub == "submissions":
+            out = svc.add_repo_submissions(repo_id=opts.get("repo") or None,
+                                           pool_id=pool_id or None, source=source)
+            return _result(out, svc, source)
         repo_id = pos[0] if pos else opts.get("repo", "")
         path = opts.get("path", "")
         if not repo_id and path:
             repo_id = _slugify_path(path)
-        out = svc.add_repo(opts.get("pool", "") or opts.get("pool_id", ""),
-                           repo_id, path,
+        out = svc.add_repo(pool_id, repo_id, path,
                            display_name=opts.get("name", ""), source=source)
         return _result(out, svc, source)
     except Exception as exc:
@@ -625,10 +730,12 @@ def _handle_fetch(ctx, raw: str, *, source=None, session_id="", session_key="", 
 def _handle_push(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
     """``/push repo <repo_id> --ticket <id>`` (claimant-only grant; returns
     the push link) and ``/push repo --deliver <transfer_ticket> --token
-    <grant> --manifest <json>`` (the pool gateway audits and completes the
-    task). The bundle itself is built and sent by the contributor's own
-    gateway (``push_build_bundle``); only the ticket + grant + signed
-    manifest cross to the pool gateway."""
+    <grant> --manifest <json>`` (the pool gateway audits the pushed bundle
+    and records the version as submitted, awaiting owner approval;
+    acceptance and completion follow the agent-driven approval path —
+    ``scripts/pool-approve.py --ticket <id>``). The bundle itself is built
+    and sent by the contributor's own gateway (``push_build_bundle``);
+    only the ticket + grant + signed manifest cross to the pool gateway."""
     try:
         svc = _service_for(ctx, source=source)
         pos, opts, _flags = _parse_args(raw)
@@ -669,7 +776,11 @@ def _handle_audit(ctx, raw: str, *, source=None, session_id="", session_key="", 
         svc = _service_for(ctx, source=source)
         pos, opts, _flags = _parse_args(raw)
         if not pos or pos[0] != "show":
-            return _result({"ok": False, "error": "usage: /audit show <ticket>"})
+            return _result({"ok": False, "error": "usage: /audit show <ticket> | /audit show --repo <repo_id>"})
+        if opts.get("repo"):
+            # Repo form: latest audit row for the repo (both ingestion
+            # paths write audits keyed by repo/version).
+            return _result(svc.audit_show(repo_id=opts["repo"]), svc, source)
         ticket_id = pos[1] if len(pos) > 1 else opts.get("ticket", "")
         return _result(svc.audit_show(ticket_id=ticket_id), svc, source)
     except Exception as exc:
@@ -728,26 +839,26 @@ _POOL_STATUS_SCHEMA = {
 }
 
 _COMMANDS = (
-    ("pool", _handle_pool, "Agent Pool: register|members|remove|freeze|list, status",
+    ("pool", _handle_pool, "Agent Pool: register|members [--enroll <key> <box> <verify> | --mykeys]|remove|freeze|list, status",
      "register|members|remove|freeze|list [options]"),
     ("fetch", _handle_fetch, "Fetch repo list (projects + available tasks + gateway addressing), task list (with claimed status), or one repo manifest / download form. Discord carries only paths and manifest JSON — the agent on the gateway performs the download",
      "repo list | task list [--ticket <id>] | repo <repo_id> | repo --manifest <json> [options]"),
     ("task", _handle_task, "Agent Pool tickets: add|list|show",
      "add|list|show [options]"),
-    ("add-repo", _handle_add_repo, "Register a project and submit its repo bytes as a new version",
-     "<repo_id> --path <abs/path> [--pool <pool_id>] [--name <display name>]"),
+    ("add-repo", _handle_add_repo, "Register a project and submit its repo bytes as a new version (owner fast path --path; link flow --deliver; approve; submissions)",
+     "<repo_id> --path <abs/path> | --deliver <transfer_ticket> --manifest <json> [--repo <repo_id>] | approve <repo_id> [--version N] | submissions [--repo <repo_id>] [options]"),
     ("task_add", _handle_task_add, "Create a ticket for a registered project (alias of /task add)",
      "--repo <repo_id> --title \"...\" [--brief \"...\"] [--pool <pool_id>]"),
     ("task_list", _handle_task_list, "List tickets, optionally for one project (alias of /task list)",
      "[--repo <repo_id>] [--pool <pool_id>] [--state open]"),
-    ("claim", _handle_claim, "Claim a ticket (paths optional: omit --paths for a whole-ticket claim) or take up to N open tickets with --any-project",
+    ("claim", _handle_claim, "Claim a ticket (paths optional: omit --paths for a whole-ticket claim) or take up to N open tickets with --any-project; the reply carries the accepted repo's Tor download link (transfer_ticket) and manifest directly",
      "[ticket] [--paths <paths>] [--any-project --max-tasks N] [options]"),
     ("release", _handle_release, "Release a claimed ticket back to open",
      "[ticket]"),
-    ("push", _handle_push, "Push a diff for a claimed ticket: issue the push link (grant), or deliver a pushed bundle (audits and completes the task). Pushes are never completed from Discord: the agent builds the bundle locally (push_build_bundle), and Discord carries only the manifest JSON + transfer ticket + grant",
+    ("push", _handle_push, "Push a diff for a claimed ticket: issue the push link (grant), or deliver a pushed bundle (audits and records the version as submitted, awaiting approval; acceptance and completion follow the agent-driven approval path). Pushes are never completed from Discord: the agent builds the bundle locally (push_build_bundle), and Discord carries only the manifest JSON + transfer ticket + grant",
      "repo <repo_id> --ticket <id> | repo --deliver <transfer_ticket> --token <grant> --manifest <json>"),
-    ("audit", _handle_audit, "Show the audit report for a ticket",
-     "show [ticket]"),
+    ("audit", _handle_audit, "Show the audit report for a ticket or a repo",
+     "show [ticket] | show --repo <repo_id>"),
 )
 
 
@@ -886,10 +997,19 @@ def _wrap_command(handler, ctx):
                                 # treated as owner-only only when resolved.
                                 if sub != "register":
                                     _owner_only = True
+                            elif handler.__name__ == "_handle_pool" and sub == "members" and "enroll" in opts:
+                                _owner_only = True
                             elif handler.__name__ == "_handle_task" and sub in ("add",):
                                 _owner_only = True
-                            elif handler.__name__ in ("_handle_add_repo", "_handle_task_add"):
+                            elif handler.__name__ == "_handle_task_add":
                                 _owner_only = True
+                            elif handler.__name__ == "_handle_add_repo":
+                                # --deliver is not owner-only: the
+                                # maintainer-gateway identity gate inside
+                                # add_repo_deliver is the real authorization.
+                                # approve/submissions/--path stay owner-only.
+                                _owner_only = not (
+                                    opts.get("deliver") is not None)
                             elif handler.__name__ == "_handle_pool" and sub in ("list", "members"):
                                 _owner_only = False
                             if _owner_only and not _L.is_owner(svc._conn, resolved, str(user_id)):

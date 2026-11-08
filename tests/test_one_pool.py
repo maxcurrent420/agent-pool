@@ -221,3 +221,62 @@ def test_push_deliver_non_maintainer_refused(tmp_path):
     out = maint_svc.push_deliver(manifest["transfer_ticket"], grant["token"],
                                  manifest, source={"user_id": "member-1"})
     assert out["ok"] is True
+
+
+def test_add_repo_deliver_non_maintainer_refused(tmp_path):
+    """add_repo_deliver from a non-owner gateway is refused with the exact
+    message, even with a valid contributor bundle (mirrors the push gate)."""
+    import subprocess
+
+    from identity import ensure_identity
+    from ledger import add_member, sync_whitelist
+    from nacl.encoding import RawEncoder
+    from transport import FakeTransport
+
+    def _insert_identity(conn, ident):
+        conn.execute(
+            "INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, created_at)"
+            " VALUES (?,?,?,0)",
+            (ident.key_id, ident.verify_key.encode(RawEncoder).hex(),
+             ident.box_pk.encode(RawEncoder).hex()))
+        conn.commit()
+
+    src = tmp_path / "src"
+    src.mkdir(parents=True)
+    for cmd in (["git", "-C", str(src), "init", "-q"],
+                ["git", "-C", str(src), "config", "user.email", "t@t.t"],
+                ["git", "-C", str(src), "config", "user.name", "T"]):
+        subprocess.run(cmd, check=True)
+    (src / "hello.txt").write_text("hello\n")
+    subprocess.run(["git", "-C", str(src), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(src), "commit", "-q", "-m", "v1"], check=True)
+
+    conn = memdb()
+    maint = ensure_identity(tmp_path / "m")
+    member = ensure_identity(tmp_path / "a")
+    for ident in (maint, member):
+        _insert_identity(conn, ident)
+    transport = FakeTransport()
+    maint_svc = PoolService(conn, transport, caller_key_id=maint.key_id,
+                            caller_signing_key=maint.signing_key,
+                            caller_box_sk=maint.box_sk)
+    member_svc = PoolService(conn, transport, caller_key_id=member.key_id,
+                             caller_signing_key=member.signing_key,
+                             caller_box_sk=member.box_sk)
+    maint_svc.register_pool("pool-1", "Team", maintainer_discord_user_id="owner-1")
+    sync_whitelist(conn, "pool-1", ["member-1"])
+    add_member(conn, "pool-1", member.key_id, role="member",
+               box_pubkey_hex=member.box_pk.encode(RawEncoder).hex(),
+               verify_pubkey_hex=member.verify_key.encode(RawEncoder).hex())
+    bundle = member_svc.add_repo_build_bundle(str(src), "demo")
+    manifest = bundle["manifest"]
+    with pytest.raises(PermissionError) as exc:
+        member_svc.add_repo_deliver(manifest["transfer_ticket"], manifest,
+                                    source={"user_id": "member-1"})
+    assert str(exc.value) == ("add-repo deliver refused: only the pool "
+                              "maintainer gateway may accept")
+    # Nothing recorded; the maintainer gateway can still deliver.
+    assert conn.execute("SELECT COUNT(*) FROM repo_versions").fetchone()[0] == 0
+    out = maint_svc.add_repo_deliver(manifest["transfer_ticket"], manifest,
+                                     source={"user_id": "member-1"})
+    assert out["ok"] is True and out["state"] == "submitted"

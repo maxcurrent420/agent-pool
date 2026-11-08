@@ -4,7 +4,11 @@ description: >-
   Agent Pool — friends form an agent team; repos propagate via Iroh-over-Tor
   only (Iroh + Tor custom transport via the tor-enabled send_hermes sidecar;
   Tor-mandatory, no relay fallback, fails closed at first use / byte
-  transfer, never at plugin registration). Coordination only via the Hermes
+  transfer, never at plugin registration). Python deps are declared in
+  pyproject.toml and installed by Hermes (hermes plugins validate
+  --install-deps / hermes pm install); system services (ClamAV, Tor
+  daemon, tor-enabled sidecar) are provisioned by the documented
+  first-run bootstrap scripts/install-deps.sh. Coordination only via the Hermes
   gateway: 2 tools (pool_status, pool_report_usage) and 10 slash commands
   (pool, fetch, task, add-repo, task_add, task_list, claim, release, push,
   audit — see provides_commands). Disclosure: spawns git/bubblewrap/send_hermes
@@ -65,7 +69,15 @@ config_schema:
   tor_binary:
     type: str
     default: ""
-    description: "Tor sidecar binary path (option (B): standalone agent-pool-iroh). Empty = tor-enabled send_hermes on PATH (option (A), the chosen default)."
+    description: "Tor sidecar binary path (option (B): standalone agent-pool-iroh). Empty = tor-enabled send_hermes on PATH (option (A), the chosen default). When empty, resolution prefers a tor-enabled send_hermes-tor build over the stock send_hermes; the stock binary is used only when it advertises the tor transport flag. Build/refresh with scripts/install-tor.sh or the system bootstrap scripts/install-deps.sh."
+  clamd_socket:
+    type: str
+    default: "/run/clamav/clamd.ctl"
+    description: "Unix socket path of the ClamAV daemon (clamd) used by the mandatory ingestion scan (clamav_scan). When the daemon socket is unreachable the plugin falls back to the real clamscan binary; a missing engine fails the audit closed (never a keyword-only verdict)."
+  auto_provision:
+    type: bool
+    default: true
+    description: "When true, a missing ClamAV engine at audit time triggers one lockfile-guarded attempt at the system steps of scripts/install-deps.sh (--system-only) under the plugin data dir, then re-probes; still absent fails closed. When false, a missing engine fails the audit closed immediately."
   max_turns:
     type: int
     default: 25

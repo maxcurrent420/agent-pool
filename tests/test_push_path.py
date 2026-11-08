@@ -128,7 +128,9 @@ def test_push_grant_is_claimant_only(tmp_path):
     assert row is not None and row["ticket_id"] == w["ticket_id"] and row["consumed_at"] is None
 
 
-def test_clean_push_completes_task(tmp_path):
+def test_clean_push_records_submitted_then_approve_completes(tmp_path):
+    """Deliver audits and records the version as submitted (awaiting
+    approval); only the agent-driven approval accepts and completes."""
     w = world(tmp_path)
     _commit_change(w["src"], "hello.txt", "hello push v2\n")
     grant, bundle = _grant_and_bundle(w)
@@ -140,17 +142,76 @@ def test_clean_push_completes_task(tmp_path):
 
     out = w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
                                       manifest, source=_member_source())
-    assert out["ok"] is True and out["state"] == "completed"
-    assert out["version"] == 2 and out["dek_rotated"] is True
+    assert out["ok"] is True and out["state"] == "submitted"
+    assert out["awaiting_approval"] is True
+    assert out["version"] == 2
+    ticket = w["maint_svc"].show_ticket(w["ticket_id"])
+    assert ticket["state"] == "claimed"  # not completed yet
+    rows = [tuple(r) for r in w["conn"].execute(
+        "SELECT version, state FROM repo_versions ORDER BY version")]
+    assert rows == [(1, "accepted"), (2, "submitted")]
+    # Grant NOT consumed by the deliver (approval consumes it).
+    grant_row = w["conn"].execute(
+        "SELECT consumed_at FROM push_grants WHERE token=?",
+        (grant["token"],)).fetchone()
+    assert grant_row[0] is None
+    # Discovery surface lists the version as awaiting approval.
+    awaiting = w["maint_svc"].awaiting_approval(source={"user_id": OWNER})
+    assert [i["repo_id"] for i in awaiting["awaiting_approval"]] == [REPO]
+    assert awaiting["awaiting_approval"][0]["ticket_id"] == w["ticket_id"]
+    assert awaiting["awaiting_approval"][0]["verdict"] == "clean"
+
+    approved = w["maint_svc"].push_approve(w["ticket_id"],
+                                           source={"user_id": OWNER})
+    assert approved["ok"] is True and approved["state"] == "completed"
+    assert approved["version"] == 2 and approved["dek_rotated"] is True
     ticket = w["maint_svc"].show_ticket(w["ticket_id"])
     assert ticket["state"] == "completed"
     # New accepted version on the chain; completed task off the available set.
     rows = [tuple(r) for r in w["conn"].execute(
         "SELECT version, state FROM repo_versions ORDER BY version")]
     assert rows == [(1, "accepted"), (2, "accepted")]
+    grant_row = w["conn"].execute(
+        "SELECT consumed_at FROM push_grants WHERE token=?",
+        (grant["token"],)).fetchone()
+    assert grant_row[0] is not None  # consumed at approval
     avail = w["maint_svc"].fetch_repo_list(source={"user_id": OWNER})
     assert avail["repos"][0]["available_tasks"] == []
     assert avail["repos"][0]["accepted_version"] == 2
+
+
+def test_clean_push_deny_records_denial(tmp_path):
+    w = world(tmp_path)
+    _commit_change(w["src"], "hello.txt", "hello push v2\n")
+    grant, bundle = _grant_and_bundle(w)
+    manifest = bundle["manifest"]
+    out = w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
+                                      manifest, source=_member_source())
+    assert out["state"] == "submitted"
+    denied = w["maint_svc"].push_deny(w["ticket_id"], source={"user_id": OWNER})
+    assert denied["ok"] is True and denied["state"] == "denied"
+    ticket = w["maint_svc"].show_ticket(w["ticket_id"])
+    assert ticket["state"] == "claimed"  # contributor may re-push
+    rows = [tuple(r) for r in w["conn"].execute("SELECT version, state FROM repo_versions")]
+    assert rows == [(1, "accepted")]  # submitted version dropped
+    ev = w["conn"].execute(
+        "SELECT payload_json FROM events WHERE kind='push_denied'").fetchone()
+    assert ev is not None and json.loads(ev[0])["ticket_id"] == w["ticket_id"]
+    # Nothing left awaiting approval.
+    assert w["maint_svc"].awaiting_approval(
+        source={"user_id": OWNER})["awaiting_approval"] == []
+
+
+def test_push_approve_owner_only_and_flagged_refused(tmp_path):
+    w = world(tmp_path)
+    _commit_change(w["src"], "evil.py", "result = eval(user_input)\n")
+    grant, bundle = _grant_and_bundle(w)
+    manifest = bundle["manifest"]
+    out = w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
+                                      manifest, source=_member_source())
+    assert out["verdict"] == "flagged"  # deliver refuses; nothing submitted
+    with pytest.raises(ValueError, match="no submitted version"):
+        w["maint_svc"].push_approve(w["ticket_id"], source={"user_id": OWNER})
 
 
 def test_flagged_push_refused_task_stays_claimed(tmp_path):
@@ -178,6 +239,8 @@ def test_flagged_push_refused_task_stays_claimed(tmp_path):
 
 
 def test_grant_replay_refused(tmp_path):
+    """The grant is consumed once, at approval; a second approval (or a
+    deliver after completion) is refused."""
     w = world(tmp_path)
     _commit_change(w["src"], "hello.txt", "hello push v2\n")
     grant, bundle = _grant_and_bundle(w)
@@ -185,6 +248,9 @@ def test_grant_replay_refused(tmp_path):
     out = w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
                                       manifest, source=_member_source())
     assert out["ok"] is True
+    w["maint_svc"].push_approve(w["ticket_id"], source={"user_id": OWNER})
+    with pytest.raises(PermissionError, match="not claimed"):
+        w["maint_svc"].push_approve(w["ticket_id"], source={"user_id": OWNER})
     with pytest.raises(PermissionError, match="unknown or replayed"):
         w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
                                     manifest, source=_member_source())
@@ -267,24 +333,31 @@ def test_push_build_bundle_returns_manifest_json(tmp_path):
     assert bundle["manifest"]["transfer_ticket"] in bundle["manifest_json"]
 
 
-def test_push_deliver_returns_agent_prompt_on_accept(tmp_path):
+def test_push_deliver_returns_agent_prompt_on_submit(tmp_path):
     w = world(tmp_path)
     _commit_change(w["src"], "hello.txt", "hello push v2\n")
     grant, bundle = _grant_and_bundle(w)
     manifest = bundle["manifest"]
     out = w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
                                       manifest, source=_member_source())
-    assert out["ok"] is True
+    assert out["ok"] is True and out["state"] == "submitted"
     prompt = out["agent_prompt"]
-    assert prompt["event"] == "push_accepted"
+    assert prompt["event"] == "push_submitted"
     assert prompt["ephemeral"] is True
     assert prompt["ticket_id"] == w["ticket_id"]
-    assert prompt["transfer_ticket"]
-    assert prompt["transfer_ticket"] == out["manifest"]["transfer_ticket"]
-    assert json.loads(prompt["manifest_json"]) == out["manifest"]
     assert prompt["version"] == 2
-    assert "approve merge" in prompt["prompt"]
-    assert "complete" in prompt["prompt"]
+    assert prompt["verdict"] == "clean"
+    assert prompt["clamav_verdict"] == "clean"
+    assert prompt["audit_id"]
+    # The prompt instructs: notify the operator, ask, approve via the
+    # agent-side path, deny to record.
+    assert "awaiting approval" in prompt["prompt"]
+    assert "pool-approve.py" in prompt["prompt"]
+    assert "--deny" in prompt["prompt"]
+    # Reply-size guard: the full manifest never rides back in the reply.
+    assert "manifest" not in out
+    assert "manifest_json" not in prompt
+    assert len(json.dumps(out)) < 4096
 
 
 def test_merge_approved_requires_owner(tmp_path):
@@ -294,6 +367,7 @@ def test_merge_approved_requires_owner(tmp_path):
     manifest = bundle["manifest"]
     w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
                                 manifest, source=_member_source())
+    w["maint_svc"].push_approve(w["ticket_id"], source={"user_id": OWNER})
     with pytest.raises(PermissionError, match="not authorized"):
         w["maint_svc"].merge_approved(w["ticket_id"], approved_by_user_id=MEMBER_USER)
 
@@ -305,6 +379,7 @@ def test_merge_approved_records_event(tmp_path):
     manifest = bundle["manifest"]
     w["maint_svc"].push_deliver(manifest["transfer_ticket"], grant["token"],
                                 manifest, source=_member_source())
+    w["maint_svc"].push_approve(w["ticket_id"], source={"user_id": OWNER})
     out = w["maint_svc"].merge_approved(w["ticket_id"], approved_by_user_id=OWNER)
     assert out == {"ok": True, "merged": True, "ticket_id": w["ticket_id"], "version": 2}
     kinds = [r[0] for r in w["conn"].execute(
