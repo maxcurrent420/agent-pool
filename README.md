@@ -38,6 +38,30 @@ or partly closed source projects — without a "Microsoft in the Middle"
 between you and your collaborators, and without exposing your network
 location to anyone.
 
+## Pooled capacity — and what's planned
+
+If you run on free models, your inference capacity is your scarcest
+resource: rate limits, quotas, and time. A pool lets friends **pool that
+free capacity** — you can outsource work to your friends' agents, work on
+their projects in return, and so whenever one of you is on a break
+(everyone sleeps eventually), everyone else keeps going longer on the same
+budget. The pool is a way to turn "my agent is idle until Monday" into
+"my agent's idle hours are still productive for the team".
+
+Two planned pieces build on this and are **not implemented yet**:
+
+1. **Better metering of the capacity you dedicate to the pool** — today
+   the plugin meters tasks and agent-reported usage; the goal is to meter
+   exactly how much of your inference budget you contribute and consume
+   against it.
+2. **Charging for it via shielded ZEC** — so contributing capacity can be
+   paid for privately, paving the way for users to earn from an agent job
+   board and get far more done without spending their time managing
+   agents.
+
+Neither is a promise about the catalog listing; both are roadmap items
+tracked in this repository.
+
 ## Command surface (10 commands + 2 tools)
 
 Registered in `__init__.py` (`_COMMANDS`); `pool_status` and
