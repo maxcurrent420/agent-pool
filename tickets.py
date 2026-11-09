@@ -258,7 +258,16 @@ class PoolService:
             raise ValueError(
                 f"record_pool_context: context pool {context['pool_id']!r} "
                 f"does not match {pool_id!r}")
-        return L.set_gateway_context(self._conn, pool_id, context)
+        result = L.set_gateway_context(self._conn, pool_id, context)
+        # Also persist the context's members (public key material only)
+        # into this gateway's members table, so the maintainer signer's
+        # verify key resolves locally for cross-gateway manifest
+        # verification. Local rows stay authoritative; conflicts are
+        # reported, never silently overwritten.
+        members_report = L.record_context_members(self._conn, context)
+        if isinstance(result, dict):
+            result = {**result, "members_report": members_report}
+        return result
 
     def get_pool_context(self, pool_id=None):
         """Enrollment wrap context recorded locally, or None.

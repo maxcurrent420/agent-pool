@@ -1078,6 +1078,86 @@ def set_gateway_context(conn, pool_id, context) -> dict:
     return record_gateway(conn, pool_id, role="enrolled", context=context)
 
 
+def record_context_members(conn, context) -> dict:
+    """Persist an enrollment context's members into this gateway's members
+    table (public key material only: key_id, role, box_pubkey_hex,
+    verify_key_hex — the context carries no private material).
+
+    Merge discipline (bind_membership-style): a local members row is
+    authoritative — its role is never overwritten; only empty fields are
+    filled. A local row with a CONFLICTING non-empty verify_pubkey_hex is
+    never silently swapped: the local row is kept untouched and the
+    conflict is reported. Members with an empty verify_key_hex are
+    recorded with their box key and empty verify (no keys invented).
+    Idempotent: re-recording the same context is a no-op. A missing or
+    empty members list does not raise.
+
+    Returns a report dict: pool_id, recorded (inserted key_ids), updated
+    (key_ids whose empty fields were filled), skipped (already-current
+    key_ids), conflicts (list of {key_id, local_verify_pubkey_hex,
+    context_verify_pubkey_hex}).
+    """
+    report = {"pool_id": "", "recorded": [], "updated": [], "skipped": [],
+              "conflicts": []}
+    if not isinstance(context, dict):
+        return report
+    pool_id = context.get("pool_id")
+    if not pool_id:
+        return report
+    pool_id = str(pool_id)
+    report["pool_id"] = pool_id
+    # members.pool_id REFERENCES pools(pool_id) and FK enforcement is on:
+    # a contributor gateway hosts no pool, so ensure a stub pool row
+    # (INSERT OR IGNORE — never overwrites a locally hosted pool).
+    conn.execute(
+        "INSERT OR IGNORE INTO pools (pool_id, name, maintainer_key_id,"
+        " relay_url, settings_json, created_at) VALUES (?,?,?,?,?,?)",
+        (pool_id, pool_id, str(context.get("maintainer_key_id") or ""),
+         "", "{}", _now()))
+    members = context.get("members") or []
+    if not isinstance(members, list):
+        members = []
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        key_id = str(m.get("key_id") or "")
+        if not key_id:
+            continue
+        role = str(m.get("role") or "member")
+        box = str(m.get("box_pubkey_hex") or "")
+        verify = str(m.get("verify_key_hex") or "")
+        existing = conn.execute(
+            "SELECT role, box_pubkey_hex, verify_pubkey_hex FROM members"
+            " WHERE pool_id=? AND key_id=?", (pool_id, key_id)).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO members (pool_id, key_id, role, box_pubkey_hex,"
+                " verify_pubkey_hex) VALUES (?,?,?,?,?)",
+                (pool_id, key_id, role, box, verify))
+            report["recorded"].append(key_id)
+            continue
+        local_box = existing[1] or ""
+        local_verify = existing[2] or ""
+        if local_verify and verify and local_verify != verify:
+            report["conflicts"].append({
+                "key_id": key_id,
+                "local_verify_pubkey_hex": local_verify,
+                "context_verify_pubkey_hex": verify})
+            continue
+        new_box = local_box or box
+        new_verify = local_verify or verify
+        if new_box != local_box or new_verify != local_verify:
+            conn.execute(
+                "UPDATE members SET box_pubkey_hex=?, verify_pubkey_hex=?"
+                " WHERE pool_id=? AND key_id=?",
+                (new_box, new_verify, pool_id, key_id))
+            report["updated"].append(key_id)
+        else:
+            report["skipped"].append(key_id)
+    conn.commit()
+    return report
+
+
 def get_gateway_context(conn, pool_id) -> dict | None:
     """Enrollment wrap context recorded for ``pool_id``, or None."""
     row = conn.execute(
