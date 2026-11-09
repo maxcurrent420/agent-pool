@@ -547,6 +547,15 @@ so setup is per profile:
 - `scripts/live-discord-check.md` — operator runbook for a live Discord
   guild.
 
+## Bundled skill — operating and joining pools
+
+The repo ships a contributor/maintainer skill at `skills/agent-pool/`
+(install it to `~/.hermes/skills/` to give any agent the full operating
+manual: roles, whitelist/enrollment, all 10 commands verbatim, the
+add-repo link flow, the claim→push→approve flow, version rules, and what
+fails closed). It is written for any agent running the plugin on any
+machine — no host-specific paths, ports, or test procedures.
+
 ## See also
 
 - `docs/architecture.md` — command-surface chain, Tor-routed Iroh
