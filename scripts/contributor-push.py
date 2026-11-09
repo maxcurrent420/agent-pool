@@ -25,7 +25,7 @@ is emitted.
 
 Usage:
     python3 scripts/contributor-push.py /path/to/checkout --repo REPO_ID \\
-        [--pool POOL_ID] [--data-dir DIR] [--json]
+        [--pool POOL_ID] [--version N] [--data-dir DIR] [--json]
 
 Exit codes: 0 on success, non-zero on failure (message on stderr).
 """
@@ -110,6 +110,8 @@ def build_parser():
     p.add_argument("repo_path", help="local checkout directory to push")
     p.add_argument("--repo", required=True, help="repo id (REPO_ID)")
     p.add_argument("--pool", default=None, help="optional pool id")
+    p.add_argument("--version", type=int, default=None,
+                   help="explicit version (default: next repo version)")
     p.add_argument("--data-dir", default=None,
                    help="plugin data dir override (default: "
                         "AGENT_POOL_DATA_DIR / plugin-data location)")
@@ -130,6 +132,7 @@ def main(argv=None):
         svc = build_service(args.data_dir)
         result = svc.push_build_bundle(
             str(repo_path), args.repo,
+            **({"version": args.version} if args.version is not None else {}),
             **({"pool_id": args.pool} if args.pool else {}))
     except TorNotReady as exc:
         print(f"error: {exc}", file=sys.stderr)
