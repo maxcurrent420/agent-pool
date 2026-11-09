@@ -890,6 +890,32 @@ class PoolService:
                 "gateway identity changed: caller is not the pool's owner gateway — "
                 "re-register the pool to continue")
 
+    def _require_owner_or_gateway(self, pool_id, source) -> None:
+        """Owner gate for the approval verbs, which have two entry paths.
+
+        Discord-sourced calls (``source`` carrying a Discord user) keep
+        the exact :meth:`_require_owner` behavior (Discord owner AND
+        owner gateway). Agent-side calls — no Discord context
+        (``source is None`` and no Discord user resolves) — are
+        authorized by gateway identity only: ``_caller_key_id`` must
+        equal the pool's ``owner_gateway_key_id`` (same lookup as
+        :meth:`_require_owner`). This is how the agent-side
+        ``scripts/pool-approve.py`` authorizes; it has no Discord
+        source to present.
+        """
+        if source is None and self._discord_user(source) is None:
+            row = self._conn.execute(
+                "SELECT owner_gateway_key_id, maintainer_key_id FROM pools WHERE pool_id=?",
+                (pool_id,)).fetchone()
+            owner_gateway = (row[0] if row and row[0] else
+                             row[1] if row else None)
+            if owner_gateway is None or owner_gateway != self._caller_key_id:
+                raise PermissionError(
+                    f"not authorized for pool {pool_id} — agent-side "
+                    "approval requires the pool's owner gateway identity")
+            return
+        self._require_owner(pool_id, source)
+
     def _require_authorized(self, pool_id, source) -> None:
         # No legacy skip: absence of whitelist rows = refusal.
         user_id = self._discord_user(source)
@@ -1480,7 +1506,7 @@ class PoolService:
         """
         resolved = self._resolve_pool(pool_id, source=source)
         self._check_not_frozen(resolved)
-        self._require_owner(resolved, source)
+        self._require_owner_or_gateway(resolved, source)
         self._assert_local_owned(resolved, source=source)
         sub = L.get_submission(self._conn, repo_id, version=version)
         if sub is None:
@@ -1826,7 +1852,7 @@ class PoolService:
         ticket = self.show_ticket(ticket_id)
         resolved = self._resolve_pool(pool_id or ticket["pool_id"], source=source)
         self._check_not_frozen(resolved)
-        self._require_owner(resolved, source)
+        self._require_owner_or_gateway(resolved, source)
         self._assert_local_owned(resolved, source=source)
         if ticket["state"] != "claimed":
             raise PermissionError(
@@ -1890,7 +1916,7 @@ class PoolService:
         ticket = self.show_ticket(ticket_id)
         resolved = self._resolve_pool(pool_id or ticket["pool_id"], source=source)
         self._check_not_frozen(resolved)
-        self._require_owner(resolved, source)
+        self._require_owner_or_gateway(resolved, source)
         self._assert_local_owned(resolved, source=source)
         sub = L.get_submission(self._conn, ticket["repo_id"])
         if sub is None:
@@ -1922,7 +1948,7 @@ class PoolService:
         """
         resolved = self._resolve_pool(pool_id, source=source)
         self._check_not_frozen(resolved)
-        self._require_owner(resolved, source)
+        self._require_owner_or_gateway(resolved, source)
         self._assert_local_owned(resolved, source=source)
         sub = L.get_submission(self._conn, repo_id, version=version)
         if sub is None:

@@ -316,6 +316,28 @@ def _verify_key(member: Member):
     return VerifyKey(bytes.fromhex(member.verify_key_hex), encoder=RawEncoder)
 
 
+def resolve_pool_checkout_dir(conn: sqlite3.Connection, repo_id: str) -> Path:
+    """The pool's canonical checkout dir for ``repo_id`` — the landing
+    place for verified bundles (``bundle-v<N>.git``).
+
+    Resolution order: the ledger ``repos.path`` (the absolute checkout
+    path recorded at registration, canonical-demo-style
+    ``work/integrate/<repo>``), else the default
+    ``<plugin-data>/work/integrate/<repo_id>`` under the ledger DB's
+    parent dir. Naming mirrors :meth:`RepoPropagator.fetch`, which
+    writes ``dest/bundle-v{version}.git``.
+    """
+    row = conn.execute(
+        "SELECT path FROM repos WHERE repo_id=?", (repo_id,)).fetchone()
+    if row is not None and row[0]:
+        return Path(row[0])
+    try:  # package import (Hermes loads plugins as a package)
+        from .ledger import default_db_path
+    except ImportError:  # flat import (pytest from repo root)
+        from ledger import default_db_path
+    return default_db_path().parent / "work" / "integrate" / str(repo_id)
+
+
 class RepoPropagator:
     """One propagator per pool. All state lives in the shared ledger + Iroh."""
 
@@ -536,21 +558,75 @@ class RepoPropagator:
 
     # -- audit + accept ------------------------------------------------------
 
-    def _decrypt_for_maintainer(self, manifest: dict, maintainer: Member) -> tuple[bytes, bytes]:
-        """Fetch ciphertext via Iroh and decrypt with the maintainer's DEK."""
+    def _persisted_bundle_path(self, manifest: dict) -> Path:
+        """The persisted verified bundle for this manifest's
+        ``repo_id``/``version`` — always inside
+        :func:`resolve_pool_checkout_dir`, never anywhere else."""
+        dest_dir = resolve_pool_checkout_dir(self._conn,
+                                              manifest["repo_id"])
+        return dest_dir / f"bundle-v{manifest['version']}.git"
+
+    def _read_persisted_bundle(self, manifest: dict) -> bytes | None:
+        """Return the persisted bundle bytes iff they are the previously
+        Tor-fetched, BLAKE3-verified copy: strict size + BLAKE3 check
+        against the (contributor-signed, caller-verified) manifest.
+
+        Returns ``None`` on any mismatch — missing file, symlink,
+        wrong size, or wrong hash — so the caller falls back to the
+        Tor fetch. Never reads outside the pool checkout dir.
+        """
+        try:
+            bundle_path = self._persisted_bundle_path(manifest)
+        except Exception:
+            return None
+        try:
+            if bundle_path.is_symlink() or not bundle_path.is_file():
+                return None
+            data = bundle_path.read_bytes()
+        except OSError:
+            return None
+        if "size_bytes" in manifest and len(data) != manifest["size_bytes"]:
+            return None
+        if blake3_hash(data) != manifest.get("content_hash"):
+            return None
+        return data
+
+    def _decrypt_for_maintainer(self, manifest: dict, maintainer: Member, *,
+                                prefer_cache: bool = True
+                                ) -> tuple[bytes, bytes, str]:
+        """Decrypt the maintainer-bound bundle, cache-first.
+
+        The persisted, BLAKE3-verified bundle in the pool checkout dir
+        (written by :meth:`audit` after the Tor fetch) is reused when
+        present and matching ``content_hash``/``size_bytes`` of the
+        signed manifest — the contributor's Tor provider may be dead
+        by approval time, and re-downloading already-verified bytes
+        must not fail acceptance. The Tor fetch runs only when no
+        valid persisted copy exists (missing or tampered).
+
+        Returns ``(plaintext, dek, source)`` where ``source`` is
+        ``"persisted"`` or ``"tor_fetch"`` — callers record it in
+        their ledger events so tests can assert which path ran.
+        ``prefer_cache=False`` forces the Tor fetch (no caller needs
+        it today; kept for explicitness).
+        """
         ticket = manifest.get("transfer_ticket", "")
         wrapped_hex = (manifest.get("wrapped_keys") or {}).get(maintainer.key_id)
         if not wrapped_hex:
             raise PermissionError(
                 f"audit refused: maintainer has no wrapped DEK for {manifest.get('repo_id')}")
         dek = unwrap_dek(maintainer.box_sk, bytes.fromhex(wrapped_hex))
+        if prefer_cache:
+            persisted = self._read_persisted_bundle(manifest)
+            if persisted is not None:
+                return persisted, dek, "persisted"
         with tempfile.TemporaryDirectory(prefix="agentpool-fetch-") as tmp:
             materialised = fetch_with_retry(self._transport, ticket, Path(tmp))
             ciphertext = Path(materialised).read_bytes()
         plaintext = decrypt_bundle(ciphertext, dek)
         if blake3_hash(plaintext) != manifest["content_hash"]:
             raise RuntimeError("BLAKE3 mismatch: fetched bundle does not match manifest content_hash")
-        return plaintext, dek
+        return plaintext, dek, "tor_fetch"
 
     def _provision_clamav_once(self) -> bool:
         """One-shot system provisioning behind a lockfile under the plugin
@@ -595,6 +671,46 @@ class RepoPropagator:
                 "bash scripts/install-deps.sh (system services) and retry; "
                 "a keyword-only verdict is never accepted")
 
+    def _persist_verified_bundle(self, manifest: dict,
+                                  plaintext: bytes) -> str:
+        """Land the BLAKE3-verified plaintext bundle in the pool's
+        canonical checkout dir as ``bundle-v{version}.git``.
+
+        This is the Tor download's destination, not a cache substitute:
+        ``plaintext`` arrived over Iroh-over-Tor and was BLAKE3-verified
+        against ``manifest['content_hash']`` (see
+        ``_decrypt_for_maintainer``) before this call. Naming mirrors
+        :meth:`fetch`, which writes ``dest/bundle-v{version}.git``.
+        Atomic (temp file + ``os.replace``), mode 0600, and idempotent:
+        an existing bundle whose BLAKE3 matches is kept as-is.
+        Returns the absolute bundle path.
+        """
+        if blake3_hash(plaintext) != manifest["content_hash"]:
+            raise RuntimeError(
+                "persist refused: plaintext does not match manifest content_hash")
+        dest_dir = resolve_pool_checkout_dir(self._conn,
+                                              manifest["repo_id"])
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        bundle_path = dest_dir / f"bundle-v{manifest['version']}.git"
+        if bundle_path.is_file() and \
+                blake3_hash(bundle_path.read_bytes()) == manifest["content_hash"]:
+            return str(bundle_path)
+        fd, tmp_name = tempfile.mkstemp(dir=str(dest_dir),
+                                         prefix=".bundle-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(plaintext)
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, bundle_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        os.chmod(bundle_path, 0o600)
+        return str(bundle_path)
+
     def audit(self, *, manifest: dict, maintainer: Member) -> dict:
         """Fetch -> verify -> ClamAV + sandboxed static audit.
 
@@ -606,7 +722,7 @@ class RepoPropagator:
         ledger; ``report_hash`` covers both sub-reports."""
         if maintainer.key_id != self._maintainer_key_id:
             raise PermissionError("audit is maintainer-only")
-        plaintext, _ = self._decrypt_for_maintainer(manifest, maintainer)
+        plaintext, _, bundle_source = self._decrypt_for_maintainer(manifest, maintainer)
         with tempfile.TemporaryDirectory(prefix="agentpool-audit-clone-") as tmp:
             bundle_file = Path(tmp) / "bundle.git"
             clone_dir = Path(tmp) / "clone"
@@ -619,6 +735,10 @@ class RepoPropagator:
                 raise RuntimeError(f"git clone of bundle failed: {proc.stderr.strip()[:400]}")
             static = _sandbox_scan(clone_dir)
             clamav = self._clamav_or_fail_closed(clone_dir)
+        # Download destination: the BLAKE3-verified bundle (fetched over
+        # Tor, verified in _decrypt_for_maintainer) lands in the pool's
+        # canonical checkout dir so the agent can merge from it.
+        bundle_path = self._persist_verified_bundle(manifest, plaintext)
         verdict = "infected" if clamav["verdict"] == "infected" else static["verdict"]
         report = {"verdict": verdict, "static": static, "clamav": clamav,
                   "hits": static.get("hits", []),
@@ -633,8 +753,10 @@ class RepoPropagator:
         self._conn.commit()
         record_event(self._conn, self._pool_id, "audited",
                      {"repo_id": manifest["repo_id"], "version": manifest["version"],
-                      "report_hash": report_hash, "verdict": report["verdict"]})
-        return {"report": report, "report_hash": report_hash, "audit_id": audit_id}
+                      "report_hash": report_hash, "verdict": report["verdict"],
+                      "bundle_source": bundle_source})
+        return {"report": report, "report_hash": report_hash, "audit_id": audit_id,
+                "bundle_path": bundle_path, "bundle_source": bundle_source}
 
     def accept(self, *, manifest: dict, report_hash: str, maintainer: Member,
                maintainer_signing_key) -> dict:
@@ -656,7 +778,7 @@ class RepoPropagator:
         if not verify_manifest(push_vk, manifest):
             raise RuntimeError("push manifest signature does not verify")
         # Re-encrypt under a fresh DEK: fetch + decrypt the push bundle.
-        plaintext, _old_dek = self._decrypt_for_maintainer(manifest, maintainer)
+        plaintext, _old_dek, bundle_source = self._decrypt_for_maintainer(manifest, maintainer)
         if blake3_hash(plaintext) != manifest["content_hash"]:
             raise RuntimeError("BLAKE3 mismatch on acceptance re-encryption")
         new_dek = secrets.token_bytes(32)
@@ -698,10 +820,12 @@ class RepoPropagator:
         record_event(self._conn, self._pool_id, "accepted",
                      {"repo_id": manifest["repo_id"], "version": manifest["version"],
                       "hash": a_hash, "dek_rotated": True,
+                      "bundle_source": bundle_source,
                       "push_ticket": manifest.get("transfer_ticket", "")})
         return {**self._transport_info(),
                 "manifest": accepted, "manifest_hash": a_hash,
                 "transfer_id": sent["transfer_id"], "dek_rotated": True,
+                "bundle_source": bundle_source,
                 "notice": _n.get("notice", "")}
 
     def rewrap_accepted(self, *, manifest: dict, maintainer: Member,
@@ -715,7 +839,7 @@ class RepoPropagator:
         """
         if maintainer.key_id != self._maintainer_key_id:
             raise PermissionError("rewrap is maintainer-only")
-        plaintext, _old_dek = self._decrypt_for_maintainer(manifest, maintainer)
+        plaintext, _old_dek, bundle_source = self._decrypt_for_maintainer(manifest, maintainer)
         if blake3_hash(plaintext) != manifest["content_hash"]:
             raise RuntimeError("BLAKE3 mismatch on enrollment rewrap")
         new_dek = secrets.token_bytes(32)
@@ -754,7 +878,8 @@ class RepoPropagator:
         append_manifest(self._conn, manifest["repo_id"], signed, a_hash)
         record_event(self._conn, self._pool_id, "rewrapped_for_enrollment",
                      {"repo_id": manifest["repo_id"],
-                      "version": manifest["version"], "hash": a_hash})
+                      "version": manifest["version"], "hash": a_hash,
+                      "bundle_source": bundle_source})
         return {**self._transport_info(),
                 "manifest": signed, "manifest_hash": a_hash,
                 "transfer_id": sent["transfer_id"]}

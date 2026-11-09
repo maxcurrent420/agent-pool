@@ -23,6 +23,14 @@ denies). Nothing here is reachable from Discord directly.
     python3 scripts/pool-approve.py --repo REPO_ID --deny
         -> PoolService.add_repo_deny: records the denial.
 
+After a successful approval (never on denial) this script fetches the
+accepted version's bytes over Tor IN THE SAME PROCESS — the accept
+re-send provider is alive only inside this run — and writes
+``bundle-v{N}.git`` into the pool checkout dir (see
+``fetch_accepted_over_tor``). The returned JSON carries the resulting
+``bundle_file`` / ``clone_dir`` paths. There is no plaintext read of
+the pool dir as a substitute: the landed bytes are the Tor fetch.
+
 The Tor gate, identity and ledger construction mirror
 ``scripts/contributor-add.py``. Prints one JSON result object.
 
@@ -82,6 +90,41 @@ def build_service(data_dir=None, *, transport=None):
             "AGENT_POOL_MAINTAINER_DISCORD_USER_ID", ""))
 
 
+def fetch_accepted_over_tor(svc, repo_id, version=None) -> dict:
+    """Fetch the accepted version's bytes over Tor in this process.
+
+    The accept step re-sends the bundle over the maintainer's own
+    transport and returns a new ``transfer_ticket``; that provider
+    lives only for this run, so the fetch must happen here, before
+    the script exits. ``PoolService.fetch_repo_download`` performs
+    the Tor fetch, DEK unwrap, BLAKE3 verification and writes
+    ``bundle-v{N}.git`` (+ a ``worktree-v{N}`` clone) into the pool
+    checkout dir. Returns the landed paths.
+    """
+    row = svc._conn.execute(
+        "SELECT manifest_json FROM repo_versions WHERE repo_id=?"
+        " AND state='accepted'"
+        " AND (? IS NULL OR version=?)"
+        " ORDER BY version DESC LIMIT 1",
+        (repo_id, version, version)).fetchone()
+    if row is None:
+        raise RuntimeError(
+            f"fetch accepted bytes refused: no accepted version for "
+            f"{repo_id!r}" + (f" v{version}" if version else ""))
+    manifest = json.loads(row[0])
+    try:  # flat import (script runs from the repo root)
+        from propagation import resolve_pool_checkout_dir
+    except ImportError:  # pragma: no cover - package import fallback
+        from agent_pool.propagation import resolve_pool_checkout_dir  # type: ignore
+    dest = resolve_pool_checkout_dir(svc._conn, repo_id)
+    downloaded = svc.fetch_repo_download(manifest, dest=dest)
+    return {"checkout_dir": str(dest),
+            "bundle_file": downloaded["bundle_file"],
+            "clone_dir": downloaded["clone_dir"],
+            "content_hash": downloaded["content_hash"],
+            "version": manifest["version"]}
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Agent-side approval/denial of a submitted pool "
@@ -117,6 +160,11 @@ def main(argv=None):
                       if args.deny else
                       svc.add_repo_approve(
                           args.repo, version=args.version, pool_id=args.pool))
+        if not args.deny:
+            # The accept re-send provider dies with this process: fetch
+            # the accepted bytes over Tor now, into the pool checkout.
+            result["fetched"] = fetch_accepted_over_tor(
+                svc, result["repo_id"], version=result.get("version"))
     except TorNotReady as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

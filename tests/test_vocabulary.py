@@ -49,6 +49,13 @@ BANNED = (
 # Single explicit allowlist: audit-verdict schema default (not ticket state).
 ALLOWLIST = (
     ("ledger.py", "verdict TEXT NOT NULL DEFAULT 'pending'"),
+    # The operator's canonical pool checkout dir is literally
+    # ``work/integrate/<repo>`` (live: work/integrate/canonical-demo);
+    # resolve_pool_checkout_dir names that path, not the deleted
+    # proposal/integrate machinery.
+    ("propagation.py", "``work/integrate/<repo>``), else the default"),
+    ("propagation.py", "``<plugin-data>/work/integrate/<repo_id>`` under the ledger DB's"),
+    ("propagation.py", 'return default_db_path().parent / "work" / "integrate" / str(repo_id)'),
 )
 
 
