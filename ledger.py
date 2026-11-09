@@ -5,11 +5,114 @@ tickets, claims, file_claims, audits, events (+ local identities metadata).
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sqlite3
+import sys
 import time
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Import bootstrap for the Hermes plugin-storage API.
+#
+# Inside the gateway, ``plugins.plugin_storage`` is already on ``sys.path``.
+# Agent-spawned standalone CLIs (scripts/*.py) are separate interpreters:
+# they do not inherit the gateway's ``sys.path`` and no ``PYTHONPATH`` is
+# provided, so a bare ``import plugins.plugin_storage`` dies with
+# ``ModuleNotFoundError``. This bootstrap resolves the Hermes *install root*
+# (the tree containing ``plugins/plugin_storage.py``) from ``HERMES_HOME``
+# (the Hermes *home*, ``~/.hermes`` or a profile dir — see
+# ``hermes_constants.get_hermes_home`` / ``_platform_default_hermes_home``,
+# where the install tree is ``<home>/hermes-agent``), verifies the file is
+# really there, adds that root to ``sys.path``, and retries the import
+# exactly once. It never creates a data path: storage still comes from the
+# real Hermes ``plugin_db`` / ``plugin_data_dir`` only, and failure still
+# fails closed. When ``plugins`` is already importable (gateway, or the
+# test-suite fake) this is a strict no-op: ``sys.path`` is untouched.
+# ---------------------------------------------------------------------------
+
+
+def _default_hermes_home() -> Path:
+    """Mirror ``hermes_constants._platform_default_hermes_home``."""
+    suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return base / ("hermes" + suffix)
+    return Path.home() / (".hermes" + suffix)
+
+
+def _hermes_install_root_candidates() -> list[Path]:
+    """Candidate install roots (trees containing ``plugins/plugin_storage.py``).
+
+    Order: ``HERMES_HOME`` (and its profile root), then the documented
+    default home. ``HERMES_HOME`` points at a Hermes *home* (``~/.hermes`` or
+    ``~/.hermes/profiles/<name>``), and the install tree is
+    ``<home>/hermes-agent`` — for a profile home the install tree lives under
+    the root (``<root>/hermes-agent``), matching
+    ``hermes_constants._hermes_root_of``. The home itself is tried last in
+    case an install is laid out directly in the home.
+    """
+    homes: list[Path] = []
+    raw_home = os.environ.get("HERMES_HOME", "").strip()
+    if raw_home:
+        home = Path(os.path.expanduser(os.path.expandvars(raw_home)))
+        homes.append(home)
+        if home.parent.name == "profiles":  # <root>/profiles/<name> -> <root>
+            homes.append(home.parent.parent)
+    homes.append(_default_hermes_home())
+    candidates: list[Path] = []
+    for home in homes:
+        for cand in (home / "hermes-agent", home):
+            if cand not in candidates:
+                candidates.append(cand)
+    return candidates
+
+
+def _resolve_hermes_install_root() -> Path | None:
+    """First candidate dir that actually contains the storage module."""
+    for cand in _hermes_install_root_candidates():
+        try:
+            if (cand / "plugins" / "plugin_storage.py").is_file():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _load_plugin_storage():
+    """Import ``plugins.plugin_storage``, bootstrapping ``sys.path`` if needed.
+
+    No-op when the module is already importable. On ``ImportError`` only
+    (never on a storage *call* failure), resolve the install root, verify
+    ``plugins/plugin_storage.py`` exists, add the root (once), and retry the
+    import exactly once. Still unavailable -> fail closed with a
+    ``RuntimeError`` naming the Hermes plugin-storage mechanism.
+    """
+    try:
+        return importlib.import_module("plugins.plugin_storage")
+    except ImportError:
+        pass
+    root = _resolve_hermes_install_root()
+    if root is not None:
+        root_str = str(root)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+        # Drop any half-registered failed import so the retry is genuine.
+        sys.modules.pop("plugins.plugin_storage", None)
+        try:
+            return importlib.import_module("plugins.plugin_storage")
+        except ImportError:
+            pass
+    raise RuntimeError(
+        "agent-pool storage requires the Hermes plugin-storage "
+        "mechanism (plugins.plugin_storage.plugin_db / "
+        "plugins.plugin_storage.plugin_data_dir); it is unavailable "
+        "in this environment — run inside a Hermes gateway profile "
+        "or install Hermes storage support"
+    )
+
 
 
 def _env_get(name, default=""):
@@ -26,23 +129,26 @@ def _env_get(name, default=""):
 def _plugin_base_dir() -> Path:
     """Profile-aware plugin data dir.
 
-    Order: ``AGENT_POOL_DATA_DIR`` override, Hermes
-    ``plugin_data_dir("agent-pool")``, ``$HERMES_HOME/plugin-data``,
-    then the legacy ``~/.hermes`` fallback (tests / standalone).
+    Order: ``AGENT_POOL_DATA_DIR`` explicit override,
+    Hermes ``plugin_data_dir("agent-pool")``. No local-file fallback:
+    if the Hermes plugin-storage mechanism is unavailable, fail closed
+    naming it (never park state under ``~/.hermes`` or ``$HERMES_HOME``).
     """
     override = _env_get("AGENT_POOL_DATA_DIR")
     if override:
         return Path(override)
     try:
-        from plugins.plugin_storage import plugin_data_dir
-
+        plugin_data_dir = _load_plugin_storage().plugin_data_dir
         return Path(plugin_data_dir("agent-pool"))
-    except Exception:
-        pass
-    hermes_home = _env_get("HERMES_HOME")
-    if hermes_home:
-        return Path(hermes_home) / "plugin-data" / "agent-pool"
-    return Path.home() / ".hermes" / "plugin-data" / "agent-pool"
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            "agent-pool data directory requires the Hermes plugin-storage "
+            "mechanism (plugins.plugin_storage.plugin_data_dir); it is "
+            "unavailable in this environment — run inside a Hermes "
+            "gateway profile or install Hermes storage support"
+        ) from exc
 
 
 SCHEMA = """
@@ -322,14 +428,27 @@ def default_db_path() -> Path:
 
 
 def get_db() -> sqlite3.Connection:
-    """Open the ledger via Hermes plugin_db(); fall back to a local SQLite file
-    when running outside Hermes (tests / standalone)."""
+    """Open the ledger via Hermes ``plugin_db("agent-pool")`` — the only
+    storage path. Fail closed if Hermes plugin storage is unavailable;
+    never open a local fallback file.
+
+    Hermes ``plugin_db`` returns a connection with ``row_factory=None``
+    (plain tuple rows), but ledger code indexes rows with string keys
+    (e.g. ``row["settings_json"]`` in :func:`_pool_row`/:func:`is_frozen`),
+    so set ``conn.row_factory = sqlite3.Row`` explicitly here.
+    """
     try:
-        from plugins.plugin_storage import plugin_db
-        conn = plugin_db("agent-pool")
-    except Exception:
-        conn = sqlite3.connect(str(default_db_path()), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        conn = _load_plugin_storage().plugin_db("agent-pool")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            "agent-pool ledger requires the Hermes plugin-storage "
+            "mechanism (plugins.plugin_storage.plugin_db); it is "
+            "unavailable in this environment — run inside a Hermes "
+            "gateway profile or install Hermes storage support"
+        ) from exc
+    conn.row_factory = sqlite3.Row
     return init_ledger(conn)
 
 
