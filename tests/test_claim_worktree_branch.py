@@ -45,7 +45,8 @@ def _world(tmp_path, manifest_version=1):
     conn.commit()
     svc = PoolService(conn, FakeTransport(), caller_key_id=ident.key_id,
                       caller_signing_key=ident.signing_key,
-                      caller_box_sk=ident.box_sk)
+                      caller_box_sk=ident.box_sk,
+                      maintainer_discord_user_id=OWNER)
     return conn, svc
 
 

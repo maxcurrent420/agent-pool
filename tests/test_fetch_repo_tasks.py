@@ -12,7 +12,7 @@ from nacl.encoding import RawEncoder
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from identity import ensure_identity
-from ledger import ClaimRefused, add_member, init_ledger, sync_whitelist
+from ledger import ClaimRefused, add_member, bind_membership, init_ledger, sync_whitelist
 from tickets import PoolNotLocalError, PoolService
 from transport import FakeTransport
 
@@ -24,11 +24,13 @@ REPO = "demo"
 
 
 def _whitelist(conn, pool_id, user_id, ident):
-    """Phase 1 stand-in for the removed invite method (see test_push_path)."""
+    """Phase 1 stand-in for the removed invite method (see test_push_path):
+    authorize + crypto member + enrollment-time Discord-id binding."""
     sync_whitelist(conn, pool_id, [user_id])
     add_member(conn, pool_id, ident.key_id, role="member",
                box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex(),
                verify_pubkey_hex=ident.verify_key.encode(RawEncoder).hex())
+    bind_membership(conn, pool_id, user_id, ident.key_id)
 
 
 def memdb():

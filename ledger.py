@@ -691,14 +691,12 @@ def is_frozen_any(conn, pool_id) -> bool:
 
 
 def check_not_frozen(conn, pool_id) -> None:
-    """Raise ClaimRefused if any freeze (global or per-pool) blocks *pool_id*."""
+    """Raise ClaimRefused if any freeze (global or per-pool) blocks *pool_id*.
+    DB errors propagate — a freeze check that silently passes is a
+    fail-open hole, never a fallback."""
     if is_global_frozen(conn):
         raise ClaimRefused(FROZEN_MESSAGE)
-    try:
-        frozen = is_frozen(conn, pool_id)
-    except Exception:
-        frozen = False
-    if frozen:
+    if is_frozen(conn, pool_id):
         raise ClaimRefused(FROZEN_MESSAGE)
 
 
@@ -1242,36 +1240,53 @@ def sync_whitelist(conn, pool_id, user_ids) -> None:
 
 
 def bind_membership(conn, pool_id, discord_user_id, key_id) -> None:
-    """First-claim key binding: record the key a whitelisted user presented.
+    """Explicit key binding (registration/enrollment time): record the key a
+    Discord user is bound to on a pool.
 
-    ``INSERT OR IGNORE`` — the first binding wins; later binds are no-ops
-    (a different presented key is refused in ``PoolService.claim``).
+    The binding is immutable: binding a user who already has a DIFFERENT key
+    hard-fails with ValueError (a membership conflict) — a bound key is
+    never silently replaced. Re-binding the SAME key is an idempotent
+    no-op. Binding never happens implicitly (no first-claim binding, no
+    gateway-identity fallback).
     """
+    user_id = str(discord_user_id)
+    key_id = str(key_id)
+    existing = conn.execute(
+        "SELECT key_id FROM pool_memberships WHERE pool_id=? AND discord_user_id=?",
+        (pool_id, user_id)).fetchone()
+    if existing is not None:
+        if existing[0] != key_id:
+            raise ValueError(
+                f"membership conflict: pool {pool_id} user {user_id} already "
+                f"bound to {existing[0]}, refusing to bind {key_id}")
+        return  # same key: idempotent no-op
     conn.execute(
-        "INSERT OR IGNORE INTO pool_memberships (pool_id, discord_user_id, key_id)"
-        " VALUES (?,?,?)", (pool_id, str(discord_user_id), str(key_id)))
+        "INSERT INTO pool_memberships (pool_id, discord_user_id, key_id)"
+        " VALUES (?,?,?)", (pool_id, user_id, key_id))
     conn.commit()
+
+
+MembershipConflict = ValueError  # testable alias (plain ValueError semantics)
 
 
 def lookup_membership_key(conn, discord_user_id, pool_id=None):
     """Bound key_id for a Discord user from ``pool_memberships``, or None.
 
     One pool per gateway, so ``pool_id`` is optional; when given it narrows
-    the lookup to that pool.
+    the lookup to that pool. DB errors propagate (no silent swallow —
+    a failed lookup must never masquerade as "unbound" and trigger a
+    fallback path).
     """
     if discord_user_id is None:
         return None
-    try:
-        if pool_id is not None:
-            row = conn.execute(
-                "SELECT key_id FROM pool_memberships WHERE pool_id=? AND discord_user_id=?",
-                (pool_id, str(discord_user_id))).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT key_id FROM pool_memberships WHERE discord_user_id=?",
-                (str(discord_user_id),)).fetchone()
-    except Exception:
-        return None
+    if pool_id is not None:
+        row = conn.execute(
+            "SELECT key_id FROM pool_memberships WHERE pool_id=? AND discord_user_id=?",
+            (pool_id, str(discord_user_id))).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT key_id FROM pool_memberships WHERE discord_user_id=?",
+            (str(discord_user_id),)).fetchone()
     return row[0] if row else None
 
 

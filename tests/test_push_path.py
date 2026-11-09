@@ -17,7 +17,7 @@ from nacl.encoding import RawEncoder
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from identity import ensure_identity
-from ledger import FROZEN_MESSAGE, add_member, init_ledger, sync_whitelist
+from ledger import FROZEN_MESSAGE, add_member, bind_membership, init_ledger, sync_whitelist
 from tickets import PoolService
 from transport import FakeTransport
 
@@ -30,12 +30,14 @@ REPO = "demo"
 
 def _whitelist(conn, pool_id, user_id, ident):
     """Phase 1 stand-in for the removed invite method: authorize the
-    Discord id via the whitelist sync and register the crypto member.
-    Key attribution binds on the user's first claim."""
+    Discord id via the whitelist sync, register the crypto member, and
+    bind the Discord id to the member key (the enrollment-time binding
+    enroll_member performs in production)."""
     sync_whitelist(conn, pool_id, [user_id])
     add_member(conn, pool_id, ident.key_id, role="member",
                box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex(),
                verify_pubkey_hex=ident.verify_key.encode(RawEncoder).hex())
+    bind_membership(conn, pool_id, user_id, ident.key_id)
 
 
 def memdb():

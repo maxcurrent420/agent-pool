@@ -126,3 +126,26 @@ def test_state_migration_idempotent():
     tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "remote_repos" in tables
     assert "pool_chats" not in tables
+
+
+class TestBindMembership:
+    """Task 1: binding is explicit and immutable — a conflicting re-bind
+    hard-fails; same-key re-bind is an idempotent no-op."""
+
+    def test_fresh_bind_inserts(self, conn):
+        from ledger import bind_membership, lookup_membership_key
+        bind_membership(conn, "pool-1", "user-1", "agent:alice")
+        assert lookup_membership_key(conn, "user-1", pool_id="pool-1") == "agent:alice"
+
+    def test_same_key_rebind_is_noop(self, conn):
+        from ledger import bind_membership, lookup_membership_key
+        bind_membership(conn, "pool-1", "user-1", "agent:alice")
+        bind_membership(conn, "pool-1", "user-1", "agent:alice")  # no raise
+        assert lookup_membership_key(conn, "user-1", pool_id="pool-1") == "agent:alice"
+
+    def test_conflicting_rebind_raises_and_first_binding_unchanged(self, conn):
+        from ledger import bind_membership, lookup_membership_key
+        bind_membership(conn, "pool-1", "user-1", "agent:alice")
+        with pytest.raises(ValueError, match="membership conflict"):
+            bind_membership(conn, "pool-1", "user-1", "agent:bob")
+        assert lookup_membership_key(conn, "user-1", pool_id="pool-1") == "agent:alice"

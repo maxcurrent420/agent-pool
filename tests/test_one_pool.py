@@ -15,7 +15,7 @@ from nacl.signing import SigningKey
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import ledger as L
-from ledger import create_pool, init_ledger
+from ledger import bind_membership, create_pool, init_ledger
 from tickets import PoolNotLocalError, PoolService
 
 
@@ -127,8 +127,16 @@ def test_cross_gateway_interaction_unaffected():
     only maintaining/hosting verbs, not fetch/claim."""
     c, svc = world()
     ticket = svc.add_ticket("pool-1", "demo", "Work", source={"user_id": "owner-1"})
-    # Whitelist a remote agent user (Phase 1 whitelist, not owner).
+    # Whitelist a remote agent user (Phase 1 whitelist, not owner), bound
+    # to its gateway key at enrollment — with the full enrollment records
+    # (members + identities) enroll_member would have written.
     L.authorize_user(c, "pool-1", "remote-user")
+    L.bind_membership(c, "pool-1", "remote-user", "agent:remote-gateway")
+    L.add_member(c, "pool-1", "agent:remote-gateway", role="member",
+                 box_pubkey_hex="ab" * 32, verify_pubkey_hex="cd" * 32)
+    c.execute("INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, created_at)"
+              " VALUES ('agent:remote-gateway', ?, ?, 0)", ("cd" * 32, "ab" * 32))
+    c.commit()
     remote = PoolService(c, caller_key_id="agent:remote-gateway",
                          caller_signing_key=SigningKey.generate())
     fetched = remote.fetch_repo_list("pool-1", source={"user_id": "remote-user"})
@@ -204,6 +212,7 @@ def test_push_deliver_non_maintainer_refused(tmp_path):
     add_member(conn, "pool-1", member.key_id, role="member",
                box_pubkey_hex=member.box_pk.encode(RawEncoder).hex(),
                verify_pubkey_hex=member.verify_key.encode(RawEncoder).hex())
+    bind_membership(conn, "pool-1", "member-1", member.key_id)
     maint_svc.add_repo("pool-1", "demo", str(src), display_name="Demo",
                        source={"user_id": "owner-1"})
     ticket = maint_svc.add_ticket("pool-1", "demo", "Work",

@@ -18,7 +18,7 @@ from nacl.encoding import RawEncoder
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from identity import ensure_identity
-from ledger import add_member, init_ledger, sync_whitelist
+from ledger import add_member, bind_membership, init_ledger, sync_whitelist
 from tickets import PoolService
 from transport import FakeTransport, TorNotReady
 
@@ -75,6 +75,7 @@ def _world(tmp_path):
     add_member(conn, POOL, member.key_id, role="member",
                box_pubkey_hex=member.box_pk.encode(RawEncoder).hex(),
                verify_pubkey_hex=member.verify_key.encode(RawEncoder).hex())
+    bind_membership(conn, POOL, MEMBER_USER, member.key_id)
     src = _git_src(tmp_path / "src")
     maint_svc.add_repo(POOL, REPO, str(src), display_name="Demo",
                        source={"user_id": OWNER})

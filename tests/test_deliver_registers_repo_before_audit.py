@@ -29,7 +29,7 @@ from nacl.signing import SigningKey
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from identity import ensure_identity
-from ledger import add_member, init_ledger, sync_whitelist
+from ledger import add_member, bind_membership, init_ledger, sync_whitelist
 from tickets import PoolService
 from transport import FakeTransport
 
@@ -95,6 +95,7 @@ def world(tmp_path, foreign_keys=True, add_repo_step=False):
     add_member(conn, POOL, member.key_id, role="member",
                box_pubkey_hex=member.box_pk.encode(RawEncoder).hex(),
                verify_pubkey_hex=member.verify_key.encode(RawEncoder).hex())
+    bind_membership(conn, POOL, MEMBER_USER, member.key_id)
     src = _git_src(tmp_path / "src")
     if add_repo_step:
         maint_svc.add_repo(POOL, REPO, str(src), display_name="Demo",

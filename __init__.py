@@ -284,6 +284,20 @@ def _maintainer_discord_user_id(ctx):
     return str(cfg).strip() if cfg else ""
 
 
+def _maintainer_bot_discord_user_id(ctx):
+    """Resolve maintainer BOT Discord id: env beats config.
+
+    Source order: ``AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID`` when
+    non-empty, else the ``maintainer_bot_discord_user_id`` config key.
+    Configuration resolution only — registration hard-fails when empty.
+    """
+    env = _env_get("AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID", "")
+    if env.strip():
+        return env.strip()
+    cfg = _cfg(ctx, "maintainer_bot_discord_user_id", "") if ctx else ""
+    return str(cfg).strip() if cfg else ""
+
+
 def _service_for(ctx, source=None):
     """Build a PoolService from the plugin context. Raises with a clear msg."""
     try:
@@ -355,6 +369,7 @@ def _service_for(ctx, source=None):
                        transport_overrides=overrides,
                        agent_task_allocations=agent_task_allocations,
                        maintainer_discord_user_id=_maintainer_discord_user_id(ctx),
+                       maintainer_bot_discord_user_id=_maintainer_bot_discord_user_id(ctx),
                        clamd_socket=_cfg(ctx, "clamd_socket", "/run/clamav/clamd.ctl") if ctx else "/run/clamav/clamd.ctl",
                        auto_provision=_cfg(ctx, "auto_provision", True) if ctx else True)
 
@@ -458,23 +473,29 @@ def _handle_pool(ctx, raw: str, *, source=None, session_id="", session_key="", p
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             out = svc.register_pool(pool_id, opts.get("name", pool_id),
                                     source=source,
-                                    maintainer_discord_user_id=getattr(svc, "_maintainer_discord_user_id", ""))
+                                    maintainer_discord_user_id=getattr(svc, "_maintainer_discord_user_id", ""),
+                                    maintainer_bot_discord_user_id=getattr(svc, "_maintainer_bot_discord_user_id", ""))
         elif sub == "members":
             pool_id = rest[0] if rest else opts.get("pool_id", "")
             if "enroll" in opts:
                 # /pool members --enroll <key_id> <box_hex> <verify_hex>
-                # (owner-only; public key material, safe over Discord).
+                # --discord-user <id>  (owner-only; public key material,
+                # safe over Discord). The Discord id is REQUIRED and is
+                # bound to the enrolled key at enrollment — no inference.
                 key_id = opts.get("enroll", "")
                 box_hex = rest[0] if len(rest) > 0 else opts.get("box", "")
                 verify_hex = rest[1] if len(rest) > 1 else opts.get("verify", "")
-                if not key_id or not box_hex or not verify_hex:
+                discord_user_id = opts.get("discord_user", "")
+                if not key_id or not box_hex or not verify_hex or not discord_user_id:
                     return _result({"ok": False,
                                     "error": "usage: /pool members --enroll "
                                              "<key_id> <box_pubkey_hex> "
-                                             "<verify_pubkey_hex>"})
+                                             "<verify_pubkey_hex> "
+                                             "--discord-user <discord_user_id>"})
                 out = svc.enroll_member(
                     opts.get("pool") or opts.get("pool_id") or None,
-                    key_id, box_hex, verify_hex, source=source)
+                    key_id, box_hex, verify_hex,
+                    discord_user_id=discord_user_id, source=source)
             elif "mykeys" in flags or "mykeys" in opts:
                 # Any gateway: print this gateway's public key material
                 # for enrollment on the pool maintainer.

@@ -26,7 +26,7 @@ from nacl.encoding import RawEncoder
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from identity import ensure_identity
-from ledger import ClaimRefused, add_member, init_ledger, sync_whitelist
+from ledger import ClaimRefused, add_member, bind_membership, init_ledger, sync_whitelist
 from tickets import PoolService
 from transport import FakeTransport
 
@@ -55,10 +55,13 @@ def _insert_identity(conn, ident):
 
 
 def _whitelist(conn, pool_id, user_id, ident):
+    """Enrolled-member stand-in: authorize + crypto member + the
+    enrollment-time Discord-id binding (enroll_member in production)."""
     sync_whitelist(conn, pool_id, [user_id])
     add_member(conn, pool_id, ident.key_id, role="member",
                box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex(),
                verify_pubkey_hex=ident.verify_key.encode(RawEncoder).hex())
+    bind_membership(conn, pool_id, user_id, ident.key_id)
 
 
 def _git_src(path: Path) -> Path:

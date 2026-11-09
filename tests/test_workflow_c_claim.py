@@ -94,7 +94,7 @@ def test_claim_reply_carries_tor_link_and_manifest(tmp_path):
     assert keys["key_id"] == w["contrib"].key_id
     enrolled = w["maint_svc"].enroll_member(
         POOL, keys["key_id"], keys["box_pubkey_hex"], keys["verify_key_hex"],
-        source={"user_id": OWNER})
+        discord_user_id=MEMBER_USER, source={"user_id": OWNER})
     assert enrolled["ok"] is True
     assert enrolled["rewrapped_repos"] == [REPO]
     # Rewrap gave the new member a DEK entry for the accepted version.
@@ -102,8 +102,12 @@ def test_claim_reply_carries_tor_link_and_manifest(tmp_path):
     manifest = get_latest_accepted_manifest(w["conn"], REPO)
     assert w["contrib"].key_id in manifest["wrapped_keys"]
 
-    claim = w["maint_svc"].claim(w["ticket_id"],
-                                 source={"user_id": MEMBER_USER})
+    # The contributor claims through its OWN gateway (its enrolled key);
+    # the maintainer gateway never presents its key for a contributor —
+    # enrollment bound MEMBER_USER -> contributor key, and the gateway
+    # identity is not a fallback.
+    claim = w["contrib_svc"].claim(w["ticket_id"],
+                                   source={"user_id": MEMBER_USER})
     assert claim["transfer_ticket"], "claim reply must carry the Tor link"
     assert claim["manifest_hash"]
     assert claim["repo_id"] == REPO
@@ -188,3 +192,63 @@ def test_registered_equals_declared_for_changed_surfaces():
         "pool", "fetch", "task", "add-repo", "task_add", "task_list",
         "claim", "release", "push", "audit"}
     assert set(ctx.tools) == {"pool_status", "pool_report_usage"}
+
+
+# --- Task 4: bound-key-only claim, unbound non-maintainer hard-fails --------
+
+def _enroll_contrib(w):
+    keys = w["contrib_svc"].my_keys()
+    return w["maint_svc"].enroll_member(
+        POOL, keys["key_id"], keys["box_pubkey_hex"], keys["verify_key_hex"],
+        discord_user_id=MEMBER_USER, source={"user_id": OWNER})
+
+
+def test_maintainer_gateway_cannot_claim_for_unbound_contributor(tmp_path):
+    """The live defect (A1): maintainer gateway + contributor Discord id +
+    no key_id must HARD FAIL — never bind the contributor to the
+    maintainer's key."""
+    w = world(tmp_path)
+    # MEMBER_USER is whitelisted by world() but has NO binding.
+    assert w["conn"].execute(
+        "SELECT key_id FROM pool_memberships WHERE discord_user_id=?",
+        (MEMBER_USER,)).fetchone() is None
+    with pytest.raises(PermissionError, match="has no bound key"):
+        w["maint_svc"].claim(w["ticket_id"], source={"user_id": MEMBER_USER})
+    # Nothing was bound and nothing was claimed.
+    assert w["conn"].execute(
+        "SELECT key_id FROM pool_memberships WHERE discord_user_id=?",
+        (MEMBER_USER,)).fetchone() is None
+    assert w["conn"].execute(
+        "SELECT state FROM tickets WHERE ticket_id=?",
+        (w["ticket_id"],)).fetchone()[0] == "open"
+
+
+def test_bound_contributor_claims_with_own_key(tmp_path):
+    w = world(tmp_path)
+    _enroll_contrib(w)
+    w["contrib_svc"].claim(w["ticket_id"], source={"user_id": MEMBER_USER})
+    ticket = w["conn"].execute(
+        "SELECT claimant_key_id FROM tickets WHERE ticket_id=?",
+        (w["ticket_id"],)).fetchone()
+    assert ticket[0] == w["contrib"].key_id
+    claim = w["conn"].execute(
+        "SELECT key_id FROM claims WHERE ticket_id=?",
+        (w["ticket_id"],)).fetchone()
+    assert claim[0] == w["contrib"].key_id
+
+
+def test_maintainer_id_claims_with_gateway_key(tmp_path):
+    w = world(tmp_path)
+    w["maint_svc"].claim(w["ticket_id"], source={"user_id": OWNER})
+    ticket = w["conn"].execute(
+        "SELECT claimant_key_id FROM tickets WHERE ticket_id=?",
+        (w["ticket_id"],)).fetchone()
+    assert ticket[0] == w["maint_svc"]._caller_key_id
+
+
+def test_bound_user_presenting_different_key_refused(tmp_path):
+    w = world(tmp_path)
+    _enroll_contrib(w)
+    with pytest.raises(PermissionError):
+        w["contrib_svc"].claim(w["ticket_id"], key_id="agent:other-key",
+                               source={"user_id": MEMBER_USER})

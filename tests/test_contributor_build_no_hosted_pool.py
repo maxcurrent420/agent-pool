@@ -60,6 +60,7 @@ def world(tmp_path):
         POOL, contrib.key_id,
         contrib.box_pk.encode(RawEncoder).hex(),
         contrib.verify_key.encode(RawEncoder).hex(),
+        discord_user_id="contrib-user",
         source={"user_id": OWNER})
 
     # Contributor ledger: separate DB, NO hosted pool.

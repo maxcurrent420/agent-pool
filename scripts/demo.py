@@ -46,8 +46,8 @@ from nacl.encoding import RawEncoder
 
 from crypto import manifest_hash, verify_chain
 from identity import ensure_identity
-from ledger import (add_member, get_latest_accepted_manifest, init_ledger,
-                    sync_whitelist)
+from ledger import (add_member, bind_membership, get_latest_accepted_manifest,
+                    init_ledger, sync_whitelist)
 from propagation import _verify_key
 from tickets import PoolService
 from transport import FakeTransport, RealSendHermesTransport
@@ -91,8 +91,11 @@ def main():
                                  worktree_root=str(tmp / "worktrees"))
 
         # 1. register pool: the maintainer IS this gateway's identity.
+        # Registration binds the maintainer user id AND the maintainer
+        # bot id to the gateway key (both are the maintainer identity).
         registered = maint_svc.register_pool(
-            "demo-pool", "Demo Team", maintainer_discord_user_id="demo-owner")
+            "demo-pool", "Demo Team", maintainer_discord_user_id="demo-owner",
+            maintainer_bot_discord_user_id="demo-maint-bot")
         assert registered["maintainer"] == maint.key_id, registered
         assert registered["owner_discord_user_id"] == "demo-owner", registered
         # Whitelist the worker through the env/config whitelist path
@@ -102,6 +105,9 @@ def main():
         add_member(conn, "demo-pool", worker.key_id, role="member",
                    box_pubkey_hex=worker.box_pk.encode(RawEncoder).hex(),
                    verify_pubkey_hex=worker.verify_key.encode(RawEncoder).hex())
+        # Enrollment binds the worker's Discord id to the worker key
+        # (enroll_member in production); claim never binds.
+        bind_membership(conn, "demo-pool", "demo-worker", worker.key_id)
         print(f"[{time.time()-t0:5.1f}s] pool registered: maintainer == gateway "
               f"identity; whitelist + member added for the worker")
 

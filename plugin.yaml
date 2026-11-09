@@ -27,6 +27,7 @@ python_dependencies:
 requires_env:
   - AGENT_POOL_ALLOWED_USERS
   - AGENT_POOL_MAINTAINER_DISCORD_USER_ID
+  - AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID
   - AGENT_POOL_TASK_ALLOCATIONS
   - AGENT_POOL_WORKTREE_ROOT
   - AGENT_POOL_DATA_DIR
@@ -110,6 +111,10 @@ config_schema:
     type: str
     default: ""
     description: "Discord user id of the pool maintainer/owner for the gateway's hosted pool. Required to register a pool; used as the owner on /pool register. Env AGENT_POOL_MAINTAINER_DISCORD_USER_ID (or reuse of the gateway allowlist's single owner) wins when set."
+  maintainer_bot_discord_user_id:
+    type: str
+    default: ""
+    description: "Discord user id of the maintainer gateway BOT itself (the bot account that runs the pool). Required to register a pool: at registration BOTH this bot id and maintainer_discord_user_id are bound to the gateway (maintainer) key in pool_memberships — the only two identities that ever resolve to the gateway key. Env AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID wins when set."
   transport:
     type: str
     default: "real"

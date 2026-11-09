@@ -52,3 +52,8 @@ sys.modules.setdefault("plugins.plugin_storage", _storage)
 def _isolated_agent_pool_data_dir(tmp_path, monkeypatch):
     """Per-test isolated storage dir (per-profile ledger isolation)."""
     monkeypatch.setenv("AGENT_POOL_DATA_DIR", str(tmp_path / "agent-pool-data"))
+    # Registration hard-fails without a maintainer bot Discord id
+    # (config resolution, Task 2). The suite runs with one configured,
+    # exactly like a real deployment; tests that exercise the missing-id
+    # hard-fail delenv it explicitly.
+    monkeypatch.setenv("AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID", "maint-bot-1")

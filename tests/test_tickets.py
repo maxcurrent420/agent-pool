@@ -168,7 +168,8 @@ def _service(conn, gateway=None, ident=None, transport=None):
     return PoolService(conn, transport or FakeTransport(),
                        caller_key_id=ident.key_id,
                        caller_signing_key=ident.signing_key,
-                       caller_box_sk=ident.box_sk)
+                       caller_box_sk=ident.box_sk,
+                       maintainer_discord_user_id=OWNER)
 
 
 def test_ticket_creation_thread_and_state_marker(conn, tmp_path):
@@ -207,9 +208,15 @@ def test_full_flow_claim_fetch_complete(tmp_path):
     conn.commit()
     maint_svc = _service(conn, gateway, maint, transport)
     work_svc = _service(conn, gateway, contrib, transport)
+    # The contributor drives its OWN Discord user (distinct from the
+    # owner), authorized + bound to the contributor key at enrollment.
+    from ledger import authorize_user, bind_membership
+    authorize_user(conn, "pool-1", "contrib-1")
+    bind_membership(conn, "pool-1", "contrib-1", contrib.key_id)
+    contrib_src = {"user_id": "contrib-1"}
 
     ticket = maint_svc.add_ticket("pool-1", "demo", "Add hello", brief="Scope: hello.txt", source=SRC)
-    claimed = work_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"], source=SRC)
+    claimed = work_svc.claim(ticket["ticket_id"], declared_paths=["hello.txt"], source=contrib_src)
     assert claimed["state"] == "active"
     assert "start" not in claimed  # Phase 2: claim no longer returns a 'start' key
 
@@ -225,21 +232,21 @@ def test_full_flow_claim_fetch_complete(tmp_path):
     added = maint_svc.add_repo("pool-1", "demo", str(src), source=SRC)
     assert added["ok"] and added["version"] == 1 and added["state"] == "accepted"
 
-    fetched = work_svc.fetch_repo("demo", source=SRC)
+    fetched = work_svc.fetch_repo("demo", source=contrib_src)
     assert fetched["ok"] and fetched["repo_id"] == "demo"
     manifest = json.loads(fetched["manifest_json"])
     assert manifest["repo_id"] == "demo" and manifest["version"] == 1
     assert fetched["manifest_hash"] and "transfer_ticket" in fetched
 
-    completed = work_svc.complete(ticket["ticket_id"], source=SRC)
+    completed = work_svc.complete(ticket["ticket_id"], source=contrib_src)
     assert completed["state"] == "completed"
     assert get_ticket(conn, ticket["ticket_id"])["state"] == "completed"
 
-    tasks = work_svc.fetch_task_list(source=SRC)
+    tasks = work_svc.fetch_task_list(source=contrib_src)
     assert tasks["ok"]
     assert ticket["ticket_id"] not in [t["ticket_id"] for t in tasks["tasks"]]
 
-    repos = work_svc.fetch_repo_list(source=SRC)
+    repos = work_svc.fetch_repo_list(source=contrib_src)
     assert repos["ok"]
     demo = [r for r in repos["repos"] if r["repo_id"] == "demo"]
     assert demo and demo[0]["accepted_version"] == 1

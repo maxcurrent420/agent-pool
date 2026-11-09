@@ -1,15 +1,15 @@
 """Whitelist authorization matrix (2109 Phase 4, per the plan).
 
-Owner registers -> a friend is on the env/config whitelist -> friend
-claims/submits (first claim binds their key) -> a non-whitelisted user
-is refused -> the friend's freeze is refused. Authorization is the
-whitelisted Discord user id only; keys are crypto-only.
+Owner registers -> a friend is enrolled (whitelist + member + binding)
+-> friend claims/submits -> a non-whitelisted user is refused -> the
+friend's freeze is refused. Authorization is the whitelisted Discord user
+id only; keys are crypto-only.
 
 There is no invite command: membership comes from the whitelist
 (env ``AGENT_POOL_ALLOWED_USERS`` / config ``allowed_users``), synced
 into ``pool_authorized`` by ``ledger.sync_whitelist``, and key
-attribution comes from first-claim binding in ``pool_memberships``.
-
+attribution comes from the enrollment-time binding in
+``pool_memberships`` (claim never binds anything).
 Also asserts the plan's construction gate: no authorisation path reads
 ``identities`` or ``members`` for a decision.
 """
@@ -40,11 +40,11 @@ def memdb():
 
 
 def whitelist_member(conn, pool_id, user_id, ident=None):
-    """Whitelist a user the Phase 1 way (no invite command exists):
-
-    ``sync_whitelist`` authorizes the Discord id; ``add_member`` registers
-    the crypto member so DEK wrapping / propagator paths see them. Key
-    attribution is NOT set here — it binds on the user's first claim.
+    """Enroll a user the production way (no invite command exists):
+    ``sync_whitelist`` authorizes the Discord id, ``add_member`` registers
+    the crypto member (so DEK wrapping / propagator paths see them), and
+    ``bind_membership`` binds the Discord id to the key — the
+    enrollment-time binding enroll_member performs in production.
     """
     import ledger as L
     L.sync_whitelist(conn, "pool-1", [user_id])
@@ -52,6 +52,7 @@ def whitelist_member(conn, pool_id, user_id, ident=None):
         L.add_member(conn, pool_id, ident.key_id, role="member",
                      box_pubkey_hex=ident.box_pk.encode(RawEncoder).hex(),
                      verify_pubkey_hex=ident.verify_key.encode(RawEncoder).hex())
+        L.bind_membership(conn, pool_id, user_id, ident.key_id)
 
 
 def world(tmp_path):
@@ -235,17 +236,19 @@ def test_frozen_blocks_every_user_except_owner_unfreeze(tmp_path):
                           source=src(OWNER))["ticket_id"]
 
 
-# --- Phase 1: env/config whitelist + first-claim key binding -----------------
+# --- env/config whitelist + enrollment-time key binding ---------------------
 
 def test_whitelist_first_claim_binds_key(tmp_path):
-    """Whitelisted user with no bound key: first claim binds the presented key."""
+    """Enrolled user: the enrollment binding maps their Discord id to
+    their key, and the first claim attributes to that bound key."""
     conn, svc, friend_svc, maint, friend = world(tmp_path)
-    # Nothing bound before any claim.
-    assert friend_svc._whitelist_bound_key("pool-1", src(FRIEND)) is None
+    # Bound at enrollment (setup), before any claim.
+    assert friend_svc._whitelist_bound_key("pool-1", src(FRIEND)) == friend.key_id
     ticket = svc.add_ticket("pool-1", "demo", "Work", source=src(OWNER))
     claim = friend_svc.claim(ticket["ticket_id"], source=src(FRIEND))
     assert claim["state"] == "active"
-    # The friend's gateway key is now bound to their Discord id.
+    assert claim["key_id"] == friend.key_id
+    # The claim did not create or change any binding.
     assert friend_svc._whitelist_bound_key("pool-1", src(FRIEND)) == friend.key_id
     row = conn.execute(
         "SELECT key_id FROM pool_memberships WHERE pool_id='pool-1' AND discord_user_id=?",
@@ -254,7 +257,7 @@ def test_whitelist_first_claim_binds_key(tmp_path):
 
 
 def test_whitelist_subsequent_reuses_key(tmp_path):
-    """After first-claim binding, later claims reuse the bound key."""
+    """Later claims reuse the enrollment-bound key."""
     conn, svc, friend_svc, maint, friend = world(tmp_path)
     t1 = svc.add_ticket("pool-1", "demo", "Work 1", source=src(OWNER))
     t2 = svc.add_ticket("pool-1", "demo", "Work 2", source=src(OWNER))
@@ -271,12 +274,12 @@ def test_whitelist_subsequent_reuses_key(tmp_path):
 
 DIFFERENT_KEY_MESSAGE = (
     "claim refused: user {user} already bound to key {bound} on pool {pool} — "
-    "presented key {presented} differs; first-claim binding is permanent")
+    "presented key {presented} differs; a bound key is immutable")
 
 
 def test_whitelist_different_key_refused(tmp_path):
-    """A whitelisted user presenting a different key than the bound one is
-    refused with the exact decided message (binding is permanent)."""
+    """An enrolled user presenting a different key than the bound one is
+    refused with the exact message (binding is immutable)."""
     conn, svc, friend_svc, maint, friend = world(tmp_path)
     t1 = svc.add_ticket("pool-1", "demo", "Work 1", source=src(OWNER))
     t2 = svc.add_ticket("pool-1", "demo", "Work 2", source=src(OWNER))
@@ -300,11 +303,12 @@ def test_empty_whitelist_refuses(tmp_path):
                       caller_signing_key=maint.signing_key, caller_box_sk=maint.box_sk)
     svc.register_pool("pool-1", "Team", maintainer_discord_user_id=OWNER)
     import ledger as L
-    # Syncing an empty whitelist authorizes nobody beyond the owner.
+    # Syncing an empty whitelist authorizes nobody beyond the owner and
+    # the maintainer bot (both whitelisted at registration).
     L.sync_whitelist(conn, "pool-1", [])
     authorized = [r[0] for r in conn.execute(
         "SELECT discord_user_id FROM pool_authorized WHERE pool_id='pool-1'").fetchall()]
-    assert authorized == [OWNER]
+    assert set(authorized) == {OWNER, "maint-bot-1"}
     ticket = svc.add_ticket("pool-1", "demo", "Work", source=src(OWNER))
     stranger = PoolService(conn, FakeTransport(), caller_key_id="agent:stranger",
                            caller_signing_key=SigningKey.generate())
@@ -363,3 +367,65 @@ def test_whitelist_env_wins_over_config(monkeypatch):
     monkeypatch.delenv("AGENT_POOL_ALLOWED_USERS")
     assert plugin._whitelist_user_ids(Ctx({"allowed_users": ["cfg-user-1"]})) == ["cfg-user-1"]
     assert plugin._whitelist_user_ids(Ctx({})) == []
+
+
+# --- Task 5: attribution via _acting_key — no gateway fallback --------------
+
+def _claimed_world(tmp_path):
+    conn, svc, friend_svc, maint, friend = world(tmp_path)
+    ticket = svc.add_ticket("pool-1", "demo", "Work", source=src(OWNER))
+    friend_svc.claim(ticket["ticket_id"], source=src(FRIEND))
+    return conn, svc, friend_svc, maint, friend, ticket
+
+
+def test_unbound_user_release_hard_fails_no_bound_key(tmp_path):
+    conn, svc, friend_svc, maint, friend, ticket = _claimed_world(tmp_path)
+    import ledger as L
+    L.authorize_user(conn, "pool-1", STRANGER)  # authorized but UNBOUND
+    with pytest.raises(PermissionError, match="no bound key"):
+        friend_svc.release(ticket["ticket_id"], source=src(STRANGER))
+    # The ticket is untouched (still claimed by the friend).
+    assert conn.execute(
+        "SELECT claimant_key_id FROM tickets WHERE ticket_id=?",
+        (ticket["ticket_id"],)).fetchone()[0] == friend.key_id
+
+
+def test_unbound_user_complete_hard_fails_no_bound_key(tmp_path):
+    conn, svc, friend_svc, maint, friend, ticket = _claimed_world(tmp_path)
+    import ledger as L
+    L.authorize_user(conn, "pool-1", STRANGER)
+    with pytest.raises(PermissionError, match="no bound key"):
+        friend_svc.complete(ticket["ticket_id"], source=src(STRANGER))
+
+
+def test_unbound_user_push_repo_hard_fails_no_bound_key(tmp_path):
+    conn, svc, friend_svc, maint, friend, ticket = _claimed_world(tmp_path)
+    import ledger as L
+    L.authorize_user(conn, "pool-1", STRANGER)
+    with pytest.raises(PermissionError, match="no bound key"):
+        friend_svc.push_repo("demo", ticket["ticket_id"], source=src(STRANGER))
+
+
+def test_bound_contributor_release_complete_use_bound_key(tmp_path):
+    conn, svc, friend_svc, maint, friend, ticket = _claimed_world(tmp_path)
+    out = friend_svc.release(ticket["ticket_id"], source=src(FRIEND))
+    assert out["state"] == "open"
+    friend_svc.claim(ticket["ticket_id"], source=src(FRIEND))
+    done = friend_svc.complete(ticket["ticket_id"], source=src(FRIEND))
+    assert done["state"] == "completed"
+
+
+def test_bound_contributor_wrong_key_release_refused(tmp_path):
+    conn, svc, friend_svc, maint, friend, ticket = _claimed_world(tmp_path)
+    with pytest.raises(PermissionError, match="already bound"):
+        friend_svc.release(ticket["ticket_id"], key_id="agent:other-key",
+                           source=src(FRIEND))
+
+
+def test_maintainer_path_release_complete_still_work(tmp_path):
+    conn, svc, friend_svc, maint, friend = world(tmp_path)
+    ticket = svc.add_ticket("pool-1", "demo", "Work", source=src(OWNER))
+    svc.claim(ticket["ticket_id"], source=src(OWNER))
+    assert svc.release(ticket["ticket_id"], source=src(OWNER))["state"] == "open"
+    svc.claim(ticket["ticket_id"], source=src(OWNER))
+    assert svc.complete(ticket["ticket_id"], source=src(OWNER))["state"] == "completed"

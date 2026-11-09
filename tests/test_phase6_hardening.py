@@ -81,10 +81,13 @@ class _World:
         self.extra = ensure_identity(self.tmp / "x")
         create_pool(self.conn, "pool-1", "Team", self.maint.key_id, relay_url="off",
                     owner_discord_user_id=OWNER)
-        # First-claim key binding is per Discord user: each service key
-        # drives its own whitelisted user.
+        # Enrollment binding is per Discord user: each service key drives
+        # its own bound whitelisted user (bind at enrollment, not claim).
         authorize_user(self.conn, "pool-1", CONTRIB)
         authorize_user(self.conn, "pool-1", MEMBER)
+        from ledger import bind_membership as _bind
+        _bind(self.conn, "pool-1", CONTRIB, self.contrib.key_id)
+        _bind(self.conn, "pool-1", MEMBER, self.member.key_id)
         self.conn.execute(
             "INSERT INTO repos (repo_id, pool_id, name, created_at) VALUES ('demo','pool-1','Demo',0)")
         for ident, role in ((self.maint, "maintainer"), (self.contrib, "member"),

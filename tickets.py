@@ -101,7 +101,8 @@ class PoolService:
                  caller_box_sk=None, budget_defaults=None, pool_resolver=None,
                  gateway=None, transport_overrides=None,
                  agent_task_allocations=None, worktree_root=None,
-                 maintainer_discord_user_id=None, clamd_socket="",
+                 maintainer_discord_user_id=None, maintainer_bot_discord_user_id=None,
+                 clamd_socket="",
                  auto_provision=True):
         # Backwards-compat: old call sites passed (conn, gateway, transport).
         # Duck-type: anything with post_notice is a legacy gateway (ignored).
@@ -143,6 +144,19 @@ class PoolService:
             self._maintainer_discord_user_id = (
                 str(maintainer_discord_user_id).strip()
                 if maintainer_discord_user_id else "")
+        # Maintainer BOT Discord id (the maintainer gateway bot's own
+        # Discord id), from config threaded in by _service_for;
+        # AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID env beats config.
+        # Config resolution only — never a user fallback: this id, like
+        # the maintainer user id, is bound to the gateway key at
+        # registration and is the only other identity that resolves to it.
+        _maint_bot_env = _env_get("AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID", "").strip()
+        if _maint_bot_env:
+            self._maintainer_bot_discord_user_id = _maint_bot_env
+        else:
+            self._maintainer_bot_discord_user_id = (
+                str(maintainer_bot_discord_user_id).strip()
+                if maintainer_bot_discord_user_id else "")
         # The agent's configured checkout root for per-ticket worktrees.
         self._worktree_root = (
             worktree_root
@@ -300,8 +314,17 @@ class PoolService:
                 key_id=m["key_id"], role=m.get("role") or "member",
                 verify_key_hex=m.get("verify_key_hex") or "",
                 box_pubkey_hex=m.get("box_pubkey_hex") or "")
-        # The local caller is a valid wrap target with its box key in memory.
+        # The local caller is a valid wrap target only when it is already
+        # in the enrollment context (an enrolled member) or IS the
+        # maintainer (the maintainer path). An unenrolled caller key is
+        # never silently added — enroll first; no fallback.
+        maintainer_id = context.get("maintainer_key_id") or ""
         if self._caller_key_id and self._caller_key_id not in members:
+            if self._caller_key_id != maintainer_id:
+                raise PoolNotLocalError(
+                    f"caller {self._caller_key_id!r} is not an enrolled "
+                    f"member of pool {pool_id!r} — enroll before building",
+                    pool_id=pool_id)
             members[self._caller_key_id] = Member(
                 key_id=self._caller_key_id, role="member",
                 verify_key_hex=self._caller_verify_key_hex(),
@@ -309,7 +332,6 @@ class PoolService:
                 box_sk=self._caller_box_sk)
         elif self._caller_key_id:
             members[self._caller_key_id].box_sk = self._caller_box_sk
-        maintainer_id = context.get("maintainer_key_id") or ""
         if maintainer_id not in members:
             raise PoolNotLocalError(
                 f"enrollment context for pool {pool_id!r} is missing the "
@@ -510,10 +532,9 @@ class PoolService:
             "SELECT verify_pubkey_hex FROM members WHERE key_id=? AND verify_pubkey_hex != '' LIMIT 1",
             "SELECT verify_key_hex FROM identities WHERE key_id=? AND verify_key_hex != '' LIMIT 1",
         ):
-            try:
-                row = self._conn.execute(sql, (key_id,)).fetchone()
-            except Exception:
-                row = None
+            # DB errors propagate: a missed recording must not silently
+            # degrade to "no key recorded" on the fetch verify path.
+            row = self._conn.execute(sql, (key_id,)).fetchone()
             if row and row[0]:
                 return row[0]
         return ""
@@ -572,7 +593,8 @@ class PoolService:
     # -- pool membership ----------------------------------------------------
 
     def register_pool(self, pool_id, name, *, relay_url="", source=None,
-                      maintainer_discord_user_id="", key_id=None) -> dict:
+                      maintainer_discord_user_id="", maintainer_bot_discord_user_id=None,
+                      key_id=None) -> dict:
         # Hard tor gate: a real transport (one with _require_tor_ready)
         # must probe tor_ready() before registration. FakeTransport
         # (test-only) has no such method and is exempt. Fail closed.
@@ -587,6 +609,16 @@ class PoolService:
             or _env_get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "").strip())
         if not discord_user_id:
             raise ValueError("register needs maintainer_discord_user_id: set it in config or AGENT_POOL_MAINTAINER_DISCORD_USER_ID")
+        # Maintainer bot Discord id: arg -> service config -> env. This is
+        # configuration resolution (rule: config resolution is allowed),
+        # not a user fallback — registration hard-fails without it.
+        bot_discord_user_id = (
+            str(maintainer_bot_discord_user_id).strip()
+            if maintainer_bot_discord_user_id else ""
+        ) or getattr(self, "_maintainer_bot_discord_user_id", "") \
+            or _env_get("AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID", "").strip()
+        if not bot_discord_user_id:
+            raise ValueError("register needs maintainer_bot_discord_user_id: set it in config or AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID")
         maintainer = key_id or self._caller_key_id
         if not maintainer:
             raise ValueError("register needs a maintainer key_id")
@@ -610,12 +642,22 @@ class PoolService:
         L.add_member(self._conn, pool_id, maintainer, role="maintainer", box_pubkey_hex=_box or "",
                      verify_pubkey_hex=_vhex or "")
         L.authorize_user(self._conn, pool_id, discord_user_id)
+        # Registration binds BOTH the maintainer Discord id and the
+        # maintainer bot's Discord id to the gateway (maintainer) key.
+        # These are the ONLY identities that ever resolve to the gateway
+        # key; every other user binds at enrollment (enroll_member).
+        # Binding is explicit and immutable (conflict = hard fail).
+        L.bind_membership(self._conn, pool_id, discord_user_id, maintainer)
+        L.bind_membership(self._conn, pool_id, bot_discord_user_id, maintainer)
+        L.authorize_user(self._conn, pool_id, bot_discord_user_id)
         L.record_event(self._conn, pool_id, "pool_registered",
                        {"pool_id": pool_id, "maintainer": maintainer,
                         "owner_discord_user_id": str(discord_user_id)})
-        # Register authorizes the owner only. Key attribution is NOT bound
-        # here: it binds on the user's first claim (pool_memberships), and
-        # the whitelist itself is synced from env/config by _service_for.
+        # Binding happens at registration (above) and at enrollment
+        # (enroll_member). There is NO first-claim binding: an unbound
+        # non-maintainer user hard-fails at claim time, and the gateway
+        # identity is never used as a substitute for anyone else's key.
+        # The whitelist itself is synced from env/config by _service_for.
         return {"ok": True, "pool_id": pool_id, "name": name, "maintainer": maintainer,
                 "owner_discord_user_id": str(discord_user_id)}
 
@@ -646,15 +688,14 @@ class PoolService:
         if pool is None:
             raise ValueError(f"unknown pool: {pool_id!r}")
         # Drop the whitelist row for the removed member's bound Discord id.
-        # Binding lives in pool_memberships (first-claim, Phase 1);
-        # identities.discord_user_id has no production writer.
-        try:
-            _row = self._conn.execute(
-                "SELECT discord_user_id FROM pool_memberships WHERE pool_id=? AND key_id=?",
-                (pool_id, key_id)).fetchone()
-            _discord_user_id = _row[0] if _row else None
-        except Exception:
-            _discord_user_id = None
+        # Binding lives in pool_memberships (registration/enrollment);
+        # identities.discord_user_id has no production writer. DB errors
+        # propagate: a failed lookup must never silently skip the
+        # deauthorization of a removed member.
+        _row = self._conn.execute(
+            "SELECT discord_user_id FROM pool_memberships WHERE pool_id=? AND key_id=?",
+            (pool_id, key_id)).fetchone()
+        _discord_user_id = _row[0] if _row else None
         removed = L.remove_member(self._conn, pool_id, key_id)
         if _discord_user_id:
             L.deauthorize_user(self._conn, pool_id, _discord_user_id)
@@ -780,21 +821,51 @@ class PoolService:
         return str(user_id) if user_id is not None else None
 
     def _whitelist_bound_key(self, pool_id=None, source=None) -> str | None:
-        """Whitelist-bound agent key for the driving Discord user (Phase 1).
+        """Whitelist-bound agent key for the driving Discord user.
 
-        Reads ``pool_memberships`` (first-claim binding). Attribution only —
-        crypto records WHO acted (overlap checks, manifests, notices). The
-        Discord id is the authorization; this lookup never decides access.
-        Returns the bound key_id, or None when unbound (callers fall back
-        to the gateway identity).
+        Reads ``pool_memberships`` (bound at registration for the
+        maintainer/bot ids, at enrollment for contributors). Attribution
+        only — crypto records WHO acted (overlap checks, manifests,
+        notices). The Discord id is the authorization; this lookup never
+        decides access. Returns the bound key_id, or None when unbound
+        (callers hard-fail for non-maintainer users; the gateway key is
+        never substituted).
         """
         user_id = self._discord_user(source)
         if user_id is None:
             return None
-        try:
-            return L.lookup_membership_key(self._conn, user_id, pool_id=pool_id)
-        except Exception:
-            return None
+        return L.lookup_membership_key(self._conn, user_id, pool_id=pool_id)
+
+    def _maintainer_ids(self) -> set:
+        """Discord ids that resolve to the gateway (maintainer) key: the
+        maintainer user id and the maintainer bot's id. Config resolution
+        only — these are the only two identities in this set, ever."""
+        ids = {getattr(self, "_maintainer_discord_user_id", ""),
+               getattr(self, "_maintainer_bot_discord_user_id", "")}
+        return {i for i in ids if i}
+
+    def _acting_key(self, pool_id, source, key_id=None) -> str:
+        """Bound key of the acting user. HARD FAIL when unbound and not
+        the maintainer/bot — never returns the gateway key for anyone
+        else. Attribution in release/complete/push/add-repo flows
+        resolves through here."""
+        user_id = self._discord_user(source)
+        bound = self._whitelist_bound_key(pool_id, source)
+        if key_id:
+            if bound and key_id != bound:
+                raise PermissionError(
+                    f"user {user_id} already bound to key {bound} on pool "
+                    f"{pool_id} — presented key {key_id} differs; "
+                    "a bound key is immutable")
+            return key_id
+        if bound:
+            return bound
+        if user_id in self._maintainer_ids():
+            return self._caller_key_id  # the maintainer path itself
+        raise PermissionError(
+            f"no bound key for user {user_id} on pool {pool_id} — bind at "
+            "registration/enrollment; the gateway identity is the "
+            "maintainer's key, never a fallback")
 
     def _caller_box_pubkey_hex(self) -> str:
         if self._caller_box_sk is None:
@@ -811,6 +882,12 @@ class PoolService:
             return self._caller_sk.verify_key.encode().hex()
         except Exception:
             return ""
+
+    def _pool_maintainer_key(self, pool_id):
+        row = self._conn.execute(
+            "SELECT maintainer_key_id FROM pools WHERE pool_id=?",
+            (pool_id,)).fetchone()
+        return row[0] if row else None
 
     def _ensure_member(self, pool_id, key_id) -> None:
         """Provision the ``members`` row for a key (DEK-wrap registry).
@@ -839,6 +916,30 @@ class PoolService:
         key_id = str(key_id or "").strip()
         if not pool_id or not key_id:
             return
+        # No-fallbacks guard: live caller-key auto-provisioning (filling
+        # box/verify material from this gateway's own key) is the
+        # MAINTAINER path only — caller == pool maintainer key. Any other
+        # key (a foreign key, or a caller key that is not the maintainer)
+        # may only be provisioned when an existing members or identities
+        # row records it — i.e. it was actually enrolled. An unknown key
+        # hard-fails; it is never silently provisioned from the gateway's
+        # own identity.
+        _is_caller_maintainer = (
+            key_id == self._caller_key_id
+            and self._pool_maintainer_key(pool_id) == key_id)
+        if not _is_caller_maintainer:
+            _has_member = self._conn.execute(
+                "SELECT 1 FROM members WHERE pool_id=? AND key_id=?",
+                (pool_id, key_id)).fetchone() is not None
+            _has_identity = self._conn.execute(
+                "SELECT 1 FROM identities WHERE key_id=?",
+                (key_id,)).fetchone() is not None
+            if not _has_member and not _has_identity:
+                raise PermissionError(
+                    f"_ensure_member refused: key {key_id!r} is not enrolled "
+                    f"on pool {pool_id!r} (no members/identities row) — "
+                    "enroll it before it can act; the gateway identity "
+                    "never provisions another key")
         existing = self._conn.execute(
             "SELECT role, box_pubkey_hex, verify_pubkey_hex FROM members"
             " WHERE pool_id=? AND key_id=?", (pool_id, key_id)).fetchone()
@@ -846,16 +947,18 @@ class PoolService:
         box = (existing[1] if existing and existing[1] else "")
         verify = (existing[2] if existing and existing[2] else "")
         if not box or not verify:
-            try:
-                irow = self._conn.execute(
-                    "SELECT box_pubkey_hex, verify_key_hex FROM identities"
-                    " WHERE key_id=?", (key_id,)).fetchone()
-            except Exception:
-                irow = None
+            # DB errors propagate: a silently-missed identities row would
+            # provision empty key material instead of failing loudly.
+            irow = self._conn.execute(
+                "SELECT box_pubkey_hex, verify_key_hex FROM identities"
+                " WHERE key_id=?", (key_id,)).fetchone()
             if irow:
                 box = box or (irow[0] or "")
                 verify = verify or (irow[1] or "")
-        if key_id == self._caller_key_id:
+        if key_id == self._caller_key_id and _is_caller_maintainer:
+            # Live caller material is the maintainer path only (guard
+            # above): a contributor caller fills from its recorded
+            # identities row, never from the gateway identity.
             box = box or self._caller_box_pubkey_hex()
             verify = verify or self._caller_verify_key_hex()
         if not role:
@@ -949,19 +1052,24 @@ class PoolService:
             raise ValueError(f"repo path is not a directory: {path!r}")
         if self._caller_sk is None:
             raise RuntimeError("add-repo needs the local signing key")
+        # Submitter attribution is the acting user's BOUND key (hard fail
+        # when unbound). add_repo is owner-gated, so in practice this is
+        # the maintainer path — but it must never silently pin to the
+        # gateway key for a non-bound user.
+        submitter_key = self._acting_key(pool_id, source)
         L.upsert_repo(self._conn, repo_id, pool_id,
                       path=str(repo_path.resolve()),
                       display_name=display_name or None,
-                      submitter_key_id=self._caller_key_id or None)
+                      submitter_key_id=submitter_key or None)
         version = L.next_repo_version(self._conn, repo_id)
-        # Persist the submitting gateway's member row so manifests
+        # Persist the submitting key's member row so manifests
         # wrap the DEK for it even if no claim has provisioned it.
-        self._ensure_member(pool_id, self._caller_key_id)
+        self._ensure_member(pool_id, submitter_key)
         prop = self._propagator(pool_id)
-        submitter = prop._members.get(self._caller_key_id)
+        submitter = prop._members.get(submitter_key)
         if submitter is None:
             raise PermissionError(
-                f"add-repo refused: caller {self._caller_key_id!r} is not a pool member")
+                f"add-repo refused: caller {submitter_key!r} is not a pool member")
         result = prop.submit(repo_path=repo_path, repo_id=repo_id, version=version,
                              submitter=submitter,
                              submitter_signing_key=self._caller_sk)
@@ -1075,19 +1183,31 @@ class PoolService:
         # Whitelist: only authorized users may claim (the Discord id is the
         # authorization; the bound key lookup is attribution, not authz).
         self._require_authorized(ticket["pool_id"], source)
-        # First-claim key binding (Phase 1): the presented key is
-        # explicit key_id, else the gateway identity. If this user already
-        # has a bound key, the presented key MUST match it — the binding is
-        # permanent; a different key is refused with the exact message
-        # below. If unbound, the presented key binds on a successful claim.
+        # Bound-key-only claim: the acting user's key comes from their
+        # registration/enrollment binding. If this user already has a
+        # bound key, the presented key MUST match it — the binding is
+        # permanent; a different key is refused. An unbound non-maintainer
+        # user HARD FAILS: binding happens only at registration
+        # (maintainer/bot ids) and enrollment (contributors) — never at
+        # claim, and never via the gateway identity.
         user_id = self._discord_user(source)
         bound = self._whitelist_bound_key(ticket["pool_id"], source)
         presented = key_id or self._caller_key_id
+        if not bound:
+            if user_id not in self._maintainer_ids():
+                raise PermissionError(
+                    f"claim refused: user {user_id} has no bound key on pool "
+                    f"{ticket['pool_id']} — bind at registration/enrollment; "
+                    "the gateway identity is the maintainer's key, never a fallback")
+            # Maintainer/bot with no row (pre-registered pool): bind to
+            # the gateway key explicitly — the maintainer path itself.
+            L.bind_membership(self._conn, ticket["pool_id"], user_id, self._caller_key_id)
+            bound = self._caller_key_id
         if bound and presented and presented != bound:
             raise PermissionError(
                 f"claim refused: user {user_id} already bound to key {bound} "
                 f"on pool {ticket['pool_id']} — presented key {presented} differs; "
-                "first-claim binding is permanent")
+                "a bound key is immutable")
         key = bound or presented
         if not key:
             raise ValueError("claim needs a claimant key_id")
@@ -1107,8 +1227,6 @@ class PoolService:
             declared_paths=declared_paths, budget=budget,
             maintainer_override=maintainer_override,
             worktree_path=worktree_path, branch=branch, base_ref=base_ref)
-        if not bound and user_id and key:
-            L.bind_membership(self._conn, ticket["pool_id"], user_id, key)
         if user_id and key:
             # Provision the crypto member row so FUTURE repo versions
             # wrap a DEK for this user's bound key. Without it the
@@ -1182,9 +1300,9 @@ class PoolService:
         if max_tasks < 1:
             raise ValueError("max_tasks must be >= 1")
         max_tasks = min(max_tasks, 10)
-        key = key_id or self._caller_key_id
-        if not key:
-            raise ValueError("claim needs a claimant key_id")
+        # No pre-computed key: each claim() resolves the acting user's
+        # bound key itself. An unbound non-maintainer hard-fails there
+        # (PermissionError propagates — it is not a per-ticket skip).
         open_tickets = self.list_tickets(pool_id=pool_id, state="open",
                                          source=source, repo_id=repo_id)
         claimed, skipped = [], []
@@ -1192,7 +1310,7 @@ class PoolService:
             if len(claimed) >= max_tasks:
                 break
             try:
-                c = self.claim(ticket["ticket_id"], key_id=key,
+                c = self.claim(ticket["ticket_id"], key_id=key_id,
                                declared_paths=[], budget=budget,
                                maintainer_override=maintainer_override, source=source)
                 claimed.append({"ticket_id": ticket["ticket_id"],
@@ -1217,9 +1335,10 @@ class PoolService:
         ticket = self.show_ticket(ticket_id)
         # Freeze is absolute: the exact message for every user.
         self._check_not_frozen(ticket["pool_id"])
-        # Whitelist: authorized-level verb.
+        # Whitelist: authorized-level verb. Attribution is the acting
+        # user's BOUND key (hard fail when unbound) — never the gateway key.
         self._require_authorized(ticket["pool_id"], source)
-        key = key_id or self._whitelist_bound_key(ticket["pool_id"], source) or self._caller_key_id
+        key = self._acting_key(ticket["pool_id"], source, key_id)
         cleanup_notice = self._active_cleanup_notice(ticket_id)
         updated = L.release_ticket(self._conn, ticket_id, key)
         notice = f"{STATE_MARKER.format(state='open')} ticket {ticket_id} released"
@@ -1237,7 +1356,7 @@ class PoolService:
         ticket = self.show_ticket(ticket_id)
         self._check_not_frozen(ticket["pool_id"])
         self._require_authorized(ticket["pool_id"], source)
-        key = key_id or self._whitelist_bound_key(ticket["pool_id"], source) or self._caller_key_id
+        key = self._acting_key(ticket["pool_id"], source, key_id)
         cleanup_notice = self._active_cleanup_notice(ticket_id)
         updated = L.complete_ticket(self._conn, ticket_id, key)
         notice = f"{STATE_MARKER.format(state='completed')} ticket {ticket_id} completed"
@@ -1275,7 +1394,7 @@ class PoolService:
             raise ValueError(
                 f"push refused: ticket {ticket_id!r} is on repo "
                 f"{ticket['repo_id']!r}, not {repo_id!r}")
-        key = self._whitelist_bound_key(resolved, source) or self._caller_key_id
+        key = self._acting_key(resolved, source)
         if ticket["state"] != "claimed" or ticket.get("claimant_key_id") != key:
             raise PermissionError(
                 f"push refused: ticket {ticket_id!r} is {ticket['state']!r} "
@@ -1334,10 +1453,20 @@ class PoolService:
                 context = self.get_pool_context()
                 resolved = context.get("pool_id") if context else None
             prop = self._contributor_propagator(resolved, context)
-        pusher = prop._members.get(self._caller_key_id)
+        # Pusher attribution: when a Discord user drives the call, the
+        # pusher is that user's BOUND key (hard fail when unbound —
+        # never the gateway key). With no Discord user (the pure
+        # agent path: the agent builds on its own gateway), the gateway's
+        # own key IS the agent's identity — there is no other user to
+        # substitute for.
+        if self._discord_user(source) is not None:
+            pusher_key = self._acting_key(resolved, source)
+        else:
+            pusher_key = self._caller_key_id
+        pusher = prop._members.get(pusher_key)
         if pusher is None:
             raise PermissionError(
-                f"push refused: caller {self._caller_key_id!r} is not a pool member")
+                f"push refused: caller {pusher_key!r} is not a pool member")
         if version is None:
             version = L.next_repo_version(self._conn, repo_id)
         result = prop.build_push_bundle(
@@ -1603,14 +1732,20 @@ class PoolService:
                 "verify_key_hex": verify_hex, "box_pubkey_hex": box_hex}
 
     def enroll_member(self, pool_id, key_id, box_pubkey_hex,
-                      verify_pubkey_hex, *, source=None) -> dict:
+                      verify_pubkey_hex, *, discord_user_id=None,
+                      source=None) -> dict:
         """Enroll a REMOTE gateway key as a real pool member (owner-only).
 
-        Public key material only (safe over Discord). After enrollment,
-        the latest accepted version of every repo is re-wrapped so the
-        new member holds a DEK entry for existing accepted versions —
-        the same rotation machinery as acceptance, keeping each
-        manifest's ``prev_manifest_hash`` and audit reference.
+        Public key material only (safe over Discord). ``discord_user_id``
+        is REQUIRED — the Discord id of the user being enrolled — and is
+        bound to the enrolled key in ``pool_memberships`` at enrollment
+        (immutable; conflict = hard fail). No inference from source, env,
+        or caller: a caller that omits it hard-fails.
+
+        After enrollment, the latest accepted version of every repo is
+        re-wrapped so the new member holds a DEK entry for existing
+        accepted versions — the same rotation machinery as acceptance,
+        keeping each manifest's ``prev_manifest_hash`` and audit reference.
         """
         resolved = self._resolve_pool(pool_id, source=source)
         self._check_not_frozen(resolved)
@@ -1628,9 +1763,16 @@ class PoolService:
                 raise ValueError(
                     f"enroll refused: {label} must be 32 bytes "
                     f"({len(raw)} given)")
+        # Enrollment binds the enrolling user's Discord id to the enrolled
+        # key — the ONLY way a contributor's identity gets a binding.
+        # Required, explicit, no inference; checked before any write so a
+        # caller that omits it hard-fails with nothing applied.
+        if not discord_user_id or not str(discord_user_id).strip():
+            raise ValueError("enroll needs the Discord user id of the member being enrolled")
         L.add_member(self._conn, resolved, key_id, role="member",
                      box_pubkey_hex=box_pubkey_hex,
                      verify_pubkey_hex=verify_pubkey_hex)
+        L.bind_membership(self._conn, resolved, str(discord_user_id).strip(), key_id)
         rewrapped = []
         prop = self._propagator(resolved)
         maintainer = prop._members.get(prop._maintainer_key_id)
@@ -2107,16 +2249,23 @@ class PoolService:
                                      verify_key_hex=row[5] or row[2] or "",
                                      box_pubkey_hex=row[3] or row[4] or "", box_sk=box_sk)
         if self._caller_key_id and self._caller_key_id not in members:
-            # The live caller identity IS a valid wrap target: it has
-            # this gateway's box key in memory. The old fallback used
-            # an EMPTY box_pubkey_hex, so submit/build_push_bundle/
-            # accept skipped wrapping for the caller and fetch
-            # refused them despite being whitelisted+bound.
-            members[self._caller_key_id] = Member(
-                key_id=self._caller_key_id, role="member",
-                verify_key_hex=self._caller_verify_key_hex(),
-                box_pubkey_hex=self._caller_box_pubkey_hex(),
-                box_sk=self._caller_box_sk)
+            # The live caller identity is a valid wrap target only on the
+            # two sanctioned paths: it IS the pool maintainer, or an
+            # identities row records it (enrolled agent). An unknown
+            # caller key is never silently added — no fallback.
+            _prow = self._conn.execute(
+                "SELECT maintainer_key_id FROM pools WHERE pool_id=?",
+                (pool_id,)).fetchone()
+            _is_maint = bool(_prow and _prow[0] == self._caller_key_id)
+            _has_ident = self._conn.execute(
+                "SELECT 1 FROM identities WHERE key_id=?",
+                (self._caller_key_id,)).fetchone() is not None
+            if _is_maint or _has_ident:
+                members[self._caller_key_id] = Member(
+                    key_id=self._caller_key_id, role="member",
+                    verify_key_hex=self._caller_verify_key_hex(),
+                    box_pubkey_hex=self._caller_box_pubkey_hex(),
+                    box_sk=self._caller_box_sk)
         return members
 
     def _propagator(self, ticket_or_pool) -> RepoPropagator:

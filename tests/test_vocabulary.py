@@ -332,11 +332,15 @@ def test_no_resolve_a_pool_in_docs():
 
 
 def test_no_discord_user_flag_in_docs_or_commands():
+    # Enrollment REQUIRES --discord-user (the Discord id of the member
+    # being enrolled, bound to the enrolled key at enrollment — no
+    # inference). The flag lives in the enroll verb only; docs describe
+    # the maintainer id via config/env, never a --discord-user flag.
     for fname in ("README.md", "docs/architecture.md", "docs/threat-model.md"):
         assert "--discord-user" not in (ROOT / fname).read_text(), fname
     init_src = (ROOT / "__init__.py").read_text()
-    assert "--discord-user" not in init_src
-    assert 'opts.get("discord_user"' not in init_src
+    assert "--discord-user" in init_src
+    assert 'opts.get("discord_user"' in init_src
 
 
 def test_no_plugin_side_discord_post():

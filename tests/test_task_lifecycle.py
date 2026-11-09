@@ -35,9 +35,16 @@ def world():
     create_pool(c, "pool-1", "Team", "agent:maint", owner_discord_user_id="owner-1")
     c.execute("INSERT INTO repos (repo_id, pool_id, name, created_at)"
               " VALUES ('demo','pool-1','Demo',0)")
+    # owner-1's bound key is agent:alice (enrollment-time binding), whose
+    # identity is recorded so member provisioning can resolve its keys.
+    L.bind_membership(c, "pool-1", "owner-1", "agent:alice")
+    c.execute("INSERT INTO identities (key_id, verify_key_hex, box_pubkey_hex, created_at)"
+              " VALUES ('agent:alice', ?, ?, 0)",
+              ("ab" * 32, "cd" * 32))
     c.commit()
     svc = PoolService(c, caller_key_id="agent:maint",
-                      caller_signing_key=SigningKey.generate())
+                      caller_signing_key=SigningKey.generate(),
+                      maintainer_discord_user_id="owner-1")
     return c, svc
 
 
@@ -53,8 +60,8 @@ def test_create_claim_release_claim_complete():
                             source={"user_id": "owner-1"}) == []
     svc.release(tid, key_id="agent:alice", source={"user_id": "owner-1"})
     assert get_ticket(c, tid)["state"] == "open"
-    # Phase 1 first-claim binding is permanent per Discord user: owner-1 is
-    # bound to agent:alice, so the re-claim/complete reuse that key.
+    # The enrollment-time binding (owner-1 -> agent:alice) is permanent:
+    # the re-claim/complete reuse that key.
     svc.claim(tid, key_id="agent:alice", declared_paths=["a.py"], source={"user_id": "owner-1"})
     done = svc.complete(tid, key_id="agent:alice", source={"user_id": "owner-1"})
     assert done["state"] == "completed"

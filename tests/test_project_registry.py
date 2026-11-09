@@ -65,10 +65,12 @@ def _world(tmp_path):
     transport = FakeTransport()
     maint_svc = PoolService(conn, transport, caller_key_id=maint.key_id,
                             caller_signing_key=maint.signing_key,
-                            caller_box_sk=maint.box_sk)
+                            caller_box_sk=maint.box_sk,
+                            maintainer_discord_user_id=OWNER)
     member_svc = PoolService(conn, transport, caller_key_id=member.key_id,
                              caller_signing_key=member.signing_key,
-                             caller_box_sk=member.box_sk)
+                             caller_box_sk=member.box_sk,
+                             maintainer_discord_user_id=OWNER)
     return conn, maint, member, maint_svc, member_svc
 
 
@@ -257,9 +259,11 @@ def test_claim_without_paths_is_whole_ticket(tmp_path):
 
 def test_whole_ticket_blocks_path_claim_and_vice_versa(tmp_path):
     conn, _maint, _member, svc, member_svc = _world(tmp_path)
-    # First-claim key binding is per Discord user: the member service
-    # presents its own key, so it drives its own whitelisted user.
+    # Enrollment binding is per Discord user: the member service drives
+    # its own bound whitelisted user.
     authorize_user(conn, "pool-1", "member-1")
+    from ledger import bind_membership as _bind
+    _bind(conn, "pool-1", "member-1", _member.key_id)
     member_src = {"user_id": "member-1"}
     t1 = svc.add_ticket("pool-1", "demo", "First", source=SRC)
     t2 = svc.add_ticket("pool-1", "demo", "Second", source=SRC)
