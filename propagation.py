@@ -557,11 +557,11 @@ class RepoPropagator:
         data dir (never in the checkout, never a retry loop): runs only
         the system steps of scripts/install-deps.sh. Returns True when a
         provisioning attempt was made (caller re-probes afterwards)."""
-        try:
-            from ledger import default_db_path
+        try:  # package import (Hermes loads plugins as a package)
+            from .ledger import default_db_path
         except ImportError:
             try:
-                from .ledger import default_db_path
+                from ledger import default_db_path
             except ImportError:
                 return False
         lockfile = default_db_path().parent / "clamav-provision.attempted"

@@ -417,12 +417,26 @@ def _result(payload, svc=None, source=None) -> str:
     return format_result(payload)
 
 
+# Only Tor failures get the Tor-readiness fix string; stamping every
+# exception with it misdiagnoses unrelated errors (e.g. a ledger
+# FOREIGN KEY IntegrityError) as Tor outages.
+_TOR_FIX = ("check pool_status for Tor readiness; if Tor is "
+            "down, start the agent-pool-tor unit and retry")
+_GENERIC_FIX = "see the error above; retry, or check pool_status if it persists"
+
+
+def _is_tor_error(exc) -> bool:
+    import re
+    text = " ".join([type(exc).__name__, str(exc)]).lower()
+    return bool(re.search(r"\btor\b", text)) or "onion" in text \
+        or "agent-pool-tor" in text
+
+
 def _error(exc) -> str:
     code = getattr(exc, "error_code", None) or "error"
     detail = getattr(exc, "detail", None) or str(exc)
     payload = {"ok": False, "code": code, "error": str(exc),
-               "fix": ("check pool_status for Tor readiness; if Tor is "
-                       "down, start the agent-pool-tor unit and retry")}
+               "fix": _TOR_FIX if _is_tor_error(exc) else _GENERIC_FIX}
     if code != "error":
         payload["error_code"] = code
         payload["detail"] = detail
@@ -871,7 +885,7 @@ def _wrap_command(handler, ctx):
     def wrapped(raw="", *, source=None, session_id="", session_key="", platform=""):
         try:
             from . import ledger as _L
-        except Exception:
+        except ImportError:
             try:
                 import ledger as _L
             except Exception:

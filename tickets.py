@@ -426,10 +426,10 @@ class PoolService:
         manifest = L.get_latest_accepted_manifest(self._conn, repo_id)
         if manifest is None:
             raise ValueError(f"no ACCEPTED version for repo {repo_id!r} to fetch")
-        try:
-            from crypto import manifest_hash as _manifest_hash
-        except Exception:
+        try:  # package import (Hermes loads plugins as a package)
             from .crypto import manifest_hash as _manifest_hash
+        except ImportError:  # flat import (pytest from repo root)
+            from crypto import manifest_hash as _manifest_hash
         out = {"ok": True, "pool_id": resolved, "repo_id": repo_id,
                "manifest_json": json.dumps(manifest, sort_keys=True),
                "manifest_hash": _manifest_hash(manifest),
@@ -472,8 +472,12 @@ class PoolService:
             raise RuntimeError("fetch refused: manifest signature does not verify")
         if not C.verify_manifest(signer_vk, manifest):
             raise RuntimeError("fetch refused: manifest signature does not verify")
-        from propagation import Member as _M
-        from propagation import RepoPropagator as _RP
+        try:  # package import (Hermes loads plugins as a package)
+            from .propagation import Member as _M
+            from .propagation import RepoPropagator as _RP
+        except ImportError:  # flat import (pytest from repo root)
+            from propagation import Member as _M
+            from propagation import RepoPropagator as _RP
         members = {self._caller_key_id: _M(key_id=self._caller_key_id, role="member",
                                            box_pubkey_hex="", box_sk=self._caller_box_sk)}
         if signer and signer not in members:
@@ -532,7 +536,9 @@ class PoolService:
 
     def _enforce_reply_guard(self, out: dict) -> None:
         """OD3: fail loudly rather than silently truncate a manifest."""
-        try:
+        try:  # package import (Hermes loads plugins as a package)
+            from .replies import MAX_CONTENT_BYTES
+        except ImportError:  # flat import (pytest from repo root)
             from replies import MAX_CONTENT_BYTES
         except Exception:
             MAX_CONTENT_BYTES = 4096
@@ -1107,7 +1113,10 @@ class PoolService:
         # instruction instead (same guard ``replies.py`` enforces).
         accepted = L.get_latest_accepted_manifest(self._conn, ticket["repo_id"])
         if accepted is not None:
-            from propagation import manifest_hash as _manifest_hash
+            try:  # package import (Hermes loads plugins as a package)
+                from .propagation import manifest_hash as _manifest_hash
+            except ImportError:  # flat import (pytest from repo root)
+                from propagation import manifest_hash as _manifest_hash
             claim["repo_id"] = ticket["repo_id"]
             claim["manifest_hash"] = _manifest_hash(accepted)
             claim["transfer_ticket"] = accepted.get("transfer_ticket", "")
@@ -1369,21 +1378,28 @@ class PoolService:
         if submitter is None:
             raise PermissionError(
                 "add-repo deliver refused: submitter is not a pool member")
-        from propagation import _verify_key
+        try:  # package import (Hermes loads plugins as a package)
+            from .propagation import _verify_key
+        except ImportError:  # flat import (pytest from repo root)
+            from propagation import _verify_key
         if not C.verify_manifest(_verify_key(submitter), manifest):
             raise RuntimeError("add-repo manifest signature does not verify")
         maintainer = prop._members.get(prop._maintainer_key_id)
         if maintainer is None:
             raise RuntimeError(
                 f"maintainer {prop._maintainer_key_id!r} is not a pool member")
-        aud = prop.audit(manifest=manifest, maintainer=maintainer)
-        report = aud["report"]
-        # Register the project row so the submitted version has a home even
-        # when the repo was never added via the --path fast path.
+        # Register the project row first so the audit insert's
+        # audits.repo_id -> repos(repo_id) FK resolves even when the repo
+        # was never added via the --path fast path.
         L.upsert_repo(self._conn, manifest["repo_id"], resolved,
                       name=manifest["repo_id"],
                       submitter_key_id=manifest.get("submitter_key_id") or None)
-        from propagation import manifest_hash as _manifest_hash
+        aud = prop.audit(manifest=manifest, maintainer=maintainer)
+        report = aud["report"]
+        try:  # package import (Hermes loads plugins as a package)
+            from .propagation import manifest_hash as _manifest_hash
+        except ImportError:  # flat import (pytest from repo root)
+            from propagation import manifest_hash as _manifest_hash
         m_hash = _manifest_hash(manifest)
         L.record_submission(self._conn, manifest["repo_id"],
                             int(manifest["version"]), m_hash,
@@ -1694,13 +1710,22 @@ class PoolService:
         if submitter is None:
             raise PermissionError(
                 "push deliver refused: submitter is not a pool member")
-        from propagation import _verify_key
+        try:  # package import (Hermes loads plugins as a package)
+            from .propagation import _verify_key
+        except ImportError:  # flat import (pytest from repo root)
+            from propagation import _verify_key
         if not C.verify_manifest(_verify_key(submitter), manifest):
             raise RuntimeError("push manifest signature does not verify")
         maintainer = prop._members.get(prop._maintainer_key_id)
         if maintainer is None:
             raise RuntimeError(
                 f"maintainer {prop._maintainer_key_id!r} is not a pool member")
+        # Register the project row first so the audit insert's
+        # audits.repo_id -> repos(repo_id) FK resolves (and the
+        # submitted-version row has a home) even when the repo row is
+        # missing. name= is omitted so an existing display name is kept.
+        L.upsert_repo(self._conn, manifest["repo_id"], resolved,
+                      submitter_key_id=manifest.get("submitter_key_id") or None)
         aud = prop.audit(manifest=manifest, maintainer=maintainer)
         report = aud["report"]
         if report.get("verdict") != "clean":
@@ -1717,7 +1742,10 @@ class PoolService:
                     "state": ticket["state"], "verdict": report.get("verdict"),
                     "report_hash": aud["report_hash"], "hits": hits,
                     "notice": notice}
-        from propagation import manifest_hash as _manifest_hash
+        try:  # package import (Hermes loads plugins as a package)
+            from .propagation import manifest_hash as _manifest_hash
+        except ImportError:  # flat import (pytest from repo root)
+            from propagation import manifest_hash as _manifest_hash
         m_hash = _manifest_hash(manifest)
         L.record_submission(self._conn, manifest["repo_id"],
                             int(manifest["version"]), m_hash,

@@ -323,7 +323,29 @@ TABLES = ("pools", "members", "identities", "repos", "repo_versions",
           "push_grants")
 
 
+def _enable_foreign_keys(conn: sqlite3.Connection) -> None:
+    """Turn ON FK enforcement for this one connection (idempotent).
+
+    SQLite defaults ``PRAGMA foreign_keys`` OFF per connection, so the
+    schema's ``REFERENCES`` clauses are inert unless each connection
+    opts in. ``PRAGMA foreign_keys=ON`` is a no-op inside a
+    transaction (silently ignored), so this must run on a fresh /
+    out-of-transaction connection — exactly where ``get_db()`` and
+    ``init_ledger()`` call it. Re-running it on an already-enforced
+    connection is a harmless no-op.
+
+    Only connections the plugin itself owns/uses get this: the
+    connection returned by Hermes ``plugin_db()`` is a fresh
+    per-call ``sqlite3`` connection (Hermes
+    ``hermes_cli.sqlite_util.open_db``), not a shared Hermes-managed
+    pool, so setting a per-connection pragma here does not touch
+    Hermes core state.
+    """
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
 def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
+    _enable_foreign_keys(conn)
     conn.executescript(SCHEMA)
     conn.commit()
     # Guarded additive migrations for existing DBs.
@@ -439,6 +461,10 @@ def get_db() -> sqlite3.Connection:
     (plain tuple rows), but ledger code indexes rows with string keys
     (e.g. ``row["settings_json"]`` in :func:`_pool_row`/:func:`is_frozen`),
     so set ``conn.row_factory = sqlite3.Row`` explicitly here.
+
+    FK enforcement is likewise set here (via :func:`init_ledger`, and
+    explicitly before it) rather than relying on Hermes' ``open_db``
+    having enabled it: the plugin owns its connections' enforcement.
     """
     try:
         conn = _load_plugin_storage().plugin_db("agent-pool")
@@ -452,6 +478,8 @@ def get_db() -> sqlite3.Connection:
             "gateway profile or install Hermes storage support"
         ) from exc
     conn.row_factory = sqlite3.Row
+    # Immediately after opening, before any transaction begins.
+    _enable_foreign_keys(conn)
     return init_ledger(conn)
 
 

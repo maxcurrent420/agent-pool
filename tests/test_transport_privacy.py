@@ -291,6 +291,14 @@ def _world(tmp_path, transport):
 
     conn = init_ledger(sqlite3.connect(":memory:"))
     create_pool(conn, "pool-1", "Team", "agent:m-maint")
+    # prop.submit appends repo_versions (FK repo_id -> repos), so the
+    # parent repo row must exist first — mirroring the production
+    # PoolService.add_repo (tickets.py) which upserts before submit,
+    # and test_propagation's world which inserts the row directly.
+    conn.execute(
+        "INSERT INTO repos (repo_id, pool_id, name, created_at)"
+        " VALUES ('demo','pool-1','Demo',0)")
+    conn.commit()
     identities = {}
     for name in ("m-maint", "b-member"):
         identities[name] = ensure_identity(tmp_path / name)
