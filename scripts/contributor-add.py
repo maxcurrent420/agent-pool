@@ -95,7 +95,16 @@ def build_parser():
                "approves with /add-repo approve <REPO_ID>).")
     p.add_argument("repo_path", help="local checkout directory to submit")
     p.add_argument("--repo", required=True, help="repo id (REPO_ID)")
-    p.add_argument("--pool", default=None, help="optional pool id")
+    p.add_argument("--pool", default=None, help="optional pool id (the "
+                    "maintainer pool; resolved against the enrollment "
+                    "gateway record, never local hosting)")
+    p.add_argument("--pool-context", default=None,
+                   help="path to a JSON file holding the enrollment "
+                        "pool_context (from /pool members --enroll); "
+                        "recorded on this gateway before building. "
+                        "Omit when the context is already recorded "
+                        "(then --pool may also be omitted if a single "
+                        "gateway record exists)")
     p.add_argument("--version", type=int, default=None,
                    help="explicit version (default: next repo version)")
     p.add_argument("--data-dir", default=None,
@@ -116,6 +125,12 @@ def main(argv=None):
         return 1
     try:
         svc = build_service(args.data_dir)
+        if args.pool_context:
+            context = json.loads(Path(args.pool_context).read_text())
+            svc.record_pool_context(
+                args.pool or context.get("pool_id"), context)
+            if not args.pool:
+                args.pool = context.get("pool_id")
         result = svc.add_repo_build_bundle(
             str(repo_path), args.repo,
             **({"version": args.version} if args.version is not None else {}),

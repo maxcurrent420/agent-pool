@@ -222,11 +222,107 @@ class PoolService:
             f"the operator must remove the extras",
             pool_id=pool_id or "")
 
-    def record_gateway(self, pool_id, gateway_endpoint="", transport_addr="", role="") -> dict:
+    def record_gateway(self, pool_id, gateway_endpoint="", transport_addr="", role="", context=None) -> dict:
         """Record a pool/gateway this agent interacts with (differentiation)."""
         return L.record_gateway(self._conn, pool_id,
                                 gateway_endpoint=gateway_endpoint,
-                                transport_addr=transport_addr, role=role)
+                                transport_addr=transport_addr, role=role,
+                                context=context)
+
+    def record_pool_context(self, pool_id, context) -> dict:
+        """Record the enrollment wrap context for a non-hosted pool.
+
+        The context is the maintainer-published dict returned by
+        ``enroll_member`` (``pool_context``): pool id, maintainer key id,
+        member wrap targets (public key material only). Stored on this
+        gateway's ``pool_gateways`` record so the contributor build path
+        can wrap+send without hosting the pool.
+        """
+        if not isinstance(context, dict) or not context.get("pool_id"):
+            raise ValueError("record_pool_context needs a pool_context dict")
+        if str(context["pool_id"]) != str(pool_id):
+            raise ValueError(
+                f"record_pool_context: context pool {context['pool_id']!r} "
+                f"does not match {pool_id!r}")
+        return L.set_gateway_context(self._conn, pool_id, context)
+
+    def get_pool_context(self, pool_id=None):
+        """Enrollment wrap context recorded locally, or None.
+
+        With ``pool_id=None``: the single recorded gateway context
+        (None when zero or several are recorded).
+        """
+        if pool_id:
+            return L.get_gateway_context(self._conn, str(pool_id).strip())
+        contexts = []
+        for row in L.list_gateways(self._conn):
+            ctx = L.get_gateway_context(self._conn, row["pool_id"])
+            if ctx:
+                contexts.append(ctx)
+        return contexts[0] if len(contexts) == 1 else None
+
+    def pool_context_for(self, pool_id) -> dict:
+        """Build the enrollment wrap context for a hosted pool.
+
+        Published by ``enroll_member`` so a contributor gateway can
+        build (DEK wrap + send) without hosting the pool. Public key
+        material only; no private keys, no new crypto.
+        """
+        resolved = self._resolve_pool(pool_id)
+        pool = self._conn.execute(
+            "SELECT maintainer_key_id FROM pools WHERE pool_id=?",
+            (resolved,)).fetchone()
+        members = self._members_for_propagator(resolved)
+        return {
+            "pool_id": resolved,
+            "maintainer_key_id": pool["maintainer_key_id"] if pool else "",
+            "members": [
+                {"key_id": m.key_id, "role": m.role or "member",
+                 "verify_key_hex": m.verify_key_hex or "",
+                 "box_pubkey_hex": m.box_pubkey_hex or ""}
+                for m in members.values()
+            ],
+        }
+
+    def _contributor_propagator(self, pool_id, context) -> RepoPropagator:
+        """Propagator from an enrollment context (no hosted pool needed)."""
+        if self._transport is None:
+            raise RuntimeError("push / submit need a transport backend")
+        if not isinstance(context, dict) or context.get("pool_id") != pool_id:
+            raise PoolNotLocalError(
+                f"no enrollment context recorded for pool {pool_id!r} on "
+                f"this gateway; record the pool_context from enrollment "
+                f"(/pool members --enroll) before building",
+                pool_id=pool_id)
+        members = {}
+        for m in context.get("members") or []:
+            members[m["key_id"]] = Member(
+                key_id=m["key_id"], role=m.get("role") or "member",
+                verify_key_hex=m.get("verify_key_hex") or "",
+                box_pubkey_hex=m.get("box_pubkey_hex") or "")
+        # The local caller is a valid wrap target with its box key in memory.
+        if self._caller_key_id and self._caller_key_id not in members:
+            members[self._caller_key_id] = Member(
+                key_id=self._caller_key_id, role="member",
+                verify_key_hex=self._caller_verify_key_hex(),
+                box_pubkey_hex=self._caller_box_pubkey_hex(),
+                box_sk=self._caller_box_sk)
+        elif self._caller_key_id:
+            members[self._caller_key_id].box_sk = self._caller_box_sk
+        maintainer_id = context.get("maintainer_key_id") or ""
+        if maintainer_id not in members:
+            raise PoolNotLocalError(
+                f"enrollment context for pool {pool_id!r} is missing the "
+                f"maintainer wrap target",
+                pool_id=pool_id)
+        return RepoPropagator(
+            self._conn, self._transport,
+            pool_id=pool_id,
+            maintainer_key_id=maintainer_id,
+            maintainer_signing_key=self._caller_sk,
+            members=members,
+            clamd_socket=self._clamd_socket,
+            auto_provision=self._auto_provision)
 
     def list_gateways(self) -> list:
         """Pools/gateways this agent interacts with (not the hosted pool)."""
@@ -1184,8 +1280,25 @@ class PoolService:
         if not repo_path or not Path(repo_path).is_dir():
             raise ValueError(
                 f"push_build_bundle: repo_path is not an existing directory: {repo_path}")
-        resolved = self._resolve_pool(pool_id, source=source)
-        prop = self._propagator(resolved)
+        try:
+            resolved = self._resolve_pool(pool_id, source=source)
+            prop = self._propagator(resolved)
+        except PoolNotLocalError:
+            # Contributor gateway: this gateway hosts no pool. Build
+            # against the maintainer pool's enrollment context (pool id
+            # + maintainer + member wrap targets, recorded via
+            # record_pool_context from enroll_member's pool_context).
+            # A maintainer gateway (single hosted pool, pool_id=None)
+            # never reaches here, so its behavior is unchanged.
+            if pool_id and str(pool_id).strip() in L.list_local_pools(self._conn):
+                raise  # hosted but refused (e.g. multi-pool DB): keep error
+            if pool_id:
+                resolved = str(pool_id).strip()
+                context = self.get_pool_context(resolved)
+            else:
+                context = self.get_pool_context()
+                resolved = context.get("pool_id") if context else None
+            prop = self._contributor_propagator(resolved, context)
         pusher = prop._members.get(self._caller_key_id)
         if pusher is None:
             raise PermissionError(
@@ -1495,8 +1608,20 @@ class PoolService:
         notice = (f"member {key_id} enrolled on {resolved} "
                   f"(rewrapped {len(rewrapped)} accepted version(s))")
         self._queue_notice(resolved, notice, kind="member_enrolled")
+        # Publish the enrollment wrap context for the contributor's
+        # build path: pool id + maintainer + member wrap targets
+        # (public key material only). The contributor records it on its
+        # own gateway (record_pool_context) so it can DEK-wrap + send
+        # without hosting the pool. Also kept on this ledger's gateway
+        # record for operability.
+        pool_context = self.pool_context_for(resolved)
+        try:
+            L.set_gateway_context(self._conn, resolved, pool_context)
+        except Exception:
+            pass
         return {"ok": True, "pool_id": resolved, "key_id": key_id,
-                "rewrapped_repos": rewrapped, "notice": notice}
+                "rewrapped_repos": rewrapped, "notice": notice,
+                "pool_context": pool_context}
 
     def push_deliver(self, transfer_ticket, token, manifest, *,
                      pool_id=None, source=None) -> dict:

@@ -303,6 +303,7 @@ CREATE TABLE IF NOT EXISTS pool_gateways (
     gateway_endpoint TEXT,
     transport_addr TEXT,
     role TEXT,
+    context_json TEXT,
     added_at REAL,
     last_seen REAL
 );
@@ -337,6 +338,8 @@ def init_ledger(conn: sqlite3.Connection) -> sqlite3.Connection:
          "ALTER TABLE repos ADD COLUMN submitter_key_id TEXT"),
         ("members", "verify_pubkey_hex",
          "ALTER TABLE members ADD COLUMN verify_pubkey_hex TEXT NOT NULL DEFAULT ''"),
+        ("pool_gateways", "context_json",
+         "ALTER TABLE pool_gateways ADD COLUMN context_json TEXT"),
         # Phase 3 (WO-022): per-ticket worktree/branch spec + agent-reported
         # usage counters live on the claim row.
         ("claims", "worktree_path",
@@ -1019,18 +1022,48 @@ def complete_ticket(conn, ticket_id, key_id=None) -> dict:
     return get_ticket_or_raise(conn, ticket_id)
 
 
-def record_gateway(conn, pool_id, gateway_endpoint="", transport_addr="", role="") -> dict:
-    """Record a pool/gateway this agent interacts with (differentiation, not management)."""
+def record_gateway(conn, pool_id, gateway_endpoint="", transport_addr="", role="", context=None) -> dict:
+    """Record a pool/gateway this agent interacts with (differentiation, not management).
+
+    ``context`` (optional dict) is the enrollment wrap context published
+    in locale-independent form: {pool_id, maintainer_key_id, members:
+    [{key_id, role, verify_key_hex, box_pubkey_hex}]} — public key
+    material only. A contributor gateway stores it here so its build
+    path can wrap the bundle DEK without hosting the pool.
+    """
     now = _now()
+    ctx = json.dumps(context, sort_keys=True) if context is not None else None
     conn.execute(
-        "INSERT INTO pool_gateways (pool_id, gateway_endpoint, transport_addr, role, added_at, last_seen)"
-        " VALUES (?,?,?,?,?,?)"
+        "INSERT INTO pool_gateways (pool_id, gateway_endpoint, transport_addr, role, context_json, added_at, last_seen)"
+        " VALUES (?,?,?,?,?,?,?)"
         " ON CONFLICT(pool_id) DO UPDATE SET gateway_endpoint=excluded.gateway_endpoint,"
-        " transport_addr=excluded.transport_addr, role=excluded.role, last_seen=excluded.last_seen",
-        (str(pool_id), gateway_endpoint or "", transport_addr or "", role or "", now, now))
+        " transport_addr=excluded.transport_addr, role=excluded.role,"
+        " context_json=COALESCE(excluded.context_json, pool_gateways.context_json),"
+        " last_seen=excluded.last_seen",
+        (str(pool_id), gateway_endpoint or "", transport_addr or "", role or "", ctx, now, now))
     conn.commit()
     return {"pool_id": str(pool_id), "gateway_endpoint": gateway_endpoint or "",
-            "transport_addr": transport_addr or "", "role": role or ""}
+            "transport_addr": transport_addr or "", "role": role or "",
+            "has_context": bool(ctx)}
+
+
+def set_gateway_context(conn, pool_id, context) -> dict:
+    """Store (or replace) the enrollment wrap context for a gateway record."""
+    return record_gateway(conn, pool_id, role="enrolled", context=context)
+
+
+def get_gateway_context(conn, pool_id) -> dict | None:
+    """Enrollment wrap context recorded for ``pool_id``, or None."""
+    row = conn.execute(
+        "SELECT context_json FROM pool_gateways WHERE pool_id=?",
+        (str(pool_id),)).fetchone()
+    if row is None or not row[0]:
+        return None
+    try:
+        ctx = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return ctx if isinstance(ctx, dict) else None
 
 
 def list_gateways(conn) -> list:
