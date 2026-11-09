@@ -1192,7 +1192,7 @@ class PoolService:
         # claim, and never via the gateway identity.
         user_id = self._discord_user(source)
         bound = self._whitelist_bound_key(ticket["pool_id"], source)
-        presented = key_id or self._caller_key_id
+        presented = key_id
         if not bound:
             if user_id not in self._maintainer_ids():
                 raise PermissionError(

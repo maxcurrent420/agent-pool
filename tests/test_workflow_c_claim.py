@@ -252,3 +252,68 @@ def test_bound_user_presenting_different_key_refused(tmp_path):
     with pytest.raises(PermissionError):
         w["contrib_svc"].claim(w["ticket_id"], key_id="agent:other-key",
                                source={"user_id": MEMBER_USER})
+
+# --- Discord-style claim on maintainer gateway: no key material ---------------
+
+def test_discord_claim_on_maintainer_gateway_attributes_to_bound_key(tmp_path):
+    """Live defect: Discord claim carries no key; gateway (maintainer)
+    caller key must NOT be synthesized as the presented key."""
+    w = world(tmp_path)
+    _enroll_contrib(w)
+    maint_key = w["maint_svc"]._caller_key_id
+    contrib_key = w["contrib"].key_id
+    assert maint_key != contrib_key
+    claim = w["maint_svc"].claim(w["ticket_id"], key_id=None,
+                                 source={"user_id": MEMBER_USER})
+    assert claim["key_id"] == contrib_key if "key_id" in claim else True
+    ticket = w["conn"].execute(
+        "SELECT claimant_key_id FROM tickets WHERE ticket_id=?",
+        (w["ticket_id"],)).fetchone()
+    assert ticket[0] == contrib_key
+    claim_row = w["conn"].execute(
+        "SELECT key_id FROM claims WHERE ticket_id=?",
+        (w["ticket_id"],)).fetchone()
+    assert claim_row[0] == contrib_key
+
+def test_discord_claim_explicit_wrong_key_still_refused(tmp_path):
+    w = world(tmp_path)
+    _enroll_contrib(w)
+    maint_key = w["maint_svc"]._caller_key_id
+    with pytest.raises(PermissionError, match="a bound key is immutable"):
+        w["maint_svc"].claim(w["ticket_id"], key_id=maint_key,
+                             source={"user_id": MEMBER_USER})
+
+def test_discord_claim_explicit_correct_key_accepted(tmp_path):
+    w = world(tmp_path)
+    _enroll_contrib(w)
+    claim = w["maint_svc"].claim(w["ticket_id"], key_id=w["contrib"].key_id,
+                                 source={"user_id": MEMBER_USER})
+    ticket = w["conn"].execute(
+        "SELECT claimant_key_id FROM tickets WHERE ticket_id=?",
+        (w["ticket_id"],)).fetchone()
+    assert ticket[0] == w["contrib"].key_id
+
+def test_discord_claim_unbound_non_maintainer_hard_fails(tmp_path):
+    w = world(tmp_path)
+    # MEMBER_USER whitelisted but unbound; gateway maintainer key must
+    # not be used as fallback.
+    with pytest.raises(PermissionError, match="has no bound key"):
+        w["maint_svc"].claim(w["ticket_id"], key_id=None,
+                             source={"user_id": MEMBER_USER})
+    assert w["conn"].execute(
+        "SELECT key_id FROM pool_memberships WHERE discord_user_id=?",
+        (MEMBER_USER,)).fetchone() is None
+
+def test_maintainer_claim_no_row_binds_gateway_key(tmp_path):
+    w = world(tmp_path)
+    # OWNER is maintainer id with no membership row yet.
+    w["maint_svc"].claim(w["ticket_id"], key_id=None,
+                         source={"user_id": OWNER})
+    row = w["conn"].execute(
+        "SELECT key_id FROM pool_memberships WHERE discord_user_id=?",
+        (OWNER,)).fetchone()
+    assert row[0] == w["maint_svc"]._caller_key_id
+    ticket = w["conn"].execute(
+        "SELECT claimant_key_id FROM tickets WHERE ticket_id=?",
+        (w["ticket_id"],)).fetchone()
+    assert ticket[0] == w["maint_svc"]._caller_key_id
