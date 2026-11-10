@@ -322,3 +322,38 @@ Reviewed `desktop/plugin.js`, `desktop/prompts.js`, `desktop/track.js` (and read
 6. **Scanner hygiene (desktop/*, dashboard/*)** — `grep -niE 'sudo|AGENT_POOL_|process\.env|file://' desktop/*.js dashboard/*.py dashboard/*.json` → one match: `dashboard/plugin_api.py:34: "agent_pool_plugin", _PLUGIN_ROOT / "__init__.py")` — a path-join for importlib, not a `file://` URL and not an env dump. No `sudo`, no `AGENT_POOL_`, no `process.env` anywhere. No fixes required.
 
 Fixes made: none. Checks re-run after review: all outputs above are the post-review (unchanged-tree) outputs.
+
+## Validation record — Task 11 deploy + validation
+
+Date: 2026-11-10. HEAD at run time: `508c315` (clean tree). Executor: implementer subagent (validate/deploy only; no restarts performed).
+
+### 1. `hermes plugins validate /home/maxcurrent/Documents/AntiGravityProjects/agent-pool --install-deps`
+Result: **Validation passed** (all checks green): manifest parses; requires_hermes '>=0.23.0'; loadable (entry __init__.py, desktop/plugin.js); capability probe register() ran in isolation; declared tools match registrations; **security scan — safe**; desktop surface inside SDK surface; isolation: host. **No scanner findings on any new JS/JSON/markdown file; no rewording required, nothing suppressed.**
+Caveat: the `--install-deps` resolver reported `error: Two workspace members are both named 'agent-pool'` under `~/.hermes/installs/7655b27799177977/.../workspace/plugin-sources/` (an `uv lock` workspace clash inside the installer's own install dir, unrelated to this repo). Report as `dependency preparation failed`; validation proper passed. Operator may want to `hermes pm doctor` / prune stale install dirs.
+
+### 2. `hermes plugins doctor agent-pool --ci`
+- By plugin id: `ERROR: Plugin 'agent-pool' was not found as a path or installed plugin id` — the installed copy at `~/.hermes/plugins/agent-pool` is not registered as an enabled plugin id in this profile (not listed by `hermes plugins list`).
+- By path: `hermes plugins doctor /home/maxcurrent/Documents/AntiGravityProjects/agent-pool --ci` → `manifest: agent-pool 2.8.0 (standalone)`; `OK: runtime discovery, manifest parsing, import, and registration passed`; `registrations: 3 tool(s), 0 hook(s)`. **Green by path.**
+
+### 3. Deploy (established rsync, verbatim flags)
+`rsync -a --delete -x --exclude=.git --exclude=.hermes --exclude=.pytest_cache --exclude=__pycache__ /home/maxcurrent/Documents/AntiGravityProjects/agent-pool/ ~/.hermes/plugins/agent-pool/`
+Then: `diff -rq -x .git -x .hermes -x .pytest_cache -x __pycache__ <repo> ~/.hermes/plugins/agent-pool` → **no output (DIFF-CLEAN)**; `~/.hermes/plugins/agent-pool/desktop/` and `dashboard/` exist and match the repo.
+
+### 4. Restart instruction for the operator (NOT performed by the executor)
+The new `/api/plugins/agent-pool/` routes (`/status`, `/pane-state`) do not mount while the gateway's prefix-skip sees the old route table. **Operator action: restart the gateway** (`hermes gateway` — or the gateway embedded in the desktop app), and `hermes dashboard` if it is running. **Post-restart verification:** re-run `hermes plugins doctor agent-pool --ci` (or by path, see §2) and confirm `OK` / `registrations: 3 tool(s)`; optionally confirm the routes respond (`GET /api/plugins/agent-pool/status`, `GET /api/plugins/agent-pool/pane-state`).
+
+### 5. Static verification of smoke-test dependencies (all pass)
+- `node --check` (node v22.22.2): `desktop/plugin.js`, `desktop/prompts.js`, `desktop/track.js` — all OK.
+- ops-manifest parity: `desktop/ops-manifest.json` commands (`/add-repo`, `/add-repo --deliver`, `/fetch repo list`, `/fetch task list`, `/claim`, `/push repo`, `/push repo --deliver`) are all within `plugin.yaml provides_commands` (pool, fetch, task, add-repo, task_add, task_list, claim, release, push, audit); scripts referenced (`scripts/contributor-add.py`, `contributor-claim.py`, `contributor-push.py`, `pool-approve.py`) all exist. No verb outside the documented surface.
+- Route handlers against a tmp `AGENT_POOL_DATA_DIR` sidecar: `/status` → dict with `ok, plugin, version, ...`; `/pane-state` → dict with `ops, pool_status, updated_at`.
+- `pool_pane_report` writes the parsePaneState-compatible sidecar: after `{op_id, kind, status, detail}` the sidecar contains `{ops, pool_status, updated_at}` with `ops[0] = {op_id, kind, status, detail, updated_at}`; track.js `parsePaneState` reads `raw.pool_status` / `raw.updated_at` and tolerates the string timestamp (falls back to `Date.now()`). parsePaneState-compatible. ✓
+- Static check script: `~/.hermes/profiles/implementer/cache/scratch/task11_static_check.py` → `ALL STATIC CHECKS PASS`.
+
+### 6. Smoke test — AWAITING OPERATOR MANUAL RUN (not performed; needs desktop UI + operator's gateway)
+Checklist:
+- [ ] Restart gateway (see §4); re-run `hermes plugins doctor` and record result.
+- [ ] Open the Pool Console pane in Hermes Desktop (⌘K → Reload desktop plugins if not visible).
+- [ ] Select gateway `pool-contrib`; submit a `/fetch repo list` op.
+- [ ] Agent on pool-contrib executes, calls `pool_pane_report`; pane's polled tracker shows the outcome.
+- [ ] Switch to `default` gateway; run `pool_status`; confirm the awaiting-approval view populates.
+- [ ] Do NOT exercise approve/merge against a live pool.
