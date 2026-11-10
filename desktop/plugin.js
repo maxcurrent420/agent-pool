@@ -40,6 +40,8 @@ const KNOWN_GATEWAYS = [
 ]
 
 const DISPLAY_COMPACT_KEY = 'display.compact'
+const OPS_KEY = 'ops'
+const OPS_KEEP = 200
 
 const STORAGE_KEYS = {
   gateway: 'gateways.active',
@@ -80,6 +82,88 @@ function notifyOp(ctx, kind, message, detail) {
   }
 }
 
+// Build, submit and track one operation. On a falsy composer result the op is
+// marked failed and nothing is recorded as sent; on success it is appended to
+// ctx.storage['ops'] (last 200, newest first) as 'awaiting agent'. Status
+// transitions beyond that arrive with the Task 8 refresh loop.
+export async function submitOp(ctx, sessionId, op) {
+  const record = {
+    id: op.id || `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: op.kind,
+    gateway: op.gateway,
+    args: op.args || {},
+    status: 'submitted',
+    at: Date.now()
+  }
+
+  const ok = await host.composer.submit(sessionId, op.text)
+
+  if (!ok) {
+    record.status = 'failed'
+    record.error = 'composer unreachable'
+    notifyOp(ctx, 'failed', 'composer unreachable', { id: record.id })
+    return record
+  }
+
+  record.status = 'awaiting agent'
+  const ops = ctx.storage.get(OPS_KEY, [])
+  const next = [record, ...(Array.isArray(ops) ? ops : [])].slice(0, OPS_KEEP)
+  ctx.storage.set(OPS_KEY, next)
+  notifyOp(ctx, 'info', `${record.kind} submitted — awaiting agent`, { id: record.id })
+  return record
+}
+
+const OP_STATUS_PILL = {
+  submitted: 'submitted',
+  'awaiting agent': 'awaiting agent',
+  done: 'done',
+  refused: 'refused',
+  failed: 'failed'
+}
+
+function opPillClass(status) {
+  if (status === 'done') return 'rounded-full px-2 py-0.5 text-xs text-(--ui-text-primary)'
+  if (status === 'refused' || status === 'failed') {
+    return 'rounded-full px-2 py-0.5 text-xs text-(--ui-text-secondary)'
+  }
+  return 'rounded-full px-2 py-0.5 text-xs text-(--ui-text-tertiary)'
+}
+
+function renderTracker(ops) {
+  if (!ops.length) {
+    return jsx('div', {
+      className: 'text-(--ui-text-tertiary)',
+      children: 'No operations tracked yet.'
+    })
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-1',
+    children: [
+      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Operations' }),
+      ...ops.slice(0, 20).map(op =>
+        jsxs('div', {
+          className: 'flex items-center justify-between gap-2 rounded-md px-2 py-1',
+          key: op.id,
+          children: [
+            jsxs('div', {
+              className: 'flex flex-col',
+              children: [
+                jsx('div', { className: 'text-(--ui-text-primary)', children: op.kind }),
+                jsx('div', {
+                  className: 'text-(--ui-text-tertiary)',
+                  children: `${op.gateway || ''} · ${new Date(op.at).toLocaleString()}`
+                })
+              ]
+            }),
+            jsx('span', { className: opPillClass(op.status), children: OP_STATUS_PILL[op.status] || op.status })
+          ]
+        })
+      )
+    ]
+  })
+}
+
 function isCollapsed(storage, id) {
   if (id in poolPaneStore.collapsed) {
     return Boolean(poolPaneStore.collapsed[id])
@@ -97,7 +181,7 @@ function setCollapsed(storage, id, value) {
 // The pane body is a plain builder (no hooks of its own) so the guard in
 // PoolPane can catch anything thrown while the tree is assembled. Hook values
 // are read in PoolPane and passed in.
-function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling }) {
+function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops }) {
   const noSession = !sessionId
   const submitTitle = noSession ? 'no focused chat session — focus a chat to submit' : undefined
 
@@ -146,7 +230,8 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
         disabled: noSession,
         title: submitTitle,
         children: 'Submit (forms arrive in a later release)'
-      })
+      }),
+      renderTracker(ops)
     ]
   })
 }
@@ -171,9 +256,13 @@ function PoolPane({ ctx }) {
   const gatewayState = useValue(host.state.gateway)
   const [gateway, setGateway] = useState(() => poolPaneStore.gateway)
   const [polling, setPolling] = useState(() => poolPaneStore.polling)
+  const [ops] = useState(() => {
+    const stored = ctx.storage.get(OPS_KEY, [])
+    return Array.isArray(stored) ? stored : []
+  })
 
   try {
-    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling })
+    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops })
   } catch (error) {
     return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.pane, error })
   }
