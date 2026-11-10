@@ -258,7 +258,7 @@ def test_docs_state_current_contracts():
     assert "Full chain verification happens on the hosted-pool" in combined
 
 
-# --- WO-025 gates: 2.7.0 release, agent-budget wording, catalog ----------
+# --- WO-025 gates: 2.8.0 release, agent-budget wording, catalog ----------
 
 # ledger.py is excluded: its meta.state_migration == "2.6.0" is the
 # historical ticket-state migration guard, asserted by
@@ -281,7 +281,7 @@ def test_release_version_is_2_7_0_everywhere_except_migration_guard():
     for fname in RELEASE_REF_FILES:
         assert "2.6.0" not in (ROOT / fname).read_text(), (
             f"{fname} still references the 2.6.0 release version")
-    assert (ROOT / "plugin.yaml").read_text().splitlines()[1].strip() == 'version: "2.7.0"'
+    assert (ROOT / "plugin.yaml").read_text().splitlines()[1].strip() == 'version: "2.8.0"'
 
 
 def test_budget_wording_matches_agent_allocation_model():
@@ -310,8 +310,8 @@ def test_budget_wording_matches_agent_allocation_model():
 
 def test_catalog_lists_both_tools_and_current_version():
     data = (ROOT / "plugin-catalog" / "agent-pool.yaml").read_text()
-    assert re.search(r'^version: "2\.7\.0"$', data, re.M), (
-        "catalog version must be 2.7.0")
+    assert re.search(r'^version: "2\.8\.0"$', data, re.M), (
+        "catalog version must be 2.8.0")
     caps = data.split("provides_tools:")[1].split("provides_hooks:")[0]
     assert "pool_status" in caps and "pool_report_usage" in caps
 

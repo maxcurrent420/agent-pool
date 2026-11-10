@@ -73,7 +73,7 @@ def test_manifest_strict_yaml_no_duplicate_keys():
 def test_manifest_version_is_string():
     data = _load_manifest_strict()
     assert isinstance(data["version"], str)
-    assert data["version"] == "2.7.0"
+    assert data["version"] == "2.8.0"
 
 
 def test_manifest_declares_requires_env():
@@ -117,7 +117,7 @@ def test_register_loads_with_tor_down(monkeypatch):
     plugin = _load_plugin()
     ctx = FakeCtx({"transport": "real"})
     plugin.register(ctx)
-    assert set(ctx.tools) == {"pool_status", "pool_report_usage"}
+    assert set(ctx.tools) == {"pool_status", "pool_report_usage", "pool_pane_report"}
     assert len(ctx.commands) == 10
 
 

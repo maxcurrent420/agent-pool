@@ -305,7 +305,7 @@ def test_register_wires_all_commands():
     assert set(ctx.commands) == {"pool", "fetch", "task", "claim", "release",
                                  "push", "audit", "add-repo", "task_add", "task_list"}
     out = json.loads(ctx.tools["pool_status"]({}))
-    assert out["ok"] is True and out["version"] == "2.7.0" and "phase" not in out
+    assert out["ok"] is True and out["version"] == "2.8.0" and "phase" not in out
 
 
 def test_command_handlers_smoke(tmp_path):

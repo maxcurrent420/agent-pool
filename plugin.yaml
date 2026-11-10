@@ -1,5 +1,5 @@
 name: agent-pool
-version: "2.7.0"
+version: "2.8.0"
 description: >-
   Agent Pool — friends form an agent team; repos propagate via Iroh-over-Tor
   only (Iroh + Tor custom transport via the tor-enabled send_hermes sidecar;
@@ -9,7 +9,7 @@ description: >-
   --install-deps / hermes pm install); system services (ClamAV, Tor
   daemon, tor-enabled sidecar) are provisioned by the documented
   first-run bootstrap scripts/install-deps.sh. Coordination only via the Hermes
-  gateway: 2 tools (pool_status, pool_report_usage) and 10 slash commands
+  gateway: 3 tools (pool_status, pool_report_usage, pool_pane_report) and 10 slash commands
   (pool, fetch, task, add-repo, task_add, task_list, claim, release, push,
   audit — see provides_commands). Disclosure: spawns git/bubblewrap/send_hermes
   child processes; network calls go to Iroh peers over Tor (no relay in the
@@ -20,7 +20,7 @@ manifest_version: 2
 api_version: 1
 license: MIT
 tags: [gateway, discord, iroh, team]
-requires_hermes: ">=0.22.0"
+requires_hermes: ">=0.23.0"
 python_dependencies:
   - "pynacl>=1.5,<2"
   - "blake3>=0.4,<2"
@@ -38,6 +38,7 @@ requires_env:
 provides_tools:
   - pool_status
   - pool_report_usage
+  - pool_pane_report
 provides_commands:
   - pool
   - fetch

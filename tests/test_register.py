@@ -54,7 +54,7 @@ def test_pool_status_reports_version_not_phase():
     ctx = FakeCtx()
     plugin.register(ctx)
     out = json.loads(ctx.tools["pool_status"]({}))
-    assert out["version"] == "2.7.0"
+    assert out["version"] == "2.8.0"
     assert "phase" not in out
 
 

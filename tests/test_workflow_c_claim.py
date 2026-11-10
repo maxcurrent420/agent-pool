@@ -191,7 +191,7 @@ def test_registered_equals_declared_for_changed_surfaces():
     assert set(ctx.commands) == {
         "pool", "fetch", "task", "add-repo", "task_add", "task_list",
         "claim", "release", "push", "audit"}
-    assert set(ctx.tools) == {"pool_status", "pool_report_usage"}
+    assert set(ctx.tools) == {"pool_status", "pool_report_usage", "pool_pane_report"}
 
 
 # --- Task 4: bound-key-only claim, unbound non-maintainer hard-fails --------

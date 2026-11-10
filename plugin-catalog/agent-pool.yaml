@@ -16,8 +16,8 @@ description: >-
   content that Hermes posts. Passive plumbing (no timers, no observation, no
   execution); one pool per gateway, and the pool maintainer is the gateway
   owner (the maintainer registered the pool on this gateway; acceptance
-  happens on the maintainer gateway only). Surface: 2 tools (pool_status,
-  pool_report_usage) and 10 slash commands (pool, fetch, task, add-repo,
+  happens on the maintainer gateway only). Surface: 3 tools (pool_status,
+  pool_report_usage, pool_pane_report) and 10 slash commands (pool, fetch, task, add-repo,
   task_add, task_list, claim, release, push, audit). Access is a whitelist,
   not an invite: the pool owner (maintainer_discord_user_id) is always
   authorized; additional Discord users arrive via env
@@ -47,14 +47,15 @@ description: >-
 maintainer: maxcurrent420
 tier: community
 category: tools
-requires_hermes: ">=0.22.0"
-version: "2.7.0"
+requires_hermes: ">=0.23.0"
+version: "2.8.0"
 readme: true
 platforms: []
 capabilities:
   provides_tools:
     - pool_status
     - pool_report_usage
+    - pool_pane_report
   provides_commands:
     - pool
     - fetch

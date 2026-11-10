@@ -114,49 +114,98 @@ def _tor_config(ctx):
     return control, socks, (str(binary).strip() or None)
 
 
+def _status_snapshot(ctx=None):
+    """Shared read-only status snapshot used by ``pool_status`` and the
+    dashboard read route. Service/plugin_db reads only — no writes and
+    no Tor probe. Returns the status dict (never raises)."""
+    mode, _relay_url, per_pool = _transport_config(ctx)
+    # relay_url is deprecated/ignored: no relay in the connection
+    # path. Kept as "" for shape compatibility.
+    relay_url = ""
+    env_relay = _env_get("HERMES_IROH_RELAY", "").strip()
+    legacy_relay = _legacy_relay_pools(ctx)
+    budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
+        ("max_turns", 25), ("max_tasks_per_day", 5),
+        ("token_cap", 50000), ("wall_clock_seconds", 1800))}
+    # NOTE: the "version" string below must be kept in sync with
+    # plugin.yaml's version. It identifies the release, not a phase.
+    status = {"ok": True, "plugin": "agent-pool", "version": "2.8.0",
+              "relay_url": relay_url, "transport_mode": mode,
+              "transport_privacy": (
+                  "tor: onion-routed via Iroh Tor custom transport "
+                  "(sidecar + tor daemon); peer learns no IP, no "
+                  "relay in the connection path; both endpoints "
+                  "must enable Tor; Iroh-over-Tor is the only byte "
+                  "transport"),
+              "pool_transports": per_pool,
+              "budgets": budgets,
+              # Budgets belong to agents, not pools: max_tasks_per_day
+              # is the default per-agent task allocation
+              # (agent_task_allocations overrides per agent, env
+              # AGENT_POOL_TASK_ALLOCATIONS beats config); max_turns /
+              # token_cap / wall_clock_seconds are optional secondary
+              # limits enforced only on agent-reported usage
+              # (pool_report_usage). There are no pool-level budgets.
+              "agent_task_allocations": (
+                  _cfg(ctx, "agent_task_allocations", {}) if ctx else {}),
+              "budget_model": (
+                  "agent-level task allocation: max_tasks_per_day is "
+                  "the default per-agent allocation; "
+                  "agent_task_allocations overrides per agent; "
+                  "max_turns/token_cap/wall_clock_seconds are optional "
+                  "secondary limits enforced only on agent-reported "
+                  "usage (pool_report_usage); no pool-level budgets"),
+              "ledger": "ready", "identity": "ready",
+              "queued_notices": []}
+    if legacy_relay:
+        status["migration_warning"] = (
+            "ignored legacy relay transport config for: "
+            + ", ".join(legacy_relay)
+            + " — treated as tor; remove transport_mode=relay / "
+            "relay_url from config (Iroh-over-Tor is the only byte "
+            "transport).")
+    if env_relay:
+        status["transport_warning"] = (
+            (status.get("transport_warning", "") + " ")
+            .strip()
+            + f"HERMES_IROH_RELAY={env_relay} is ignored: no relay "
+            "flags are emitted; Iroh-over-Tor is the only byte "
+            "transport.").strip()
+    try:
+        svc = _service_for(ctx)
+        # Read-only: peek, never drain (draining advances the ledger
+        # cursor, which would make this path a write).
+        try:
+            status["queued_notices"] = svc.peek_notices()
+        except Exception:
+            status["queued_notices"] = []
+        # Discovery: what is awaiting owner approval on both
+        # ingestion paths (submitted versions), so the agent can
+        # tell the operator without any approval slash command.
+        try:
+            status["awaiting_approval"] = svc.awaiting_approval()[
+                "awaiting_approval"]
+        except Exception:
+            status["awaiting_approval"] = []
+        # Local identity (public values only): key_id, verify key, box pubkey.
+        try:
+            status["identity_detail"] = {
+                "key_id": getattr(svc, "_caller_key_id", ""),
+                "verify_key_hex": svc._caller_sk.verify_key.encode().hex() if getattr(svc, "_caller_sk", None) is not None else "",
+                "box_pubkey_hex": svc._caller_box_sk.public_key.encode().hex() if getattr(svc, "_caller_box_sk", None) is not None else "",
+            }
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return status
+
+
 def _pool_status(args=None, **kwargs):
     """Report plugin config + ledger/identity readiness. Always returns JSON."""
     ctx = kwargs.get("ctx")
     try:
-        mode, _relay_url, per_pool = _transport_config(ctx)
-        # relay_url is deprecated/ignored: no relay in the connection
-        # path. Kept as "" for shape compatibility.
-        relay_url = ""
-        env_relay = _env_get("HERMES_IROH_RELAY", "").strip()
-        legacy_relay = _legacy_relay_pools(ctx)
-        budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
-            ("max_turns", 25), ("max_tasks_per_day", 5),
-            ("token_cap", 50000), ("wall_clock_seconds", 1800))}
-        # NOTE: the "version" string below must be kept in sync with
-        # plugin.yaml's version. It identifies the release, not a phase.
-        status = {"ok": True, "plugin": "agent-pool", "version": "2.7.0",
-                  "relay_url": relay_url, "transport_mode": mode,
-                  "transport_privacy": (
-                      "tor: onion-routed via Iroh Tor custom transport "
-                      "(sidecar + tor daemon); peer learns no IP, no "
-                      "relay in the connection path; both endpoints "
-                      "must enable Tor; Iroh-over-Tor is the only byte "
-                      "transport"),
-                  "pool_transports": per_pool,
-                  "budgets": budgets,
-                  # Budgets belong to agents, not pools: max_tasks_per_day
-                  # is the default per-agent task allocation
-                  # (agent_task_allocations overrides per agent, env
-                  # AGENT_POOL_TASK_ALLOCATIONS beats config); max_turns /
-                  # token_cap / wall_clock_seconds are optional secondary
-                  # limits enforced only on agent-reported usage
-                  # (pool_report_usage). There are no pool-level budgets.
-                  "agent_task_allocations": (
-                      _cfg(ctx, "agent_task_allocations", {}) if ctx else {}),
-                  "budget_model": (
-                      "agent-level task allocation: max_tasks_per_day is "
-                      "the default per-agent allocation; "
-                      "agent_task_allocations overrides per agent; "
-                      "max_turns/token_cap/wall_clock_seconds are optional "
-                      "secondary limits enforced only on agent-reported "
-                      "usage (pool_report_usage); no pool-level budgets"),
-                  "ledger": "ready", "identity": "ready",
-                  "queued_notices": []}
+        status = _status_snapshot(ctx)
         # Tor is the only transport: always surface readiness.
         control, socks, tor_binary = _tor_config(ctx)
         status["tor"] = {"control_port": control, "socks_port": socks,
@@ -178,42 +227,6 @@ def _pool_status(args=None, **kwargs):
                 "byte transport (no relay fallback). Start the unit "
                 "named in the error (systemctl start agent-pool-tor) "
                 "and install the tor sidecar (scripts/install-tor.sh).")
-        if legacy_relay:
-            status["migration_warning"] = (
-                "ignored legacy relay transport config for: "
-                + ", ".join(legacy_relay)
-                + " — treated as tor; remove transport_mode=relay / "
-                "relay_url from config (Iroh-over-Tor is the only "
-                "byte transport).")
-        if env_relay:
-            status["transport_warning"] = (
-                (status.get("transport_warning", "") + " ")
-                .strip()
-                + f"HERMES_IROH_RELAY={env_relay} is ignored: no relay "
-                "flags are emitted; Iroh-over-Tor is the only byte "
-                "transport.").strip()
-        try:
-            svc = _service_for(ctx)
-            status["queued_notices"] = svc.drain_notices()
-            # Discovery: what is awaiting owner approval on both
-            # ingestion paths (submitted versions), so the agent can
-            # tell the operator without any approval slash command.
-            try:
-                status["awaiting_approval"] = svc.awaiting_approval()[
-                    "awaiting_approval"]
-            except Exception:
-                status["awaiting_approval"] = []
-            # Local identity (public values only): key_id, verify key, box pubkey.
-            try:
-                status["identity_detail"] = {
-                    "key_id": getattr(svc, "_caller_key_id", ""),
-                    "verify_key_hex": svc._caller_sk.verify_key.encode().hex() if getattr(svc, "_caller_sk", None) is not None else "",
-                    "box_pubkey_hex": svc._caller_box_sk.public_key.encode().hex() if getattr(svc, "_caller_box_sk", None) is not None else "",
-                }
-            except Exception:
-                pass
-        except Exception:
-            pass
         return json.dumps(status)
     except Exception as exc:  # never raise from a handler
         return json.dumps({"ok": False, "code": "status_unavailable",
@@ -822,6 +835,29 @@ def _handle_audit(ctx, raw: str, *, source=None, session_id="", session_key="", 
         return _error(exc)
 
 
+def _pane_state_file():
+    """Path of the agent→pane sidecar (profile-aware plugin data dir)."""
+    try:
+        from . import ledger as _L
+    except ImportError:
+        import ledger as _L
+    return Path(_L._plugin_base_dir()) / "pane-state.json"
+
+
+def _pane_state_read():
+    """Read the sidecar; never raises. Empty state on any problem."""
+    try:
+        path = _pane_state_file()
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("sidecar is not a JSON object")
+        data.setdefault("ops", [])
+        data.setdefault("pool_status", {})
+        return data
+    except Exception:
+        return {"ops": [], "pool_status": {}, "updated_at": None}
+
+
 _POOL_REPORT_USAGE_SCHEMA = {
     "name": "pool_report_usage",
     "description": ("Record agent-reported usage (turns/tokens/seconds) on a "
@@ -863,6 +899,59 @@ def _pool_report_usage(args=None, **kwargs):
                            "fix": "pass a valid claim_id from an active "
                                  "claim; check pool_status for Tor "
                                  "readiness if the claim lookup failed"})
+
+
+_POOL_PANE_REPORT_SCHEMA = {
+    "name": "pool_pane_report",
+    "description": ("Record an operation outcome for the Agent Pool desktop "
+                    "pane. Upserts the op into the pane-state sidecar; the "
+                    "pane polls it. Writes ONLY the pane-state sidecar — "
+                    "never the ledger."),
+    "parameters": {"type": "object", "properties": {
+        "op_id": {"type": "string"},
+        "kind": {"type": "string"},
+        "status": {"type": "string"},
+        "detail": {"type": "string", "default": ""}},
+        "required": ["op_id", "kind", "status"]},
+}
+
+
+def _pool_pane_report(args=None, **kwargs):
+    """Agent→pane state bridge. Writes only the pane-state sidecar."""
+    ctx = kwargs.get("ctx")
+    args = args or {}
+    try:
+        import datetime
+        op_id = str(args.get("op_id", "") or "").strip()
+        kind = str(args.get("kind", "") or "").strip()
+        status = str(args.get("status", "") or "").strip()
+        detail = str(args.get("detail", "") or "")
+        if not op_id or not kind or not status:
+            return json.dumps({"ok": False, "code": "missing_argument",
+                               "error_code": "missing_argument",
+                               "error": "pool_pane_report needs op_id, kind and status"})
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        state = _pane_state_read()
+        ops = [o for o in state.get("ops", []) if isinstance(o, dict)
+               and o.get("op_id") != op_id]
+        ops.insert(0, {"op_id": op_id, "kind": kind, "status": status,
+                       "detail": detail, "updated_at": now})
+        ops = ops[:200]
+        try:
+            pool_status = _status_snapshot(ctx)
+        except Exception:
+            pool_status = state.get("pool_status") or {}
+        new_state = {"ops": ops, "pool_status": pool_status,
+                     "updated_at": now}
+        path = _pane_state_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(new_state))
+        return json.dumps({"ok": True, "op_id": op_id, "ops": len(ops),
+                           "updated_at": now})
+    except Exception as exc:  # never raise from a handler
+        return json.dumps({"ok": False, "code": "pane_state_unavailable",
+                           "error_code": "pane_state_unavailable",
+                           "error": str(exc)[:300]})
 
 
 _POOL_STATUS_SCHEMA = {
@@ -1107,6 +1196,10 @@ def register(ctx):
             ctx, name="pool_report_usage", toolset="agent_pool",
             schema=_POOL_REPORT_USAGE_SCHEMA,
             handler=lambda args=None, **kw: _pool_report_usage(args, ctx=ctx, **kw))
+        _register_tool_compat(
+            ctx, name="pool_pane_report", toolset="agent_pool",
+            schema=_POOL_PANE_REPORT_SCHEMA,
+            handler=lambda args=None, **kw: _pool_pane_report(args, ctx=ctx, **kw))
     except Exception as exc:
         logger.warning("agent-pool: tool registration failed: %s", exc)
     for name, handler, description, args_hint in _COMMANDS:
