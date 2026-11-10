@@ -81,7 +81,7 @@ export function isActiveStatus(status) {
 // --- sidecar parsing (defensive: empty/missing never throws) ----------------
 
 export function parsePaneState(raw) {
-  const empty = { poolStatus: null, tasks: null, claims: null, discovered: null, awaitingApproval: [], budgets: [], at: null }
+  const empty = { poolStatus: null, tasks: null, claims: null, discovered: null, awaitingApproval: [], budgets: [], at: null, substeps: null }
   if (!raw || typeof raw !== 'object') return empty
   const ps = raw.pool_status || raw.poolStatus || raw.status || null
   const parsed = { ...empty, at: typeof raw.at === 'number' ? raw.at : (typeof raw.updated_at === 'number' ? raw.updated_at : Date.now()) }
@@ -99,6 +99,10 @@ export function parsePaneState(raw) {
   // snapshot.discovered.
   const discovered = raw.discovered || raw.discovery || raw.detail || null
   if (discovered) parsed.discovered = discovered
+  // Sub-step progress reported by the sidecar (e.g. link flow:
+  // substeps: ['build bundle', 'deliver']). A flat string list.
+  const substeps = raw.substeps || raw.sub_steps || null
+  if (Array.isArray(substeps)) parsed.substeps = substeps.map(s => str(s)).filter(s => s && s !== 'none')
   return parsed
 }
 
@@ -174,8 +178,17 @@ export function applyPaneStateToOps(ops, parsed) {
   const awaiting = asArray(parsed.awaitingApproval)
   const budgetsExhausted = asArray(parsed.budgets).some(b => b && b.exhausted)
   let changed = false
+  const reportedSubsteps = asArray(parsed.substeps).map(String)
   const next = list.map(op => {
     if (!op || typeof op !== 'object') return op
+    // Merge sidecar-reported sub-steps into any op that declares a substeps list.
+    if (reportedSubsteps.length && op.args && Array.isArray(op.args.substeps) && isActiveStatus(op.status)) {
+      const merged = [...new Set([...asArray(op.args.substepsDone).map(String), ...reportedSubsteps])]
+      if (merged.length !== asArray(op.args.substepsDone).length) {
+        changed = true
+        op = { ...op, args: { ...op.args, substepsDone: merged } }
+      }
+    }
     if (op.status === 'done' || op.status === 'failed') return op
     let status = op.status
     if ((op.kind === 'push' || op.kind === 'add-repo-owner' || op.kind === 'add-repo-link')
@@ -576,6 +589,53 @@ function isAbsoluteLocalPath(value) {
   return true
 }
 
+// --- discovered-repo helpers (pure; testable without a renderer) ------------
+// Discovery replies arrive as free text or objects; normalize to
+// { id, path, name } where id === path (the dropdown value) and name is the
+// basename. Entries failing the local-absolute-path shape check are filtered
+// out — the pane never carries remote URLs.
+export function repoNameFromPath(path) {
+  const parts = String(path || '').split('/').filter(Boolean)
+  return parts.length ? parts[parts.length - 1] : ''
+}
+
+function normalizeDiscoveredEntry(raw) {
+  if (raw == null) return null
+  let path = ''
+  if (typeof raw === 'string' || typeof raw === 'number') {
+    const line = String(raw).trim()
+    // Format: '<path> — <first remote or directory name>'
+    path = (line.includes(' — ') ? line.split(' — ')[0] : line).trim()
+  } else if (typeof raw === 'object') {
+    path = str(raw.path ?? raw.repo_path ?? raw.id ?? '').trim()
+  }
+  if (!path) return null
+  return { id: path, path, name: repoNameFromPath(path) }
+}
+
+export function filterDiscovered(items) {
+  const out = []
+  for (const raw of asArray(items)) {
+    const entry = normalizeDiscoveredEntry(raw)
+    if (entry && isAbsoluteLocalPath(entry.path)) out.push(entry)
+  }
+  return out
+}
+
+// Flow-state machine for the add-repo flows: { discoveredId, poolId,
+// manualPath? }. Returns { path, repoId } or null — a prompt cannot be
+// produced without a discovered-or-manual (absolute, local) path.
+export function resolveAddRepoSelection({ discoveredId, manualPath, discovered }) {
+  const manual = (manualPath || '').trim()
+  if (manual) {
+    if (!isAbsoluteLocalPath(manual)) return null
+    return { path: manual, repoId: repoNameFromPath(manual) }
+  }
+  const hit = asArray(discovered).find(e => e && str(e.id ?? e.path) === str(discoveredId))
+  if (!hit || !isAbsoluteLocalPath(hit.path)) return null
+  return { path: hit.path, repoId: hit.name || repoNameFromPath(hit.path) }
+}
+
 const inputClass = 'rounded-md px-2 py-1 text-(--ui-text-primary)'
 const labelClass = 'text-(--ui-text-secondary)'
 
@@ -653,7 +713,9 @@ function snapshotSources(ctx) {
   const claimsRaw = ctx.storage.get('snapshot.claims', null)
   const claims = Array.isArray(claimsRaw) ? claimsRaw : (claimsRaw && Array.isArray(claimsRaw.items) ? claimsRaw.items : [])
   const gateways = readSnapshot(ctx, 'snapshot.gateways')
-  return { repos, tasks, claims, poolStatus: ps, awaitingApproval: awaiting, gateways }
+  const discRaw = readSnapshot(ctx, 'snapshot.discovered')
+  const discovered = filterDiscovered(discRaw)
+  return { repos, tasks, claims, poolStatus: ps, awaitingApproval: awaiting, gateways, discovered, discoveredRaw: discRaw.length }
 }
 
 function snapshotRepos(ctx) {
@@ -694,33 +756,45 @@ const ADD_REPO_FAILURES = [
 ]
 
 function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp, ops }) {
-  const gateways = snapshotSources(ctx).gateways.map(g => ({ id: str(g && g.id), title: str((g && g.role) || '') }))
+  const snapSrc = snapshotSources(ctx)
+  const discovered = snapSrc.discovered
+  const skipped = Math.max(0, snapSrc.discoveredRaw - discovered.length)
+  const pools = itemsFor({ repos: snapSrc.repos, poolStatus: snapSrc.poolStatus }, 'pools')
+  const gatewayItems = snapSrc.gateways.map(g => ({ id: str(g && g.id), repo: str((g && g.role) || '') }))
+  const discoveredItems = discovered.map(d => ({ id: d.path, title: d.path }))
   const [mode, setMode] = useState('owner')
-  const [repoId, setRepoId] = useState('')
-  const [path, setPath] = useState('')
+  const [discoveredId, setDiscoveredId] = useState('')
+  const [manualPath, setManualPath] = useState('')
+  const [poolId, setPoolId] = useState('')
   const [version, setVersion] = useState('')
   const [maintainerGateway, setMaintainerGateway] = useState('default')
 
-  const pathOk = isAbsoluteLocalPath(path)
+  const selection = resolveAddRepoSelection({ discoveredId, manualPath, discovered })
+  const pathOk = selection !== null
+  const manualPathActive = Boolean(manualPath.trim())
   const versionOk = !version.trim() || /^\d+$/.test(version.trim())
-  const ready = !noSession && repoId.trim() && pathOk && versionOk
+  const ready = !noSession && pathOk && versionOk
   const disabledTitle = noSession
     ? submitTitle
-    : !repoId.trim() ? 'repo_id is required'
-    : !pathOk ? 'path must be an absolute local path (no URLs)'
+    : !pathOk
+      ? (manualPathActive
+          ? 'path must be an absolute local path (no URLs)'
+          : 'pick a discovered repo, or choose (enter manually…) and type an absolute path')
     : !versionOk ? '--version must be a positive integer'
     : undefined
 
   const onSubmit = async () => {
-    if (!ready) return
+    if (!ready || !selection) return
     const v = version.trim() ? Number(version.trim()) : undefined
     const text = mode === 'owner'
-      ? addRepoOwnerPrompt({ gateway, repoId: repoId.trim(), path: path.trim(), version: v })
-      : addRepoLinkPrompt({ gateway, repoId: repoId.trim(), path: path.trim(), version: v, maintainerGateway })
+      ? addRepoOwnerPrompt({ gateway, repoId: selection.repoId, path: selection.path, version: v })
+      : addRepoLinkPrompt({ gateway, repoId: selection.repoId, path: selection.path, version: v, maintainerGateway })
     await recordOp({
       kind: mode === 'owner' ? 'add-repo-owner' : 'add-repo-link',
       gateway,
-      args: { mode, repoId: repoId.trim(), path: path.trim(), version: v ?? null, maintainerGateway: mode === 'link' ? maintainerGateway : undefined, substatus: mode === 'link' ? 'build bundle → deliver' : undefined },
+      args: mode === 'owner'
+        ? { mode, repoId: selection.repoId, path: selection.path, poolId: poolId || null, version: v ?? null }
+        : { mode, repoId: selection.repoId, path: selection.path, version: v ?? null, maintainerGateway, substeps: ['build bundle', 'deliver'], substepsDone: [] },
       text
     })
   }
@@ -737,11 +811,41 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
         value: mode,
         onChange: setMode
       }),
-      field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' })),
-      field('local path (absolute)', jsx('input', { className: inputClass, value: path, onChange: e => setPath(e.target.value), placeholder: '/home/you/src/my-repo' })),
-      !pathOk && path.trim() ? jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Path must be absolute (starts with /) and must not look like a URL.' }) : null,
       jsx(SnapshotSelect, {
-        label: '--version (optional — auto-resolves)',
+        label: 'repo (discovered) — or enter manually…',
+        items: discoveredItems,
+        value: manualPathActive ? '' : discoveredId,
+        onChange: setDiscoveredId,
+        emptyHint: 'No discovered repos yet — click Discover repos',
+        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'discovered', gateway) : undefined,
+        refreshKind: 'discover',
+        ops,
+        allowManual: true,
+        manualPlaceholder: '/home/you/src/my-repo',
+        manualValue: manualPath,
+        onManualChange: setManualPath,
+        selectLabel: '(select a discovered repo)'
+      }),
+      skipped > 0 ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `${skipped} entries skipped (non-local paths)` }) : null,
+      manualPathActive && !isAbsoluteLocalPath(manualPath)
+        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Path must be absolute (starts with /) and must not look like a URL.' })
+        : null,
+      mode === 'owner'
+        ? jsx(SnapshotSelect, {
+            label: 'target pool',
+            items: pools,
+            value: poolId,
+            onChange: setPoolId,
+            emptyHint: SNAPSHOT_KIND_EMPTY.pools,
+            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
+            ops,
+            allowManual: false,
+            selectLabel: '(select a pool)'
+          })
+        : null,
+      jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'version auto-resolves (agent asks /fetch repo for accepted_version)' }),
+      jsx(SnapshotSelect, {
+        label: '--version (optional)',
         items: [],
         value: version,
         onChange: setVersion,
@@ -754,14 +858,11 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
       mode === 'link'
         ? jsx(SnapshotSelect, {
             label: 'maintainer gateway (profile)',
-            items: gateways,
+            items: gatewayItems,
             value: maintainerGateway,
             onChange: setMaintainerGateway,
             emptyHint: SNAPSHOT_KIND_EMPTY.gateways,
-            allowManual: true,
-            manualPlaceholder: 'default',
-            manualValue: maintainerGateway,
-            onManualChange: setMaintainerGateway,
+            allowManual: false,
             selectLabel: '(select a gateway)'
           })
         : null,
@@ -777,7 +878,7 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
         })
       ] }),
       failureHints(ADD_REPO_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: mode === 'owner' ? 'Add repo (owner fast path)' : 'Add repo (link flow: build bundle → deliver)' })
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: mode === 'owner' ? 'Add repo' : 'Contribute repo' })
     ]
   })
 }
@@ -1424,7 +1525,12 @@ function opRow(op) {
             children: `${str(op.gateway) === 'none' ? '' : str(op.gateway)} · ${new Date(op.at).toLocaleString()}`
           }),
           op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${str(op.error)}` }) : null,
-          op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${str(op.args.substatus)}` }) : null
+          op.args && Array.isArray(op.args.substeps)
+            ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: op.args.substeps.map(s => {
+                const done = asArray(op.args.substepsDone).map(String).includes(String(s))
+                return `${done ? '✓' : '○'} ${str(s)}`
+              }).join('  ') })
+            : (op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${str(op.args.substatus)}` }) : null)
         ]
       }),
       jsx('span', { className: opPillClass(op.status), children: str(OP_STATUS_PILL[op.status] || op.status) })

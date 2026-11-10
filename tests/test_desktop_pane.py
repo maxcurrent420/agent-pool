@@ -473,3 +473,112 @@ def test_snapshot_select_and_helpers_exist():
                  "Request the grant first (Step 1)",
                  "Version resolves automatically"]:
         assert hint in src, hint
+
+
+# --- Task 3: repo add flow without typing a path ------------------------------
+
+def _load_add_repo_helpers(src):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    parts = []
+    for pattern in [
+        r"function str\(v\) \{.*?\n\}\n",
+        r"function asArray\(v\) \{[^\n]*\n",
+        r"function isAbsoluteLocalPath\(value\) \{.*?\n\}\n",
+        r"export function repoNameFromPath\(path\) \{.*?\n\}\n",
+        r"function normalizeDiscoveredEntry\(raw\) \{.*?\n\}\n",
+        r"export function filterDiscovered\(items\) \{.*?\n\}\n",
+        r"export function resolveAddRepoSelection\(\{ discoveredId, manualPath, discovered \}\) \{.*?\n\}\n",
+        r"function replySuffix\(\) \{.*?\n\}\n",
+        r"export function addRepoOwnerPrompt\(\{ gateway, repoId, path, version \}\) \{.*?\n\}\n",
+        r"export function addRepoLinkPrompt\(\{ gateway, repoId, path, version, maintainerGateway \}\) \{.*?\n\}\n",
+    ]:
+        m = re.search(pattern, src, re.S)
+        assert m, f"missing piece: {pattern}"
+        parts.append(m.group(0))
+    return node, "".join(parts)
+
+
+def _run_node(src, body):
+    node, harness = _load_add_repo_helpers(src)
+    out = subprocess.run([node, "-e", harness + body],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip()
+
+
+def test_add_repo_owner_prompt_golden():
+    src = (DESKTOP / "plugin.js").read_text()
+    out = _run_node(src, "console.log(JSON.stringify(addRepoOwnerPrompt({ gateway: 'default', repoId: 'my-repo', path: '/home/u/my-repo' })));")
+    assert json.loads(out) == (
+        "On the default gateway, register this repo in the pool and ingest it as a new version: "
+        "run /add-repo my-repo --path /home/u/my-repo. If the user did not supply a version and "
+        "the pool already has accepted versions, first ask the maintainer gateway /fetch repo my-repo "
+        "for accepted_version and use the next one. Return the plugin's reply verbatim."
+    )
+    out_v = _run_node(src, "console.log(JSON.stringify(addRepoOwnerPrompt({ gateway: 'default', repoId: 'my-repo', path: '/home/u/my-repo', version: 3 })));")
+    assert "/add-repo my-repo --path /home/u/my-repo --version 3." in json.loads(out_v)
+
+
+def test_add_repo_link_prompt_golden():
+    src = (DESKTOP / "plugin.js").read_text()
+    out = _run_node(src, "console.log(JSON.stringify(addRepoLinkPrompt({ gateway: 'pool-contrib', repoId: 'my-repo', path: '/home/u/my-repo', maintainerGateway: 'default' })));")
+    assert json.loads(out) == (
+        "On the pool-contrib gateway, link this repo into a designated pool (two steps, one tracked operation): "
+        "(1) run scripts/contributor-add.py /home/u/my-repo --repo my-repo and capture the printed manifest_json "
+        "and transfer_ticket; (2) send /add-repo --deliver <transfer_ticket> --manifest '<manifest_json>' --repo my-repo "
+        "to default's bot. Do not use remote URLs — local paths only. Return the plugin's reply verbatim."
+    )
+
+
+def test_add_repo_flow_state_requires_path_and_composes_verbatim():
+    src = (DESKTOP / "plugin.js").read_text()
+    discovered = [{"id": "/home/u/my-repo", "path": "/home/u/my-repo", "name": "my-repo"}]
+    body = (
+        "const d = " + json.dumps(discovered) + ";\n"
+        "console.log(JSON.stringify(["
+        " resolveAddRepoSelection({ discoveredId: '', discovered: d }),"
+        " resolveAddRepoSelection({ discoveredId: '/home/u/my-repo', discovered: d }),"
+        " resolveAddRepoSelection({ discoveredId: '', manualPath: 'relative/x', discovered: d }),"
+        " resolveAddRepoSelection({ discoveredId: '', manualPath: 'https://evil.example/repo', discovered: d }),"
+        " resolveAddRepoSelection({ discoveredId: '', manualPath: '/home/u/manual-repo', discovered: d })"
+        "]));"
+    )
+    out = json.loads(_run_node(src, body))
+    assert out[0] is None and out[2] is None and out[3] is None
+    assert out[1] == {"path": "/home/u/my-repo", "repoId": "my-repo"}
+    assert out[4] == {"path": "/home/u/manual-repo", "repoId": "manual-repo"}
+    prompt = json.loads(_run_node(src, "console.log(JSON.stringify(addRepoOwnerPrompt({ gateway: 'default', repoId: out_repoId, path: '/home/u/my-repo' })));".replace("out_repoId", "'my-repo'")))
+    assert "/add-repo my-repo --path /home/u/my-repo" in prompt
+
+
+def test_filter_discovered_filters_non_local_paths():
+    src = (DESKTOP / "plugin.js").read_text()
+    items = [
+        "https://github.com/u/repo — remote",
+        "ssh://git@host/repo",
+        "git@github.com:u/repo.git",
+        "relative/path/repo",
+        "/home/u/good-repo — good-repo",
+        {"path": "/home/u/obj-repo"},
+        {"path": "scheme://nope"},
+        "/home/u/plain",
+    ]
+    body = "console.log(JSON.stringify(filterDiscovered(" + json.dumps(items) + ")));"
+    out = json.loads(_run_node(src, body))
+    paths = [e["path"] for e in out]
+    assert paths == ["/home/u/good-repo", "/home/u/obj-repo", "/home/u/plain"], paths
+
+
+def test_add_repo_form_rework_markers():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert "filterDiscovered" in src
+    assert "version auto-resolves (agent asks /fetch repo for accepted_version)" in src
+    assert "entries skipped (non-local paths)" in src
+    assert "'Add repo'" in src and "'Contribute repo'" in src
+    assert "substeps: ['build bundle', 'deliver']" in src
+    assert "args.substepsDone" in src or "substepsDone" in src
+    # Manual path only behind the disclosure; the standalone absolute-path field is gone.
+    assert "field('local path (absolute)'" not in src
+    assert "field('repo_id'" not in src
