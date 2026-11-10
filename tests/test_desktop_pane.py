@@ -333,3 +333,64 @@ def test_desktop_plugin_str_guard_defined_and_used():
     # Error boundary present so a render error cannot take down the chat UI.
     assert "getDerivedStateFromError" in src
     assert "PoolErrorBoundary" in src
+
+
+# --- Task 1: snapshot schema + discovery prompts -----------------------------
+# Note on manifest parity: discoverReposPrompt() deliberately names NO slash
+# command and no plugin script — it asks the agent to enumerate host git repos
+# read-only. Discovery is therefore OUTSIDE the slash-command manifest parity
+# set enforced by test_ops_manifest_to_prompts_parity /
+# test_prompts_to_manifest_parity, by design.
+
+def test_snapshot_read_malformed_returns_empty_list():
+    src = (DESKTOP / "plugin.js").read_text()
+    m = re.search(r"export function readSnapshot\(ctx, key\) \{.*?\n\}", src, re.S)
+    assert m, "readSnapshot helper missing"
+    body = m.group(0)
+    assert "return []" in body
+    assert "catch" in body
+
+
+def test_snapshot_keys_and_shape_documented():
+    src = (DESKTOP / "plugin.js").read_text()
+    for key in ["snapshot.repos", "snapshot.tasks", "snapshot.claims",
+                "snapshot.discovered", "snapshot.poolStatus", "snapshot.gateways"]:
+        assert key in src, f"snapshot key {key} missing from plugin.js"
+    assert "SNAPSHOT_KEYS" in src
+
+
+def test_discover_repos_prompt_agent_scoped():
+    src = (DESKTOP / "plugin.js").read_text()
+    m = re.search(r"export function discoverReposPrompt\(\) \{\s*return '([^']+)'", src)
+    assert m, "discoverReposPrompt missing"
+    prompt = m.group(1)
+    assert "~/Documents" in prompt and "~/projects" in prompt
+    # Instructs the agent; executes nothing itself; names no slash command.
+    assert not re.search(r"/(add-repo|fetch|claim|push|audit|pool)(?![\w-])", prompt)
+    assert "scripts/" not in prompt
+    # The pane itself never touches the filesystem.
+    assert "fs." not in src.lower() or "fsync" not in src  # sanity: no fs module use
+    assert "require('fs" not in src and 'from \'fs\'' not in src
+
+
+def test_full_refresh_prompt_covers_four_sources():
+    src = (DESKTOP / "plugin.js").read_text()
+    m = re.search(r"export const FULL_REFRESH_PROMPT = '([^']+)'", src)
+    assert m, "FULL_REFRESH_PROMPT missing"
+    prompt = m.group(1)
+    assert "pool_status" in prompt
+    assert "/fetch repo list" in prompt
+    assert "/fetch task list" in prompt
+    assert "pool_pane_report" in prompt
+
+
+def test_discover_op_kind_tracked():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert "'discover'" in src
+    assert re.search(r"OP_KINDS = \[[^\]]*'discover'", src)
+
+
+def test_discover_repos_button_present():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert "Discover repos" in src
+    assert src.count("Discover repos") >= 1

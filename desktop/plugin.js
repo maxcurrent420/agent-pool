@@ -37,10 +37,10 @@ function str(v) {
 // and the pool_pane_report sidecar (read via ctx.rest('/pane-state')).
 //
 // Op kinds: {add-repo-owner, add-repo-link, fetch-tasks, claim, pull, push,
-// approve, merge}. Older builds wrote 'add-repo' — migrateOps() upgrades
+// approve, merge, discover}. Older builds wrote 'add-repo' — migrateOps() upgrades
 // those records in place so prior ops survive.
 
-export const OP_KINDS = ['add-repo-owner', 'add-repo-link', 'fetch-tasks', 'claim', 'pull', 'push', 'approve', 'merge']
+export const OP_KINDS = ['add-repo-owner', 'add-repo-link', 'fetch-tasks', 'claim', 'pull', 'push', 'approve', 'merge', 'discover']
 
 export const OPS_KEY = 'ops'
 export const OPS_KEEP = 200
@@ -81,7 +81,7 @@ export function isActiveStatus(status) {
 // --- sidecar parsing (defensive: empty/missing never throws) ----------------
 
 export function parsePaneState(raw) {
-  const empty = { poolStatus: null, tasks: null, claims: null, awaitingApproval: [], budgets: [], at: null }
+  const empty = { poolStatus: null, tasks: null, claims: null, discovered: null, awaitingApproval: [], budgets: [], at: null }
   if (!raw || typeof raw !== 'object') return empty
   const ps = raw.pool_status || raw.poolStatus || raw.status || null
   const parsed = { ...empty, at: typeof raw.at === 'number' ? raw.at : (typeof raw.updated_at === 'number' ? raw.updated_at : Date.now()) }
@@ -94,6 +94,11 @@ export function parsePaneState(raw) {
   if (tasks) parsed.tasks = tasks
   const claims = raw.claims || null
   if (claims) parsed.claims = claims
+  // Free-form discovery reply (agent-enumerated git repos). Accept either a
+  // pre-split list or a raw detail string; the refresh loop stores it under
+  // snapshot.discovered.
+  const discovered = raw.discovered || raw.discovery || raw.detail || null
+  if (discovered) parsed.discovered = discovered
   return parsed
 }
 
@@ -186,6 +191,62 @@ export function applyPaneStateToOps(ops, parsed) {
     return op
   })
   return { ops: next, changed }
+}
+
+// --- ctx.storage snapshot schema (defensive: malformed reads return []) -----
+// Every snapshot lives under a 'snapshot.*' key as { at: <ms>, items: [...] }.
+// Snapshots are a cache of what the agent last reported — never a source of
+// truth, never written by the pane except as a timestamped slot.
+export const SNAPSHOT_KEYS = ['snapshot.repos', 'snapshot.tasks', 'snapshot.claims', 'snapshot.discovered', 'snapshot.poolStatus', 'snapshot.gateways']
+
+// readSnapshot(ctx, key): returns the snapshot's items array, or [] on
+// anything malformed (missing key, wrong shape, non-array items). Never throws.
+export function readSnapshot(ctx, key) {
+  try {
+    const snap = ctx && ctx.storage ? ctx.storage.get(key, null) : null
+    if (!snap || typeof snap !== 'object') return []
+    if (Array.isArray(snap)) return snap
+    if (Array.isArray(snap.items)) return snap.items
+    if (Array.isArray(snap.table)) return snap.table
+    if (Array.isArray(snap.repos)) return snap.repos
+    if (Array.isArray(snap.tasks)) return snap.tasks
+    if (Array.isArray(snap.claims)) return snap.claims
+    return []
+  } catch {
+    return []
+  }
+}
+
+// One literal prompt asking the agent to enumerate local git repositories.
+// This instructs the AGENT — the pane itself never touches the filesystem.
+// Discovery is outside the slash-command manifest parity set on purpose: it
+// names no plugin command.
+export function discoverReposPrompt() {
+  return 'Discover local git repositories for the pool console: run `git -C ~/Documents rev-parse --is-inside-work-tree` style discovery — list the git repositories under ~/Documents and ~/projects with their absolute paths (one per line, format: <path> — <first remote or directory name>). Do not open, read, or modify any files inside them; just enumerate the worktrees. Reply with the list.'
+}
+
+// One click, four data sources, still one literal prompt.
+export const FULL_REFRESH_PROMPT = 'Report pool status and lists now: run pool_status, run /fetch repo list, run /fetch task list, and call pool_pane_report with all the results (pool_status, repo list, task list).'
+
+// refreshSnapshot(ctx, sessionId, name, gateway): submit the refresh prompt
+// for one snapshot via the composer. 'discover' is tracked as an op of kind
+// 'discover'; other names ride the plain refresh path. Returns the submit
+// result (or null for unknown names / static snapshots like gateways).
+export function refreshSnapshot(ctx, sessionId, name, gateway) {
+  const gw = gateway || 'default'
+  const prompts = {
+    repos: fetchRepoListPrompt({ gateway: gw }),
+    tasks: fetchTaskListPrompt({ gateway: gw }),
+    poolStatus: BATCHED_STATUS_PROMPT,
+    full: FULL_REFRESH_PROMPT,
+    discovered: discoverReposPrompt()
+  }
+  const text = prompts[name]
+  if (!text) return Promise.resolve(null)
+  if (name === 'discovered') {
+    return submitOp(ctx, sessionId, { kind: 'discover', gateway: gw, args: { snapshot: 'snapshot.discovered' }, text })
+  }
+  return host.composer.submit(sessionId, text)
 }
 
 // The one batched UI→agent prompt used for the initial/fallback refresh.
@@ -323,6 +384,12 @@ function hydratePaneStore(storage) {
   // Migrate any pre-Task-8 op records (e.g. kind 'add-repo') in place.
   const { ops, changed } = migrateOps(storage.get(OPS_KEY, []))
   if (changed) storage.set(OPS_KEY, ops)
+  // Seed the gateways snapshot from the known mapping + any operator
+  // settings, so the link flow always has a non-empty dropdown source.
+  const existingGateways = storage.get('snapshot.gateways', null)
+  if (!existingGateways || !Array.isArray(existingGateways.items)) {
+    storage.set('snapshot.gateways', { at: Date.now(), items: KNOWN_GATEWAYS.map(g => ({ ...g })) })
+  }
 }
 
 // Notify the user of an op result and persist which op is highlighted.
@@ -486,6 +553,17 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
       mode === 'link'
         ? field('maintainer gateway (profile)', jsx('input', { className: inputClass, value: maintainerGateway, onChange: e => setMaintainerGateway(e.target.value), placeholder: 'default' }))
         : null,
+      jsx('div', { className: 'flex items-center gap-2', children: [
+        submitButton({
+          disabled: noSession,
+          title: noSession ? submitTitle : 'Ask the agent to enumerate local git repositories (read-only)',
+          onClick: async () => {
+            if (noSession) return
+            await recordOp({ kind: 'discover', gateway, args: { snapshot: 'snapshot.discovered' }, text: discoverReposPrompt() })
+          },
+          children: 'Discover repos'
+        })
+      ] }),
       failureHints(ADD_REPO_FAILURES),
       submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: mode === 'owner' ? 'Add repo (owner fast path)' : 'Add repo (link flow: build bundle → deliver)' })
     ]
@@ -1231,8 +1309,14 @@ function PoolConsole({ ctx }) {
       }
       ctx.storage.set('snapshot.poolStatus', snap)
       setPoolStatus(snap)
-      if (parsed.tasks) ctx.storage.set('snapshot.tasks', { at: snap.at, table: parsed.tasks })
-      if (parsed.claims) ctx.storage.set('snapshot.claims', parsed.claims)
+      if (parsed.tasks) ctx.storage.set('snapshot.tasks', { at: snap.at, items: Array.isArray(parsed.tasks) ? parsed.tasks : (parsed.tasks.items || parsed.tasks.table || []) })
+      if (parsed.claims) ctx.storage.set('snapshot.claims', { at: snap.at, items: Array.isArray(parsed.claims) ? parsed.claims : Object.values(parsed.claims) })
+      if (parsed.discovered) {
+        const items = Array.isArray(parsed.discovered)
+          ? parsed.discovered
+          : String(parsed.discovered).split('\n').map(l => l.trim()).filter(Boolean)
+        ctx.storage.set('snapshot.discovered', { at: snap.at, items })
+      }
     } finally {
       setRefreshing(false)
     }
