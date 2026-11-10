@@ -137,26 +137,24 @@ class PoolService:
             _env_get("AGENT_POOL_TASK_ALLOCATIONS", ""))
         # Maintainer Discord id from config (threaded in by _service_for);
         # AGENT_POOL_MAINTAINER_DISCORD_USER_ID env beats config.
-        _maint_env = _env_get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "").strip()
-        if _maint_env:
-            self._maintainer_discord_user_id = _maint_env
-        else:
-            self._maintainer_discord_user_id = (
-                str(maintainer_discord_user_id).strip()
-                if maintainer_discord_user_id else "")
+        _maint_kw = (
+            str(maintainer_discord_user_id).strip()
+            if maintainer_discord_user_id else "")
+        self._maintainer_discord_user_id = (
+            _maint_kw
+            or _env_get("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "").strip())
         # Maintainer BOT Discord id (the maintainer gateway bot's own
         # Discord id), from config threaded in by _service_for;
         # AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID env beats config.
         # Config resolution only — never a user fallback: this id, like
         # the maintainer user id, is bound to the gateway key at
         # registration and is the only other identity that resolves to it.
-        _maint_bot_env = _env_get("AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID", "").strip()
-        if _maint_bot_env:
-            self._maintainer_bot_discord_user_id = _maint_bot_env
-        else:
-            self._maintainer_bot_discord_user_id = (
-                str(maintainer_bot_discord_user_id).strip()
-                if maintainer_bot_discord_user_id else "")
+        _maint_bot_kw = (
+            str(maintainer_bot_discord_user_id).strip()
+            if maintainer_bot_discord_user_id else "")
+        self._maintainer_bot_discord_user_id = (
+            _maint_bot_kw
+            or _env_get("AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID", "").strip())
         # The agent's configured checkout root for per-ticket worktrees.
         self._worktree_root = (
             worktree_root

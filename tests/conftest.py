@@ -57,3 +57,23 @@ def _isolated_agent_pool_data_dir(tmp_path, monkeypatch):
     # exactly like a real deployment; tests that exercise the missing-id
     # hard-fail delenv it explicitly.
     monkeypatch.setenv("AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID", "maint-bot-1")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _scrub_ambient_agent_pool_env():
+    """Delete ambient AGENT_POOL_* env vars for the whole session.
+
+    An operator shell exports the real pool's maintainer ids; leaking
+    them into construction made fixture ids stop being maintainer ids
+    (16 phantom failures). Scrubbed at session start; the per-test
+    fixture above then sets only what a test deliberately configures.
+    Restored at teardown so the operator's shell is unaffected.
+    """
+    import os as _os
+    saved = {k: v for k, v in _os.environ.items()
+             if k.startswith("AGENT_POOL_")}
+    for k in saved:
+        del _os.environ[k]
+    yield
+    for k, v in saved.items():
+        _os.environ[k] = v

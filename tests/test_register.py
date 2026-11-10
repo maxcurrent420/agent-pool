@@ -114,8 +114,10 @@ def test_register_uses_config_maintainer(tmp_path, monkeypatch):
 
 def test_register_uses_env_maintainer(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_POOL_MAINTAINER_DISCORD_USER_ID", "env-owner")
-    _conn, svc = _svc(tmp_path, maintainer_discord_user_id="config-owner")
-    # env beats config at service construction
+    _conn, svc = _svc(tmp_path)
+    # env provides the maintainer id when no explicit id is threaded;
+    # the plugin layer (__init__.py _maintainer_discord_user_id) already
+    # resolves env-beats-config before threading anything in.
     assert svc._maintainer_discord_user_id == "env-owner"
     out = svc.register_pool("pool-1", "Team")
     assert out["owner_discord_user_id"] == "env-owner"
