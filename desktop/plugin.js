@@ -14,8 +14,247 @@
 import { host, ListRow, PANES_AREA, ROUTES_AREA, SegmentedControl, SIDEBAR_NAV_AREA, ToggleRow, useValue } from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { auditShowPrompt, applyPaneStateToOps, BATCHED_STATUS_PROMPT, isActiveStatus, migrateOps, normalizeKind, OPS_KEEP, OPS_KEY, parsePaneState } from './track.js'
-import { addRepoLinkPrompt, addRepoOwnerPrompt, approvePrompt, claimPrompt, fetchTaskListPrompt, mergePrompt, pullPrompt, pushDeliverPrompt, pushGrantPrompt, pushPackagePrompt } from './prompts.js'
+// --- inlined from track.js (runtime import allowlist: no relative imports) ---
+// Agent Pool — tracker logic (pure, no SDK imports).
+//
+// Pane-local operation log. NOT the ledger: everything here lives in
+// ctx.storage under 'ops' / 'snapshot.*' and is derived from agent replies
+// and the pool_pane_report sidecar (read via ctx.rest('/pane-state')).
+//
+// Op kinds: {add-repo-owner, add-repo-link, fetch-tasks, claim, pull, push,
+// approve, merge}. Older builds wrote 'add-repo' — migrateOps() upgrades
+// those records in place so prior ops survive.
+
+export const OP_KINDS = ['add-repo-owner', 'add-repo-link', 'fetch-tasks', 'claim', 'pull', 'push', 'approve', 'merge']
+
+export const OPS_KEY = 'ops'
+export const OPS_KEEP = 200
+
+const KIND_MIGRATION = {
+  'add-repo': 'add-repo-owner'
+}
+
+export function normalizeKind(kind) {
+  if (typeof kind !== 'string') return kind
+  return KIND_MIGRATION[kind] || kind
+}
+
+// Migrate stored ops in place (called on hydrate). Returns { ops, changed }.
+export function migrateOps(stored) {
+  const list = Array.isArray(stored) ? stored : []
+  let changed = false
+  const ops = list.map(op => {
+    if (!op || typeof op !== 'object') return op
+    const kind = normalizeKind(op.kind)
+    if (kind !== op.kind) {
+      changed = true
+      return { ...op, kind }
+    }
+    return op
+  })
+  return { ops, changed }
+}
+
+export function isAwaitingApprovalStatus(status) {
+  return status === 'done (awaiting approval)'
+}
+
+export function isActiveStatus(status) {
+  return status === 'submitted' || status === 'awaiting agent'
+}
+
+// --- sidecar parsing (defensive: empty/missing never throws) ----------------
+
+export function parsePaneState(raw) {
+  const empty = { poolStatus: null, tasks: null, claims: null, awaitingApproval: [], budgets: [], at: null }
+  if (!raw || typeof raw !== 'object') return empty
+  const ps = raw.pool_status || raw.poolStatus || raw.status || null
+  const parsed = { ...empty, at: typeof raw.at === 'number' ? raw.at : (typeof raw.updated_at === 'number' ? raw.updated_at : Date.now()) }
+  if (ps && typeof ps === 'object') {
+    parsed.poolStatus = ps
+    parsed.awaitingApproval = extractAwaitingApproval(ps)
+    parsed.budgets = extractBudgets(ps)
+  }
+  const tasks = raw.tasks || raw.task_list || null
+  if (tasks) parsed.tasks = tasks
+  const claims = raw.claims || null
+  if (claims) parsed.claims = claims
+  return parsed
+}
+
+function asArray(v) { return Array.isArray(v) ? v : [] }
+
+export function extractAwaitingApproval(ps) {
+  if (!ps || typeof ps !== 'object') return []
+  const direct = ps.awaiting_approval || ps.awaitingApproval || ps.pending_approval || ps.pending
+  const out = []
+  for (const entry of asArray(direct)) {
+    if (entry == null) continue
+    if (typeof entry === 'string') { out.push({ id: entry, raw: entry }); continue }
+    if (typeof entry === 'object') {
+      out.push({
+        id: String(entry.repo_id || entry.repo || entry.ticket_id || entry.ticket || entry.id || entry.version || ''),
+        repo: entry.repo_id || entry.repo || null,
+        ticket: entry.ticket_id || entry.ticket || null,
+        version: entry.version != null ? entry.version : null,
+        raw: entry
+      })
+    }
+  }
+  return out.filter(e => e.id)
+}
+
+// Budget lines: entries mentioning an allocation/used/exhausted shape, or a
+// plain string line containing 'budget'.
+export function extractBudgets(ps) {
+  if (!ps || typeof ps !== 'object') return []
+  const direct = ps.budgets || ps.budget || ps.agent_budgets
+  const out = []
+  if (Array.isArray(direct)) {
+    for (const entry of direct) {
+      if (entry == null) continue
+      if (typeof entry === 'string') { out.push({ line: entry, exhausted: /exhaust|refus/i.test(entry) }); continue }
+      if (typeof entry === 'object') {
+        const used = Number(entry.used ?? entry.completed ?? entry.spent ?? NaN)
+        const alloc = Number(entry.allocation ?? entry.max ?? entry.limit ?? NaN)
+        const exhausted = entry.exhausted === true || (Number.isFinite(used) && Number.isFinite(alloc) && alloc > 0 && used >= alloc)
+        out.push({ ...entry, line: String(entry.line || entry.agent || entry.key || 'budget'), exhausted })
+      }
+    }
+    return out
+  }
+  // Free-text fallback: scan top-level string fields for budget mentions.
+  for (const value of Object.values(ps)) {
+    if (typeof value === 'string' && /budget/i.test(value)) {
+      out.push({ line: value, exhausted: /exhaust|refus/i.test(value) })
+    }
+  }
+  return out
+}
+
+function opMatchesAwaiting(op, entry) {
+  const args = (op && op.args) || {}
+  const candidates = [args.repoId, args.repo, args.ticketId, args.ticket, args.key].filter(Boolean).map(String)
+  if (!candidates.length) return false
+  const ids = [entry.repo, entry.ticket, entry.id].filter(Boolean).map(String)
+  if (ids.some(id => candidates.includes(id))) return true
+  // version-only match for repo pushes
+  if (entry.version != null && args.version != null && String(entry.version) === String(args.version) && entry.repo && candidates.includes(String(entry.repo))) return true
+  return false
+}
+
+// Apply a parsed pane-state to the op list. Returns { ops, changed }.
+// Flip rules:
+//  - push/add-* op whose repo/ticket appears in awaiting_approval
+//      → 'done (awaiting approval)'
+//  - claim op when any budget line is exhausted → 'refused'
+export function applyPaneStateToOps(ops, parsed) {
+  const list = Array.isArray(ops) ? ops : []
+  if (!parsed) return { ops: list, changed: false }
+  const awaiting = asArray(parsed.awaitingApproval)
+  const budgetsExhausted = asArray(parsed.budgets).some(b => b && b.exhausted)
+  let changed = false
+  const next = list.map(op => {
+    if (!op || typeof op !== 'object') return op
+    if (op.status === 'done' || op.status === 'failed') return op
+    let status = op.status
+    if ((op.kind === 'push' || op.kind === 'add-repo-owner' || op.kind === 'add-repo-link')
+        && awaiting.some(entry => opMatchesAwaiting(op, entry))) {
+      status = 'done (awaiting approval)'
+    } else if (op.kind === 'claim' && budgetsExhausted && isActiveStatus(op.status)) {
+      status = 'refused'
+    }
+    if (status !== op.status) {
+      changed = true
+      return { ...op, status, replyRef: parsed.at || op.replyRef || null }
+    }
+    return op
+  })
+  return { ops: next, changed }
+}
+
+// The one batched UI→agent prompt used for the initial/fallback refresh.
+export const BATCHED_STATUS_PROMPT = 'Report pool status now: run pool_status and /fetch repo list, call pool_pane_report with the results.'
+
+// Audit view prompt (composed, submitted through the composer like any op).
+export function auditShowPrompt(gateway, ticketId) {
+  const t = (ticketId || '').trim()
+  return `Using the ${gateway} gateway profile: run /audit show${t ? ` ${t}` : ''} and report the result verbatim.`
+}
+
+// --- inlined from prompts.js (runtime import allowlist: no relative imports) ---
+// Agent Pool — prompt builders for the desktop pane.
+//
+// Pure functions, no SDK import: each builder turns form state into the exact
+// prompt text the pane submits to the bound agent session. Every prompt
+// names the gateway profile, carries the literal slash command or script
+// invocation with the form's fields as args, and asks the agent to return
+// the plugin's reply verbatim. The pane never free-hands an operation.
+
+function replySuffix() {
+  return 'Return the plugin\'s reply verbatim.'
+}
+
+export function addRepoOwnerPrompt({ gateway, repoId, path, version }) {
+  const versionFlag = version ? ` --version ${version}` : ''
+  return `On the ${gateway} gateway, register this repo in the pool and ingest it as a new version: run /add-repo ${repoId} --path ${path}${versionFlag}. If the user did not supply a version and the pool already has accepted versions, first ask the maintainer gateway /fetch repo ${repoId} for accepted_version and use the next one. ${replySuffix()}`
+}
+
+export function addRepoLinkPrompt({ gateway, repoId, path, version, maintainerGateway }) {
+  const versionFlag = version ? ` --version ${version}` : ''
+  const target = maintainerGateway || 'the designated pool maintainer'
+  return `On the ${gateway} gateway, link this repo into a designated pool (two steps, one tracked operation): (1) run scripts/contributor-add.py ${path} --repo ${repoId}${versionFlag} and capture the printed manifest_json and transfer_ticket; (2) send /add-repo --deliver <transfer_ticket> --manifest '<manifest_json>' --repo ${repoId} to ${target}'s bot. Do not use remote URLs — local paths only. ${replySuffix()}`
+}
+
+export function fetchRepoListPrompt({ gateway }) {
+  return `On the ${gateway} gateway, list the pools and repos: run /fetch repo list. ${replySuffix()}`
+}
+
+export function fetchTaskListPrompt({ gateway, repoId }) {
+  const filter = repoId ? ` --repo ${repoId}` : ''
+  return `On the ${gateway} gateway, bootstrap the catalog and list tasks: run /fetch repo list, then run /fetch task list${filter}. Reply with the task table. ${replySuffix()}`
+}
+
+export function claimPrompt({ gateway, ticketId, maxTasks }) {
+  if (maxTasks && !ticketId) {
+    return `On the ${gateway} gateway, auto-assign work: run /claim --any-project --max-tasks ${maxTasks}. Save the reply's worktree_path, branch (pool/<ticket_id>), base_ref and budget into the reply text so the pane can record them. ${replySuffix()}`
+  }
+  return `On the ${gateway} gateway, claim this ticket: run /claim ${ticketId}. Save the reply's worktree_path, branch (pool/${ticketId}), base_ref and budget into the reply text so the pane can record them. ${replySuffix()}`
+}
+
+export function pullPrompt({ gateway, repoId, ticketId, replyFile, dest }) {
+  const ticket = ticketId || repoId
+  const replyRef = replyFile ? ` --reply-file ${replyFile}` : ' --reply-file <saved claim reply json>'
+  const destRef = dest || '<destination dir>'
+  return `On the ${gateway} gateway, fetch the accepted bytes for ticket ${ticket} into a worktree: run scripts/contributor-claim.py ${ticket}${replyRef} --dest ${destRef}. Show the resulting worktree_path and branch. ${replySuffix()}`
+}
+
+export function pushGrantPrompt({ gateway, repoId, ticketId }) {
+  return `On the ${gateway} gateway, request a push grant: run /push repo ${repoId} --ticket ${ticketId}. Return the grant token verbatim. ${replySuffix()}`
+}
+
+export function pushPackagePrompt({ gateway, worktreePath, repoId, poolId, version }) {
+  return `On the ${gateway} gateway, package the completed work: run scripts/contributor-push.py ${worktreePath} --repo ${repoId} --pool ${poolId} --version ${version}. Take next_version from the grant reply or re-ask /fetch repo ${repoId} for accepted_version; never trust enroll-time chain_tips. ${replySuffix()}`
+}
+
+export function pushDeliverPrompt({ gateway, repoId, version, ticketJson, transferTicket, grantToken }) {
+  const tokenFlag = grantToken ? ` --token ${grantToken}` : ' --token <grant_token>'
+  return `On the ${gateway} gateway, deliver the packaged repo ${repoId} version ${version}: run /push repo --deliver ${transferTicket}${tokenFlag} --manifest '${ticketJson}'. Note: a redelivery is legal — the grant is not consumed by deliver — so offer "Retry deliver" on transport failure. ${replySuffix()}`
+}
+
+export function approvePrompt({ gateway, repoId, version, ticketId, deny }) {
+  const denyFlag = deny ? ' --deny' : ''
+  const target = ticketId
+    ? `--ticket ${ticketId}`
+    : `--repo ${repoId}${version ? ` --version ${version}` : ''}`
+  return `On the ${gateway} gateway, OWNER ONLY: run scripts/pool-approve.py ${target}${denyFlag}. If the plugin refuses because this profile is not the pool owner, report the refusal verbatim and do not retry. ${replySuffix()}`
+}
+
+export function mergePrompt({ gateway, repoId, ticketId, checkoutPath }) {
+  const target = ticketId ? `ticket ${ticketId}` : `repo ${repoId}`
+  const dest = checkoutPath || `work/integrate/${repoId}/`
+  return `On the ${gateway} gateway, OWNER ONLY: merge the approved bundle for ${target}: the plugin never merges — run the merge yourself. git fetch <approved bundle> and git merge it into the canonical checkout at ${dest}. Where the maintainer flow calls the merge_approved service path (tickets.py:2249), do it through the plugin's documented flow, never a side import. If the audit is not clean, there is no accepted bundle for the version, or the plugin refuses because this profile is not the pool owner, report the refusal/failure verbatim and do not retry. ${replySuffix()}`
+}
 
 // Contribution ids are namespaced by the host as '<plugin id>:<local id>'.
 // The pane's error card names the contribution it came from.

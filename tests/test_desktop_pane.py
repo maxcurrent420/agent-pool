@@ -143,17 +143,19 @@ DOCUMENTED_SCRIPTS = {
 
 
 def test_artifacts_exist_in_repo():
-    for rel in ["desktop/plugin.js", "desktop/prompts.js", "desktop/track.js",
+    for rel in ["desktop/plugin.js",
                 "desktop/ops-manifest.json",
                 "dashboard/plugin_api.py", "dashboard/manifest.json"]:
         assert (ROOT / rel).is_file(), rel
+    for rel in ["desktop/prompts.js", "desktop/track.js"]:
+        assert not (ROOT / rel).exists(), f"{rel} must be inlined into plugin.js"
 
 
 def test_installed_tree_artifacts_optional():
     installed = Path.home() / ".hermes" / "plugins" / "agent-pool"
     if not installed.is_dir():
         pytest.skip("installed tree not present")
-    for rel in ["desktop/plugin.js", "desktop/prompts.js", "desktop/track.js",
+    for rel in ["desktop/plugin.js",
                 "desktop/ops-manifest.json",
                 "dashboard/plugin_api.py", "dashboard/manifest.json"]:
         assert (installed / rel).is_file(), rel
@@ -170,13 +172,14 @@ def test_plugin_js_import_allowlist():
     specs = _import_specifiers(DESKTOP / "plugin.js")
     assert specs, "expected imports in plugin.js"
     for spec in specs:
-        assert spec in SDK_ALLOWLIST or spec.startswith("./"), \
+        assert spec in SDK_ALLOWLIST, \
             f"disallowed import specifier: {spec}"
 
 
-def test_track_and_prompts_are_pure():
-    for name in ("track.js", "prompts.js"):
-        assert _import_specifiers(DESKTOP / name) == [], name
+def test_plugin_js_no_relative_imports():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert not re.search(r"""(?:from|import)\s+['"]\.""", src), \
+        "plugin.js must contain zero relative imports"
 
 
 def _scan_sources():
@@ -266,33 +269,37 @@ def test_ops_manifest_within_documented_surface():
 
 
 def test_ops_manifest_to_prompts_parity():
-    prompts = (DESKTOP / "prompts.js").read_text()
+    src = (DESKTOP / "plugin.js").read_text()
+    # Scan only the inlined prompts.js section — same corpus as before the merge.
+    prompts = src[src.index("// --- inlined from prompts.js"):src.index("// Contribution ids", src.index("// --- inlined from prompts.js"))]
     for op in _load_manifest()["operations"]:
         for cmd in op["commands"]:
-            assert cmd in prompts, f"{op['kind']}: {cmd!r} not in prompts.js"
+            assert cmd in prompts, f"{op['kind']}: {cmd!r} not in plugin.js"
         if op["script"] is not None:
-            assert op["script"] in prompts, f"{op['kind']}: {op['script']} not in prompts.js"
+            assert op["script"] in prompts, f"{op['kind']}: {op['script']} not in plugin.js"
 
 
 def test_prompts_to_manifest_parity():
-    prompts = (DESKTOP / "prompts.js").read_text()
+    src = (DESKTOP / "plugin.js").read_text()
+    # Scan only the inlined prompts.js section — same corpus as before the merge.
+    prompts = src[src.index("// --- inlined from prompts.js"):src.index("// Contribution ids", src.index("// --- inlined from prompts.js"))]
     manifest = _load_manifest()["operations"]
     manifest_cmds = [c for op in manifest for c in op["commands"]]
     manifest_scripts = [op["script"] for op in manifest if op["script"]]
     manifest_verbs = {re.match(r"^/([a-z-]+)", c).group(1) for c in manifest_cmds}
     for verb in set(re.findall(r"/(add-repo|fetch|task|task_add|task_list|claim|release|push|audit|pool)(?![\w-])", prompts)):
         assert verb in DOCUMENTED_COMMANDS
-        assert verb in manifest_verbs, f"prompts.js invokes /{verb} absent from manifest"
+        assert verb in manifest_verbs, f"plugin.js invokes /{verb} absent from manifest"
     for script in set(re.findall(r"scripts/[a-z-]+\.py", prompts)):
         assert script in DOCUMENTED_SCRIPTS
-        assert script in manifest_scripts, f"prompts.js invokes {script} absent from manifest"
+        assert script in manifest_scripts, f"plugin.js invokes {script} absent from manifest"
 
 
 def test_node_check_js_files():
     node = shutil.which("node")
     if not node:
         pytest.skip("node not available")
-    for name in ("plugin.js", "prompts.js", "track.js"):
+    for name in ("plugin.js",):
         result = subprocess.run([node, "--check", str(DESKTOP / name)],
                                 capture_output=True, text=True)
         assert result.returncode == 0, f"{name}: {result.stderr}"
