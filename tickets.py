@@ -1548,6 +1548,20 @@ class PoolService:
             from propagation import _verify_key
         if not C.verify_manifest(_verify_key(submitter), manifest):
             raise RuntimeError("add-repo manifest signature does not verify")
+        existing = self._conn.execute(
+            "SELECT state, manifest_hash FROM repo_versions "
+            "WHERE repo_id=? AND version=?",
+            (manifest["repo_id"], int(manifest["version"]))).fetchone()
+        if existing is not None and existing["state"] == "accepted":
+            L.record_event(self._conn, resolved, "repo_submission_refused",
+                           {"repo_id": manifest["repo_id"],
+                            "version": manifest.get("version"),
+                            "reason": "version_collision"})
+            raise L.VersionCollisionError(
+                f"{manifest['repo_id']} v{manifest['version']} is already "
+                f"accepted on this pool — the contributor must re-mint the "
+                f"next version and deliver a new bundle (this signed manifest "
+                f"cannot be re-versioned).")
         maintainer = prop._members.get(prop._maintainer_key_id)
         if maintainer is None:
             raise RuntimeError(
@@ -1565,9 +1579,16 @@ class PoolService:
         except ImportError:  # flat import (pytest from repo root)
             from propagation import manifest_hash as _manifest_hash
         m_hash = _manifest_hash(manifest)
-        L.record_submission(self._conn, manifest["repo_id"],
-                            int(manifest["version"]), m_hash,
-                            json.dumps(manifest, sort_keys=True))
+        try:
+            L.record_submission(self._conn, manifest["repo_id"],
+                                int(manifest["version"]), m_hash,
+                                json.dumps(manifest, sort_keys=True))
+        except L.VersionCollisionError:
+            L.record_event(self._conn, resolved, "repo_submission_refused",
+                           {"repo_id": manifest["repo_id"],
+                            "version": manifest.get("version"),
+                            "reason": "version_collision"})
+            raise
         if report.get("verdict") != "clean":
             hits = report.get("hits", [])
             L.record_event(self._conn, resolved, "repo_submission_refused",
@@ -1893,6 +1914,20 @@ class PoolService:
             from propagation import _verify_key
         if not C.verify_manifest(_verify_key(submitter), manifest):
             raise RuntimeError("push manifest signature does not verify")
+        existing = self._conn.execute(
+            "SELECT state, manifest_hash FROM repo_versions "
+            "WHERE repo_id=? AND version=?",
+            (manifest["repo_id"], int(manifest["version"]))).fetchone()
+        if existing is not None and existing["state"] == "accepted":
+            L.record_event(self._conn, resolved, "repo_submission_refused",
+                           {"repo_id": manifest["repo_id"],
+                            "version": manifest.get("version"),
+                            "reason": "version_collision"})
+            raise L.VersionCollisionError(
+                f"{manifest['repo_id']} v{manifest['version']} is already "
+                f"accepted on this pool — the contributor must re-mint the "
+                f"next version and deliver a new bundle (this signed manifest "
+                f"cannot be re-versioned).")
         maintainer = prop._members.get(prop._maintainer_key_id)
         if maintainer is None:
             raise RuntimeError(
@@ -1924,9 +1959,16 @@ class PoolService:
         except ImportError:  # flat import (pytest from repo root)
             from propagation import manifest_hash as _manifest_hash
         m_hash = _manifest_hash(manifest)
-        L.record_submission(self._conn, manifest["repo_id"],
-                            int(manifest["version"]), m_hash,
-                            json.dumps(manifest, sort_keys=True))
+        try:
+            L.record_submission(self._conn, manifest["repo_id"],
+                                int(manifest["version"]), m_hash,
+                                json.dumps(manifest, sort_keys=True))
+        except L.VersionCollisionError:
+            L.record_event(self._conn, resolved, "repo_submission_refused",
+                           {"repo_id": manifest["repo_id"],
+                            "version": manifest.get("version"),
+                            "reason": "version_collision"})
+            raise
         notice = (f"push for ticket {ticket['ticket_id']} recorded as "
                   f"submitted ({manifest['repo_id']} "
                   f"v{manifest['version']}, {m_hash[:12]}); awaiting "
