@@ -810,6 +810,8 @@ export function resolveAddRepoSelection({ discoveredId, manualPath, discovered }
 // these labels; everything else is a sub-step or a secondary action.
 export const PRIMARY_BUTTONS = {
   addRepo: 'Add repo',
+  addRepoLink: 'Contribute repo',
+  discover: 'Discover repos',
   fetchTasks: 'Fetch tasks',
   claim: 'Claim',
   pull: 'Pull repo',
@@ -1137,7 +1139,7 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
         })
       ] }),
       failureHints(ADD_REPO_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: mode === 'owner' ? PRIMARY_BUTTONS.addRepo : 'Contribute repo' })
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: mode === 'owner' ? PRIMARY_BUTTONS.addRepo : PRIMARY_BUTTONS.addRepoLink })
     ]
   })
 }
@@ -2184,7 +2186,7 @@ function OnboardingCard({ ctx, sessionId, gateway, recordOp, noSession }) {
         className: 'flex items-center gap-2',
         children: [
           submitButton({ disabled: noSession, title: noSession ? 'no focused chat session — focus a chat to submit' : 'Load pools, repos and the approval queue', onClick: onRefresh, children: 'Refresh pools' }),
-          submitButton({ disabled: noSession, title: noSession ? 'no focused chat session — focus a chat to submit' : 'Ask the agent to enumerate local git repositories (read-only)', onClick: onDiscover, children: 'Discover repos' })
+          submitButton({ disabled: noSession, title: noSession ? 'no focused chat session — focus a chat to submit' : 'Ask the agent to enumerate local git repositories (read-only)', onClick: onDiscover, children: PRIMARY_BUTTONS.discover })
         ]
       })
     ]

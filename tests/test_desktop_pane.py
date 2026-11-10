@@ -848,3 +848,180 @@ def test_stale_strip_absent_when_snapshot_exists():
     assert "① Click Refresh pools" in src
     assert "Loading…" in src
     assert "loadingKey: 'repos'" in src and "loadingKey: 'tasks'" in src and "loadingKey: 'discovered'" in src
+
+
+# --- Task 7: UX-guarantee battery completion -----------------------------------
+
+def test_forbidden_patterns_extend_file_apis():
+    # In-frame file APIs are banned outright; plugin.js also contains no
+    # word-boundary 'drop' (drag-drop of host paths must never exist).
+    src = (DESKTOP / "plugin.js").read_text()
+    for pat in ["FileReader", "DataTransfer", "createObjectURL"]:
+        assert pat not in src, pat
+    assert not re.search(r"(?<![\w])drop(?![\w])", src), "word-boundary 'drop' found"
+    # Same scan across the shipped desktop sources.
+    for f in DESKTOP.glob("*.js"):
+        s = f.read_text()
+        for pat in ["FileReader", "DataTransfer", "createObjectURL"]:
+            assert pat not in s, f"{f}: {pat}"
+        assert not re.search(r"(?<![\w])drop(?![\w])", s), f"{f}: word-boundary 'drop'"
+
+
+def test_dropdown_options_empty_exact_list_and_label_shape():
+    # optionsFor on a fake snapshot yields labeled options (id — title shape);
+    # on empty yields exactly placeholder + manual fallback with the empty-hint.
+    src = (DESKTOP / "plugin.js").read_text()
+    options = _run_options_for(src,
+        {"tasks": [{"ticket_id": "42", "title": "fix parser", "repo": "my-repo"}]},
+        "tasks")
+    labels = [o["label"] for o in options]
+    assert any(l.startswith("42") or "ticket 42" in l for l in labels), labels
+    task_opts = [o for o in options if o["value"] == "42"]
+    assert task_opts and "fix parser" in task_opts[0]["label"], options
+    empty = _run_options_for(src, {}, "repos")
+    assert [o["label"] for o in empty] == [
+        "No repos in the pool yet — click Refresh pools or Add repo",
+        "(enter manually…)",
+    ], empty
+    assert empty[0]["value"] == ""
+
+
+def test_primary_button_per_flow_full_nine_kinds():
+    src = (DESKTOP / "plugin.js").read_text()
+    m = re.search(r"export const PRIMARY_BUTTONS = \{.*?\n\}", src, re.S)
+    assert m, "PRIMARY_BUTTONS table missing"
+    table = m.group(0)
+    kind_to_key = {
+        "add-repo-owner": "addRepo",
+        "add-repo-link": "addRepoLink",
+        "fetch-tasks": "fetchTasks",
+        "claim": "claim",
+        "pull": "pull",
+        "push": "push",
+        "approve": "approve",
+        "merge": "merge",
+        "discover": "discover",
+    }
+    keys = re.findall(r"^\s*(\w+):", table, re.M)
+    for kind, key in kind_to_key.items():
+        assert key in keys, f"{kind} -> {key} missing from PRIMARY_BUTTONS"
+        assert f"PRIMARY_BUTTONS.{key}" in src, f"PRIMARY_BUTTONS.{key} unused"
+    # Exactly one primary entry per kind: no duplicate primary labels among the nine.
+    labels = dict(re.findall(r"(\w+): '([^']+)'", table))
+    nine = [labels[k] for k in kind_to_key.values()]
+    assert len(set(nine)) == len(nine) == 9, nine
+
+
+def test_confirm_gate_approve_and_merge_only():
+    src = (DESKTOP / "plugin.js").read_text()
+    # finalizeOp: no confirm -> null; confirm -> draft carrying the literal command.
+    for kind, cmd in [("approve", "scripts/pool-approve.py --repo my-repo --version 3"),
+                      ("merge", "git merge")]:
+        body = (
+            f"const draft = {{ kind: '{kind}', gateway: 'default', args: {{}}, text: 'run {cmd}' }};\n"
+            "console.log(JSON.stringify(["
+            " finalizeOp(draft, { confirmed: false }),"
+            " finalizeOp(draft, {}),"
+            " finalizeOp(draft, { confirmed: true })"
+            "]));"
+        )
+        out = json.loads(_run_confirm_node(src, body))
+        assert out[0] is None and out[1] is None
+        assert out[2]["kind"] == kind and cmd in out[2]["text"]
+    # Kinds-only scoping: finalizeOp call sites are exactly the approve and
+    # merge confirm handlers — no other flow submits through the gate.
+    sites = [m.start() for m in re.finditer(r"finalizeOp\(", src)]
+    assert len(sites) == 4  # comment + definition + two call sites
+    call_sites = [s for s in sites
+                  if not src[max(0, s - 20):s].rstrip().endswith(("//", "function"))]
+    assert len(call_sites) == 2
+    for site in call_sites:
+        window = src[max(0, site - 4000):site]
+        assert ("kind: 'approve'" in window or "kind: 'merge'" in window), \
+            "finalizeOp called outside approve/merge confirm handlers"
+
+
+def _prompt_builder_inventory(src):
+    fns = re.findall(r"export function (\w*[Pp]rompt)\(", src)
+    consts = re.findall(r"export const (\w*[Pp]ROMPT|\w*PROMPT) = ", src)
+    return sorted(set(fns) | set(consts))
+
+
+def test_prompt_golden_strings_all_builders():
+    src = (DESKTOP / "plugin.js").read_text()
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    golden = {
+        "discoverReposPrompt": "Discover local git repositories for the pool console: run `git -C ~/Documents rev-parse --is-inside-work-tree` style discovery — list the git repositories under ~/Documents and ~/projects with their absolute paths (one per line, format: <path> — <first remote or directory name>). Do not open, read, or modify any files inside them; just enumerate the worktrees. Reply with the list.",
+        "auditShowPrompt": "Using the default gateway profile: run /audit show 42 and report the result verbatim.",
+        "addRepoOwnerPrompt": "On the default gateway, register this repo in the pool and ingest it as a new version: run /add-repo my-repo --path /home/u/my-repo --version 3. If the user did not supply a version and the pool already has accepted versions, first ask the maintainer gateway /fetch repo my-repo for accepted_version and use the next one. Return the plugin's reply verbatim.",
+        "addRepoLinkPrompt": "On the default gateway, link this repo into a designated pool (two steps, one tracked operation): (1) run scripts/contributor-add.py /home/u/my-repo --repo my-repo --version 3 and capture the printed manifest_json and transfer_ticket; (2) send /add-repo --deliver <transfer_ticket> --manifest '<manifest_json>' --repo my-repo to maint's bot. Do not use remote URLs — local paths only. Return the plugin's reply verbatim.",
+        "fetchRepoListPrompt": "On the default gateway, list the pools and repos: run /fetch repo list. Return the plugin's reply verbatim.",
+        "fetchTaskListPrompt": "On the default gateway, bootstrap the catalog and list tasks: run /fetch repo list, then run /fetch task list --repo my-repo. Reply with the task table. Return the plugin's reply verbatim.",
+        "claimPrompt": "On the default gateway, claim this ticket: run /claim 42. Save the reply's worktree_path, branch (pool/42), base_ref and budget into the reply text so the pane can record them. Return the plugin's reply verbatim.",
+        "pullPrompt": "On the default gateway, fetch the accepted bytes for ticket 42 into a worktree: run scripts/contributor-claim.py 42 --reply-file reply.json --dest /tmp/dest. Show the resulting worktree_path and branch. Return the plugin's reply verbatim.",
+        "pushGrantPrompt": "On the default gateway, request a push grant: run /push repo my-repo --ticket 42. Return the grant token verbatim. Return the plugin's reply verbatim.",
+        "pushPackagePrompt": "On the default gateway, package the completed work: run scripts/contributor-push.py /wt --repo my-repo --pool pool-1 --version 3. Take next_version from the grant reply or re-ask /fetch repo my-repo for accepted_version; never trust enroll-time chain_tips. Return the plugin's reply verbatim.",
+        "pushDeliverPrompt": "On the default gateway, deliver the packaged repo my-repo version 3: run /push repo --deliver tt-1 --token tok-abc123 --manifest '{}'. Note: a redelivery is legal — the grant is not consumed by deliver — so offer \"Retry deliver\" on transport failure. Return the plugin's reply verbatim.",
+        "approvePrompt": "On the default gateway, OWNER ONLY: run scripts/pool-approve.py --repo my-repo --version 3. If the plugin refuses because this profile is not the pool owner, report the refusal verbatim and do not retry. Return the plugin's reply verbatim.",
+        "mergePrompt": "On the default gateway, OWNER ONLY: merge the approved bundle for ticket 42: the plugin never merges — run the merge yourself. git fetch <approved bundle> and git merge it into the canonical checkout at /co. Where the maintainer flow calls the merge_approved service path (tickets.py:2249), do it through the plugin's documented flow, never a side import. If the audit is not clean, there is no accepted bundle for the version, or the plugin refuses because this profile is not the pool owner, report the refusal/failure verbatim and do not retry. Return the plugin's reply verbatim.",
+        "FULL_REFRESH_PROMPT": "Report pool status and lists now: run pool_status, run /fetch repo list, run /fetch task list, and call pool_pane_report with all the results (pool_status, repo list, task list).",
+        "BATCHED_STATUS_PROMPT": "Report pool status now: run pool_status and /fetch repo list, call pool_pane_report with the results.",
+    }
+    inventory = _prompt_builder_inventory(src)
+    # Dynamic enumeration: every exported prompt builder/const must have a golden entry.
+    missing = [name for name in inventory if name not in golden]
+    assert not missing, f"prompt builders without golden coverage: {missing}"
+    calls = {
+        "discoverReposPrompt": "discoverReposPrompt()",
+        "auditShowPrompt": "auditShowPrompt('default', '42')",
+        "addRepoOwnerPrompt": "addRepoOwnerPrompt({ gateway: 'default', repoId: 'my-repo', path: '/home/u/my-repo', version: 3 })",
+        "addRepoLinkPrompt": "addRepoLinkPrompt({ gateway: 'default', repoId: 'my-repo', path: '/home/u/my-repo', version: 3, maintainerGateway: 'maint' })",
+        "fetchRepoListPrompt": "fetchRepoListPrompt({ gateway: 'default' })",
+        "fetchTaskListPrompt": "fetchTaskListPrompt({ gateway: 'default', repoId: 'my-repo' })",
+        "claimPrompt": "claimPrompt({ gateway: 'default', ticketId: '42' })",
+        "pullPrompt": "pullPrompt({ gateway: 'default', repoId: 'my-repo', ticketId: '42', replyFile: 'reply.json', dest: '/tmp/dest' })",
+        "pushGrantPrompt": "pushGrantPrompt({ gateway: 'default', repoId: 'my-repo', ticketId: '42' })",
+        "pushPackagePrompt": "pushPackagePrompt({ gateway: 'default', worktreePath: '/wt', repoId: 'my-repo', poolId: 'pool-1', version: 3 })",
+        "pushDeliverPrompt": "pushDeliverPrompt({ gateway: 'default', repoId: 'my-repo', version: 3, ticketJson: '{}', transferTicket: 'tt-1', grantToken: 'tok-abc123' })",
+        "approvePrompt": "approvePrompt({ gateway: 'default', repoId: 'my-repo', version: 3 })",
+        "mergePrompt": "mergePrompt({ gateway: 'default', repoId: 'my-repo', ticketId: '42', checkoutPath: '/co' })",
+        "FULL_REFRESH_PROMPT": "FULL_REFRESH_PROMPT",
+        "BATCHED_STATUS_PROMPT": "BATCHED_STATUS_PROMPT",
+    }
+    parts = [re.search(r"function str\(v\) \{.*?\n\}\n", src, re.S).group(0),
+             re.search(r"function replySuffix\(\) \{.*?\n\}\n", src, re.S).group(0)]
+    for name in inventory:
+        if name in ("FULL_REFRESH_PROMPT", "BATCHED_STATUS_PROMPT"):
+            parts.append(re.search(r"export const " + name + r" = '[^']+'\n", src).group(0))
+        else:
+            parts.append(re.search(r"export function " + name + r"\(.*?\n\}\n", src, re.S).group(0))
+    body = ("\n".join(parts).replace("export ", "")
+            .replace("const FULL_REFRESH_PROMPT =", "globalThis.FULL_REFRESH_PROMPT =")
+            .replace("const BATCHED_STATUS_PROMPT =", "globalThis.BATCHED_STATUS_PROMPT ="))
+    for name in inventory:
+        # Byte-stability: evaluate twice, require identical output.
+        script = body + "\nconsole.log(JSON.stringify(" + calls[name] + "));\n"
+        outs = []
+        for _ in range(2):
+            out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+            assert out.returncode == 0, out.stderr
+            outs.append(json.loads(out.stdout))
+        assert outs[0] == outs[1] == golden[name], f"{name} drifted from golden"
+
+
+def test_retry_legality_full_map():
+    src = (DESKTOP / "plugin.js").read_text()
+    body = (
+        "console.log(JSON.stringify(["
+        " retryLegality({ kind: 'push', status: 'failed', error: 'deliver failed', args: { substatus: 'deliver' } }),"
+        " retryLegality({ kind: 'claim', status: 'failed', error: 'composer unreachable', args: {} }),"
+        " retryLegality({ kind: 'approve', status: 'refused', error: 'nope', args: {} }),"
+        " retryLegality({ kind: 'merge', status: 'refused', error: 'plugin said no', args: {} }),"
+        " retryLegality({ kind: 'pull', status: 'failed', error: 'some other failure', args: {} }),"
+        " retryLegality({ kind: 'push', status: 'done', args: {} })"
+        "]));\n"
+    )
+    out = _run_task5(src, body)
+    assert json.loads(out[0]) == ['deliver', 'resubmit', None, None, None, None]
