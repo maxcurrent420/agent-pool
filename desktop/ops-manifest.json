@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "description": "Machine-readable list of desktop pane operations. prompts.js builds prompts for these operations; tests assert two-way parity between this manifest and prompts.js, and that no entry invokes a verb outside the plugin's documented command surface (plugin.yaml provides_commands plus the four operator scripts).",
+  "operations": [
+    {
+      "kind": "add-repo-owner",
+      "commands": ["/add-repo"],
+      "script": null,
+      "fields": ["gateway", "repoId", "path", "version"]
+    },
+    {
+      "kind": "add-repo-link",
+      "commands": ["/add-repo --deliver"],
+      "script": "scripts/contributor-add.py",
+      "fields": ["gateway", "repoId", "path", "version", "maintainerGateway"]
+    },
+    {
+      "kind": "fetch-tasks",
+      "commands": ["/fetch repo list", "/fetch task list"],
+      "script": null,
+      "fields": ["gateway", "repoId"]
+    },
+    {
+      "kind": "claim",
+      "commands": ["/claim"],
+      "script": null,
+      "fields": ["gateway", "ticketId", "maxTasks"]
+    },
+    {
+      "kind": "pull",
+      "commands": [],
+      "script": "scripts/contributor-claim.py",
+      "fields": ["gateway", "repoId", "ticketId", "replyFile", "dest"]
+    },
+    {
+      "kind": "push",
+      "commands": ["/push repo", "/push repo --deliver"],
+      "script": "scripts/contributor-push.py",
+      "fields": ["gateway", "repoId", "ticketId", "worktreePath", "poolId", "version", "ticketJson", "transferTicket", "grantToken"]
+    },
+    {
+      "kind": "approve",
+      "commands": [],
+      "script": "scripts/pool-approve.py",
+      "fields": ["gateway", "repoId", "version", "ticketId", "deny"]
+    },
+    {
+      "kind": "merge",
+      "commands": [],
+      "script": null,
+      "fields": ["gateway", "repoId", "ticketId", "checkoutPath"]
+    }
+  ]
+}
