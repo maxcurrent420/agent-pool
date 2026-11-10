@@ -155,11 +155,16 @@ push.
 ## Versions
 
 Versions are per-repo and append-only in the chain. If the pool already
-has v1/v2 accepted, a fresh submission must be v3: contributor scripts
-resolve the next version from pool-side data (your enrollment context, or
-an explicit `--version N`) — a local ledger with no enrolled repos
-defaults to v1. Delivering a version that already exists as *accepted*
-never overwrites it.
+has v1/v2 accepted, a fresh submission must be v3. Fresh chain state
+always comes from the maintainer gateway: ask it `/fetch repo <repo_id>`
+(its reply carries `accepted_version` — the current tip) or take the
+`next_version` from your push grant; your enrollment context's
+`chain_tips` is a snapshot from enroll time and can be stale. Contributor
+scripts mint tip+1 from that recorded snapshot and refuse when the tip is
+unknown — pass an explicit `--version` (must be greater than the tip) or
+re-ask the maintainer gateway first. Delivering a version that already
+exists as *accepted* is refused at the maintainer gateway, never
+overwritten.
 
 ## What always fails closed
 
