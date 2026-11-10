@@ -14,7 +14,7 @@
 import { host, ListRow, PANES_AREA, ROUTES_AREA, SegmentedControl, SIDEBAR_NAV_AREA, ToggleRow, useValue } from '@hermes/plugin-sdk'
 import { useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { addRepoLinkPrompt, addRepoOwnerPrompt, claimPrompt, fetchTaskListPrompt } from './prompts.js'
+import { addRepoLinkPrompt, addRepoOwnerPrompt, claimPrompt, fetchTaskListPrompt, pullPrompt, pushDeliverPrompt, pushGrantPrompt, pushPackagePrompt } from './prompts.js'
 
 // Contribution ids are namespaced by the host as '<plugin id>:<local id>'.
 // The pane's error card names the contribution it came from.
@@ -117,13 +117,14 @@ export async function submitOp(ctx, sessionId, op) {
 const OP_STATUS_PILL = {
   submitted: 'submitted',
   'awaiting agent': 'awaiting agent',
+  'done (awaiting approval)': 'done (awaiting approval)',
   done: 'done',
   refused: 'refused',
   failed: 'failed'
 }
 
 function opPillClass(status) {
-  if (status === 'done') return 'rounded-full px-2 py-0.5 text-xs text-(--ui-text-primary)'
+  if (status === 'done' || status === 'done (awaiting approval)') return 'rounded-full px-2 py-0.5 text-xs text-(--ui-text-primary)'
   if (status === 'refused' || status === 'failed') {
     return 'rounded-full px-2 py-0.5 text-xs text-(--ui-text-secondary)'
   }
@@ -384,6 +385,203 @@ function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
   })
 }
 
+// Update a tracked op in ctx.storage (merge args, patch status). Used by the
+// push card to keep ONE op of kind 'push' across its three sub-steps.
+function updateOp(ctx, id, patch) {
+  const ops = ctx.storage.get(OPS_KEY, [])
+  if (!Array.isArray(ops)) return null
+  let updated = null
+  const next = ops.map(op => {
+    if (op.id !== id) return op
+    updated = { ...op, ...patch, args: { ...(op.args || {}), ...((patch && patch.args) || {}) } }
+    return updated
+  })
+  ctx.storage.set(OPS_KEY, next)
+  return updated
+}
+
+function claimOps(ops) {
+  return (Array.isArray(ops) ? ops : []).filter(op => op && op.kind === 'claim')
+}
+
+const PULL_FAILURES = [
+  'manifest signature does not verify — do not use the bytes; re-read or re-issue the ticket',
+  'transport errors: "Tor is not ready, the ticket expired" — re-read the ticket or ask the maintainer to re-issue it',
+  'destination not writable — pick another --dest directory'
+]
+
+// --- form: pull repo --------------------------------------------------------
+
+function PullRepoForm({ ctx, gateway, noSession, submitTitle, recordOp, ops }) {
+  const claims = claimOps(ops)
+  const [claimId, setClaimId] = useState('')
+  const [ticketId, setTicketId] = useState('')
+  const [replyFile, setReplyFile] = useState('')
+  const [dest, setDest] = useState('')
+
+  const selected = claims.find(op => op.id === claimId) || null
+  const effectiveTicket = (selected && selected.args && (selected.args.ticket || selected.args.key)) || ticketId.trim()
+  const effectiveReplyFile = replyFile.trim() || (selected && selected.args && selected.args.replyFile) || ''
+  const ready = !noSession && Boolean(effectiveTicket) && Boolean(dest.trim()) && isAbsoluteLocalPath(dest)
+  const disabledTitle = noSession
+    ? submitTitle
+    : !effectiveTicket ? 'ticket id is required — pick a claim op or type it'
+    : !dest.trim() ? 'destination directory is required'
+    : !isAbsoluteLocalPath(dest) ? 'destination must be an absolute local path'
+    : undefined
+
+  const onPickClaim = id => {
+    setClaimId(id)
+    const op = claims.find(o => o.id === id)
+    if (op && op.args) {
+      setTicketId(op.args.ticket || op.args.key || '')
+      setReplyFile(op.args.replyFile || '')
+    }
+  }
+
+  const onSubmit = async () => {
+    if (!ready) return
+    const text = pullPrompt({ gateway, ticketId: effectiveTicket, replyFile: effectiveReplyFile || undefined, dest: dest.trim() })
+    await recordOp({
+      kind: 'pull',
+      gateway,
+      args: { ticket: effectiveTicket, replyFile: effectiveReplyFile || null, dest: dest.trim(), substatus: 'pull' },
+      text
+    })
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Pull repo (contributor-claim.py)' }),
+      claims.length
+        ? field('prefill from claim op', jsx('select', {
+            className: inputClass,
+            value: claimId,
+            onChange: e => onPickClaim(e.target.value),
+            children: [
+              jsx('option', { key: '__none', value: '', children: '(pick a claim op)' }),
+              ...claims.map(op => jsx('option', { key: op.id, value: op.id, children: `${(op.args && (op.args.ticket || op.args.key)) || op.id} · ${new Date(op.at).toLocaleString()}` }))
+            ]
+          }))
+        : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No claim ops recorded yet — type the ticket id manually.' }),
+      field('ticket id', jsx('input', { className: inputClass, value: effectiveTicket, onChange: e => { setClaimId(''); setTicketId(e.target.value) }, placeholder: 'ticket_id' })),
+      field('saved claim reply json (--reply-file)', jsx('input', { className: inputClass, value: effectiveReplyFile, onChange: e => setReplyFile(e.target.value), placeholder: '/path/to/claim-reply.json' })),
+      field('destination directory (--dest, absolute)', jsx('input', { className: inputClass, value: dest, onChange: e => setDest(e.target.value), placeholder: '/home/you/work/ticket' })),
+      failureHints(PULL_FAILURES),
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: 'Pull repo (scripts/contributor-claim.py)' })
+    ]
+  })
+}
+
+const PUSH_FAILURES = [
+  'unknown tip — the plugin refuses; re-ask /fetch repo <repo_id> for accepted_version and retry with the right --version',
+  'agent budget exhausted — the push is refused until the budget resets',
+  'transport not ready — "Tor is not ready, the ticket expired"; wait for Tor or re-issue the ticket',
+  'manifest signature does not verify — repackage and redeliver'
+]
+
+// --- form: push / submit (one op, three guided sub-steps) -------------------
+
+function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }) {
+  const existing = (Array.isArray(ops) ? ops : []).find(op => op && op.kind === 'push' && op.status !== 'done' && op.status !== 'done (awaiting approval)' && op.status !== 'failed') || null
+  const [pushOpId, setPushOpId] = useState(() => existing && existing.id)
+  const [repoId, setRepoId] = useState(() => (existing && existing.args && existing.args.repoId) || '')
+  const [ticketId, setTicketId] = useState(() => (existing && existing.args && existing.args.ticketId) || '')
+  const [worktreePath, setWorktreePath] = useState(() => (existing && existing.args && existing.args.worktreePath) || '')
+  const [poolId, setPoolId] = useState(() => (existing && existing.args && existing.args.poolId) || '')
+  const [version, setVersion] = useState(() => (existing && existing.args && existing.args.version != null ? String(existing.args.version) : ''))
+  const [grantToken, setGrantToken] = useState(() => (existing && existing.args && existing.args.grantToken) || '')
+  const [transferTicket, setTransferTicket] = useState(() => (existing && existing.args && existing.args.transferTicket) || '')
+  const [manifest, setManifest] = useState(() => (existing && existing.args && existing.args.manifest) || '')
+  const [grantDone, setGrantDone] = useState(() => Boolean(existing && existing.args && existing.args.grantDone))
+  const [packageDone, setPackageDone] = useState(() => Boolean(existing && existing.args && existing.args.packageDone))
+
+  const substatus = grantDone && packageDone ? 'deliver' : grantDone ? 'package' : 'grant'
+
+  const ensureOp = async (argsPatch, text) => {
+    if (pushOpId) {
+      const ok = await host.composer.submit(sessionId, text)
+      const updated = updateOp(ctx, pushOpId, { args: argsPatch, status: ok ? 'awaiting agent' : 'failed', ...(ok ? {} : { error: 'composer unreachable' }) })
+      refreshOps?.()
+      return updated
+    }
+    const record = await recordOp({ kind: 'push', gateway, args: { ...argsPatch }, text })
+    if (record && record.id) setPushOpId(record.id)
+    return record
+  }
+
+  // Step 3 gating: disabled until steps 1-2 statuses are filled (ticket,
+  // grant token and manifest path linked/filled).
+  const deliverReady = !noSession && grantDone && packageDone && Boolean(transferTicket.trim()) && Boolean(grantToken.trim()) && Boolean(manifest.trim())
+  const deliverTitle = noSession ? submitTitle
+    : !grantDone ? 'step 1 (grant) must complete first — the grant token comes from the /push repo reply'
+    : !packageDone ? 'step 2 (package) must complete first — the manifest comes from scripts/contributor-push.py'
+    : !transferTicket.trim() ? 'transfer ticket is required (from the package reply)'
+    : !grantToken.trim() ? 'grant token is required (from the /push repo reply)'
+    : !manifest.trim() ? 'manifest json (or path) is required'
+    : undefined
+
+  const submitGrant = async () => {
+    if (noSession || !repoId.trim() || !ticketId.trim()) return
+    const text = pushGrantPrompt({ gateway, repoId: repoId.trim(), ticketId: ticketId.trim() })
+    await ensureOp({ repoId: repoId.trim(), ticketId: ticketId.trim(), grantDone: true, substatus: 'grant' }, text)
+    setGrantDone(true)
+  }
+
+  const submitPackage = async () => {
+    if (noSession || !grantDone || !worktreePath.trim() || !repoId.trim() || !poolId.trim() || !/^\d+$/.test(version.trim())) return
+    const text = pushPackagePrompt({ gateway, worktreePath: worktreePath.trim(), repoId: repoId.trim(), poolId: poolId.trim(), version: Number(version.trim()) })
+    await ensureOp({ worktreePath: worktreePath.trim(), poolId: poolId.trim(), version: Number(version.trim()), packageDone: true, substatus: 'package' }, text)
+    setPackageDone(true)
+  }
+
+  const submitDeliver = async () => {
+    if (!deliverReady) return
+    const text = pushDeliverPrompt({ gateway, repoId: repoId.trim(), version: version.trim(), ticketJson: manifest.trim(), transferTicket: transferTicket.trim(), grantToken: grantToken.trim() })
+    await ensureOp({ transferTicket: transferTicket.trim(), grantToken: grantToken.trim(), manifest: manifest.trim(), substatus: 'deliver' }, text)
+  }
+
+  // Retry deliver: re-submits ONLY the deliver prompt. The grant is not
+  // consumed by deliver, so redelivery is legal on transport failure.
+  const retryDeliver = async () => {
+    if (noSession || !(pushOpId || existing) || !grantToken.trim() || !transferTicket.trim() || !manifest.trim()) return
+    const text = pushDeliverPrompt({ gateway, repoId: repoId.trim(), version: version.trim(), ticketJson: manifest.trim(), transferTicket: transferTicket.trim(), grantToken: grantToken.trim() })
+    const id = pushOpId || (existing && existing.id)
+    const ok = await host.composer.submit(sessionId, text)
+    updateOp(ctx, id, { args: { substatus: 'deliver' }, status: ok ? 'awaiting agent' : 'failed', ...(ok ? {} : { error: 'composer unreachable' }) })
+    refreshOps?.()
+    notifyOp(ctx, ok ? 'info' : 'failed', ok ? 'push deliver re-submitted — awaiting agent' : 'composer unreachable', { id })
+  }
+
+  const grantReady = !noSession && repoId.trim() && ticketId.trim()
+  const packageReady = !noSession && grantDone && worktreePath.trim() && repoId.trim() && poolId.trim() && /^\d+$/.test(version.trim())
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Push / submit work (grant → package → deliver)' }),
+      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `one tracked op of kind push · substatus: ${substatus}` }),
+      field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' })),
+      field('ticket id', jsx('input', { className: inputClass, value: ticketId, onChange: e => setTicketId(e.target.value), placeholder: 'ticket_id' })),
+      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 1 — grant (/push repo)' }),
+      submitButton({ disabled: !grantReady, title: noSession ? submitTitle : (!repoId.trim() || !ticketId.trim() ? 'repo_id and ticket id are required' : undefined), onClick: submitGrant, children: grantDone ? 'Step 1 — grant submitted ✓ (re-request)' : 'Step 1 — request grant (/push repo)' }),
+      field('grant token (from the /push repo reply)', jsx('input', { className: inputClass, value: grantToken, onChange: e => setGrantToken(e.target.value), placeholder: 'grant_token' })),
+      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 2 — package (scripts/contributor-push.py). Caveat: take next_version from the grant reply or re-ask /fetch repo <repo_id> for accepted_version; never trust the enroll-time chain_tips.' }),
+      field('worktree path', jsx('input', { className: inputClass, value: worktreePath, onChange: e => setWorktreePath(e.target.value), placeholder: '/path/to/worktree' })),
+      field('pool_id', jsx('input', { className: inputClass, value: poolId, onChange: e => setPoolId(e.target.value), placeholder: 'pool_id' })),
+      field('--version N (next_version from grant reply or /fetch repo)', jsx('input', { className: inputClass, value: version, onChange: e => setVersion(e.target.value), inputMode: 'numeric', placeholder: 'N' })),
+      submitButton({ disabled: !packageReady, title: noSession ? submitTitle : !grantDone ? 'step 1 (grant) must complete first' : 'worktree, repo_id, pool_id and a numeric --version are required', onClick: submitPackage, children: packageDone ? 'Step 2 — package submitted ✓ (re-package)' : 'Step 2 — package (scripts/contributor-push.py)' }),
+      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 3 — deliver (/push repo --deliver). Redelivery is legal: the grant is not consumed by deliver.' }),
+      field('transfer ticket (from the package reply)', jsx('input', { className: inputClass, value: transferTicket, onChange: e => setTransferTicket(e.target.value), placeholder: 'transfer_ticket' })),
+      field('manifest json (or path)', jsx('input', { className: inputClass, value: manifest, onChange: e => setManifest(e.target.value), placeholder: '{"manifest": …} or /path/to/manifest.json' })),
+      submitButton({ disabled: !deliverReady, title: deliverTitle, onClick: submitDeliver, children: 'Step 3 — deliver (/push repo --deliver)' }),
+      submitButton({ disabled: noSession || !(pushOpId || existing) || !grantToken.trim() || !transferTicket.trim() || !manifest.trim(), title: 'Re-submits only the deliver prompt (grant not consumed by deliver)', onClick: retryDeliver, children: 'Retry deliver (grant not consumed)' }),
+      failureHints(PUSH_FAILURES)
+    ]
+  })
+}
+
 function renderTracker(ops) {
   if (!ops.length) {
     return jsx('div', {
@@ -410,7 +608,9 @@ function renderTracker(ops) {
                   children: `${op.gateway || ''} · ${new Date(op.at).toLocaleString()}`
                 }),
                 op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${op.error}` }) : null,
-                op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${op.args.substatus}` }) : null
+                op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${op.args.substatus}` }) : null,
+                op.args && op.args.worktree_path ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `worktree: ${op.args.worktree_path}` }) : null,
+                op.args && op.args.branch ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `branch: ${op.args.branch}` }) : null
               ]
             }),
             jsx('span', { className: opPillClass(op.status), children: OP_STATUS_PILL[op.status] || op.status })
@@ -438,7 +638,7 @@ function setCollapsed(storage, id, value) {
 // The pane body is a plain builder (no hooks of its own) so the guard in
 // PoolPane can catch anything thrown while the tree is assembled. Hook values
 // are read in PoolPane and passed in.
-function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp }) {
+function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps }) {
   const noSession = !sessionId
   const submitTitle = noSession ? 'no focused chat session — focus a chat to submit' : undefined
 
@@ -485,6 +685,8 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
       jsx(AddRepoForm, { ctx, sessionId, gateway, noSession, submitTitle, recordOp }),
       jsx(FetchTasksForm, { ctx, gateway, noSession, submitTitle, recordOp }),
       jsx(ClaimForm, { ctx, gateway, noSession, submitTitle, recordOp }),
+      jsx(PullRepoForm, { ctx, gateway, noSession, submitTitle, recordOp, ops }),
+      jsx(PushSubmitCard, { ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }),
       renderTracker(ops)
     ]
   })
@@ -521,7 +723,11 @@ function PoolPane({ ctx }) {
   }
 
   try {
-    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp })
+    const refreshOps = () => {
+      const stored = ctx.storage.get(OPS_KEY, [])
+      setOps(Array.isArray(stored) ? stored : [])
+    }
+    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps })
   } catch (error) {
     return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.pane, error })
   }
