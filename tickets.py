@@ -1435,7 +1435,8 @@ class PoolService:
         transport send -> contributor-signed manifest, with no ledger
         write. Thin wrapper over the propagator so the contributor's
         plugin drives it through the service; *version* defaults to the
-        next repo version.
+        pool chain tip + 1 on contributor gateways and to the next
+        local repo version on the maintainer gateway.
 
         Agent-facing, service-level only (no slash command): the AGENT
         on the gateway calls this with its local ``repo_path`` and does
@@ -1446,9 +1447,11 @@ class PoolService:
         if not repo_path or not Path(repo_path).is_dir():
             raise ValueError(
                 f"push_build_bundle: repo_path is not an existing directory: {repo_path}")
+        context = None
         try:
             resolved = self._resolve_pool(pool_id, source=source)
             prop = self._propagator(resolved)
+            hosted = True
         except PoolNotLocalError:
             # Contributor gateway: this gateway hosts no pool. Build
             # against the maintainer pool's enrollment context (pool id
@@ -1456,6 +1459,7 @@ class PoolService:
             # record_pool_context from enroll_member's pool_context).
             # A maintainer gateway (single hosted pool, pool_id=None)
             # never reaches here, so its behavior is unchanged.
+            hosted = False
             if pool_id and str(pool_id).strip() in L.list_local_pools(self._conn):
                 raise  # hosted but refused (e.g. multi-pool DB): keep error
             if pool_id:
@@ -1480,12 +1484,41 @@ class PoolService:
             raise PermissionError(
                 f"push refused: caller {pusher_key!r} is not a pool member")
         if version is None:
-            version = L.next_repo_version(self._conn, repo_id)
+            if hosted:
+                version = L.next_repo_version(self._conn, repo_id)
+            else:
+                version = self._contributor_next_version(repo_id, resolved,
+                                                         context)
+        elif not hosted:
+            # Explicit version on a contributor gateway must be ABOVE the
+            # pool's published chain tip (the manifest is contributor-signed
+            # and cannot be re-minted after signing).
+            tip = (context or {}).get("chain_tips", {}).get(repo_id)
+            if tip is not None and int(version) <= int(tip):
+                raise L.VersionCollisionError(
+                    f"{repo_id} v{int(version)} is not above the pool chain "
+                    f"tip (v{int(tip)} accepted on pool {resolved!r}) — "
+                    f"re-mint with version {int(tip) + 1} or later.")
         result = prop.build_push_bundle(
             repo_path=Path(repo_path), repo_id=repo_id, version=int(version),
             pusher=pusher, pusher_signing_key=self._caller_sk)
         result["manifest_json"] = json.dumps(result["manifest"], sort_keys=True)
         return result
+
+    def _contributor_next_version(self, repo_id, pool_id, context) -> int:
+        """Contributor gateways have no pool chain rows; mint from the pool's
+        published chain tip (enrollment context ``chain_tips``). Never falls
+        back to the local ledger — it is repo-less and would always yield 1
+        (the 2026-11-09 blind-mint collision)."""
+        tip = (context or {}).get("chain_tips", {}).get(repo_id)
+        if tip is None:
+            raise ValueError(
+                f"cannot determine the next version for {repo_id!r}: no chain "
+                f"tip in the enrollment context for pool {pool_id!r}. Re-enroll "
+                f"(/pool members --enroll) for a fresh context, or pass an "
+                f"explicit --version greater than the pool's latest accepted "
+                f"version.")
+        return int(tip) + 1
 
     def add_repo_build_bundle(self, repo_path, repo_id, *, version=None,
                               pool_id=None, source=None) -> dict:

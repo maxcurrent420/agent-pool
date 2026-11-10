@@ -106,7 +106,7 @@ def build_parser():
                         "(then --pool may also be omitted if a single "
                         "gateway record exists)")
     p.add_argument("--version", type=int, default=None,
-                   help="explicit version (default: next repo version)")
+                   help="explicit version (default: pool chain tip + 1 from the enrollment context)")
     p.add_argument("--data-dir", default=None,
                    help="plugin data dir override (default: "
                         "AGENT_POOL_DATA_DIR / plugin-data location)")

@@ -111,7 +111,7 @@ def build_parser():
     p.add_argument("--repo", required=True, help="repo id (REPO_ID)")
     p.add_argument("--pool", default=None, help="optional pool id")
     p.add_argument("--version", type=int, default=None,
-                   help="explicit version (default: next repo version)")
+                   help="explicit version (default: pool chain tip + 1 from the enrollment context)")
     p.add_argument("--data-dir", default=None,
                    help="plugin data dir override (default: "
                         "AGENT_POOL_DATA_DIR / plugin-data location)")
