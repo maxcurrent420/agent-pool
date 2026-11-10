@@ -303,3 +303,33 @@ def test_node_check_js_files():
         result = subprocess.run([node, "--check", str(DESKTOP / name)],
                                 capture_output=True, text=True)
         assert result.returncode == 0, f"{name}: {result.stderr}"
+
+
+def test_desktop_plugin_registers_page_and_nav_only_no_dock():
+    src = (DESKTOP / "plugin.js").read_text()
+    # Sidebar nav row at /agent-pool and a ROUTES_AREA route at /agent-pool.
+    assert "SIDEBAR_NAV_AREA" in src
+    assert "ROUTES_AREA" in src
+    assert "/agent-pool" in src
+    # The right-dock pane contribution is gone entirely.
+    assert "PANES_AREA" not in src
+    assert "placement" not in src
+    assert "420px" not in src
+    assert "initializing" not in src.lower()
+
+
+def test_desktop_plugin_str_guard_defined_and_used():
+    src = (DESKTOP / "plugin.js").read_text()
+    # str() guard helper is defined.
+    assert re.search(r"function str\(v\)\s*{", src), "str() guard helper missing"
+    # str() call sites exist for the previously crashing render values.
+    for site in ["str(sessionId)", "str(gatewayState)", "str(op.kind)",
+                 "str(contributionId)", "str(entry && entry.id)"]:
+        assert site in src, f"str() guard missing at: {site}"
+    # useValue(host.state.*) results never reach JSX raw — each is stringified.
+    for m in re.finditer(r"const\s+(\w+)\s*=\s*useValue\(host\.state\.\w+\)", src):
+        assert f"str({m.group(1)})" in src, \
+            f"useValue result {m.group(1)} never stringified"
+    # Error boundary present so a render error cannot take down the chat UI.
+    assert "getDerivedStateFromError" in src
+    assert "PoolErrorBoundary" in src

@@ -1,6 +1,7 @@
-// Agent Pool — Hermes Desktop pane ("Pool Console").
+// Agent Pool — Hermes Desktop plugin ("Pool Console").
 //
-// Task 1: loadable skeleton only. The desktop host loads this file UNCOMPILED,
+// The console lives on its own full page at /agent-pool (sidebar row: Agent
+// Pool). The desktop host loads this file UNCOMPILED,
 // so there is no JSX syntax here — every element is built with jsx()/jsxs()
 // from 'react/jsx-runtime'.
 //
@@ -11,9 +12,23 @@
 // --ui-text-secondary / --ui-text-tertiary), so light and dark mode both
 // come out of the host's palette. No literal colours.
 
-import { host, ListRow, PANES_AREA, ROUTES_AREA, SegmentedControl, SIDEBAR_NAV_AREA, ToggleRow, useValue } from '@hermes/plugin-sdk'
-import { useEffect, useState } from 'react'
+import { host, ListRow, ROUTES_AREA, SegmentedControl, SIDEBAR_NAV_AREA, ToggleRow, useValue } from '@hermes/plugin-sdk'
+import { Component, useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
+
+// Every dynamic value rendered as text goes through str(): null/undefined →
+// 'none', strings pass through, objects stringify (JSON, with an id fallback).
+// Anything less invites React error #31 (object as a React child).
+function str(v) {
+  if (v == null) return 'none'
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  if (typeof v === 'object') {
+    if (typeof v.id === 'string' || typeof v.id === 'number') return String(v.id)
+    try { return JSON.stringify(v) } catch { return String(v) }
+  }
+  return String(v)
+}
 // --- inlined from track.js (runtime import allowlist: no relative imports) ---
 // Agent Pool — tracker logic (pure, no SDK imports).
 //
@@ -257,11 +272,10 @@ export function mergePrompt({ gateway, repoId, ticketId, checkoutPath }) {
 }
 
 // Contribution ids are namespaced by the host as '<plugin id>:<local id>'.
-// The pane's error card names the contribution it came from.
+// The error card names the contribution it came from.
 const CONTRIBUTION_IDS = {
   nav: 'agent-pool:nav',
-  page: 'agent-pool:page',
-  pane: 'agent-pool:pane'
+  page: 'agent-pool:page'
 }
 
 // The gateway profiles this plugin knows about. The live profile inventory
@@ -490,7 +504,7 @@ function snapshotRepos(ctx) {
 function repoIdOf(entry) {
   if (entry == null) return ''
   if (typeof entry === 'string') return entry
-  return entry.repo_id || entry.repo || entry.id || entry.name || ''
+  return str(entry.repo_id || entry.repo || entry.id || entry.name || '')
 }
 
 function FetchTasksForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
@@ -554,7 +568,7 @@ function snapshotTasks(ctx) {
 function ticketIdOf(entry) {
   if (entry == null) return ''
   if (typeof entry === 'string') return entry
-  return entry.ticket_id || entry.ticket || entry.id || ''
+  return str(entry.ticket_id || entry.ticket || entry.id || '')
 }
 
 function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
@@ -621,7 +635,7 @@ function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
             ]
           }),
       field('claimant identity note (optional)', jsx('input', { className: inputClass, value: note, onChange: e => setNote(e.target.value), placeholder: 'who is claiming, for the record' })),
-      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `target profile: ${gateway} (plugin binds claim to key + Discord id automatically)` }),
+      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `target profile: ${str(gateway)} (plugin binds claim to key + Discord id automatically)` }),
       failureHints(CLAIM_FAILURES),
       submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: autoAssign ? 'Auto-assign (/claim --any-project)' : 'Claim ticket (/claim)' })
     ]
@@ -704,7 +718,7 @@ function PullRepoForm({ ctx, gateway, noSession, submitTitle, recordOp, ops }) {
             onChange: e => onPickClaim(e.target.value),
             children: [
               jsx('option', { key: '__none', value: '', children: '(pick a claim op)' }),
-              ...claims.map(op => jsx('option', { key: op.id, value: op.id, children: `${(op.args && (op.args.ticket || op.args.key)) || op.id} · ${new Date(op.at).toLocaleString()}` }))
+              ...claims.map(op => jsx('option', { key: str(op.id), value: str(op.id), children: `${str((op.args && (op.args.ticket || op.args.key)) || op.id)} · ${new Date(op.at).toLocaleString()}` }))
             ]
           }))
         : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No claim ops recorded yet — type the ticket id manually.' }),
@@ -728,15 +742,15 @@ const PUSH_FAILURES = [
 
 function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }) {
   const existing = (Array.isArray(ops) ? ops : []).find(op => op && op.kind === 'push' && op.status !== 'done' && op.status !== 'done (awaiting approval)' && op.status !== 'failed') || null
-  const [pushOpId, setPushOpId] = useState(() => existing && existing.id)
-  const [repoId, setRepoId] = useState(() => (existing && existing.args && existing.args.repoId) || '')
-  const [ticketId, setTicketId] = useState(() => (existing && existing.args && existing.args.ticketId) || '')
-  const [worktreePath, setWorktreePath] = useState(() => (existing && existing.args && existing.args.worktreePath) || '')
-  const [poolId, setPoolId] = useState(() => (existing && existing.args && existing.args.poolId) || '')
+  const [pushOpId, setPushOpId] = useState(() => existing && existing.id != null ? str(existing.id) : undefined)
+  const [repoId, setRepoId] = useState(() => str((existing && existing.args && existing.args.repoId) || ''))
+  const [ticketId, setTicketId] = useState(() => str((existing && existing.args && existing.args.ticketId) || ''))
+  const [worktreePath, setWorktreePath] = useState(() => str((existing && existing.args && existing.args.worktreePath) || ''))
+  const [poolId, setPoolId] = useState(() => str((existing && existing.args && existing.args.poolId) || ''))
   const [version, setVersion] = useState(() => (existing && existing.args && existing.args.version != null ? String(existing.args.version) : ''))
-  const [grantToken, setGrantToken] = useState(() => (existing && existing.args && existing.args.grantToken) || '')
-  const [transferTicket, setTransferTicket] = useState(() => (existing && existing.args && existing.args.transferTicket) || '')
-  const [manifest, setManifest] = useState(() => (existing && existing.args && existing.args.manifest) || '')
+  const [grantToken, setGrantToken] = useState(() => str((existing && existing.args && existing.args.grantToken) || ''))
+  const [transferTicket, setTransferTicket] = useState(() => str((existing && existing.args && existing.args.transferTicket) || ''))
+  const [manifest, setManifest] = useState(() => str((existing && existing.args && existing.args.manifest) || ''))
   const [grantDone, setGrantDone] = useState(() => Boolean(existing && existing.args && existing.args.grantDone))
   const [packageDone, setPackageDone] = useState(() => Boolean(existing && existing.args && existing.args.packageDone))
 
@@ -804,7 +818,7 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
     className: 'flex flex-col gap-2 rounded-md p-2',
     children: [
       jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Push / submit work (grant → package → deliver)' }),
-      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `one tracked op of kind push · substatus: ${substatus}` }),
+      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `one tracked op of kind push · substatus: ${str(substatus)}` }),
       field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' })),
       field('ticket id', jsx('input', { className: inputClass, value: ticketId, onChange: e => setTicketId(e.target.value), placeholder: 'ticket_id' })),
       jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 1 — grant (/push repo)' }),
@@ -947,7 +961,7 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
         ? field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' }))
         : field('ticket_id', jsx('input', { className: inputClass, value: ticketId, onChange: e => setTicketId(e.target.value), placeholder: 'ticket_id' })),
       field('canonical checkout path (default: work/integrate/<repo_id>/)', jsx('input', { className: inputClass, value: checkoutPath, onChange: e => setCheckoutPath(e.target.value), placeholder: repoId.trim() ? `work/integrate/${repoId.trim()}/` : 'work/integrate/<repo_id>/' })),
-      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `effective checkout: ${effectiveCheckout || '(enter a repo_id to prefill the work/integrate/ convention)'}` }),
+      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `effective checkout: ${str(effectiveCheckout) || '(enter a repo_id to prefill the work/integrate/ convention)'}` }),
       failureHints(MERGE_FAILURES),
       submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: 'Merge approved bundle (agent runs git fetch + git merge)' })
     ]
@@ -964,21 +978,21 @@ const TRACKER_TABS = [
 function opRow(op) {
   return jsxs('div', {
     className: 'flex items-center justify-between gap-2 rounded-md px-2 py-1',
-    key: op.id,
+    key: str(op.id),
     children: [
       jsxs('div', {
         className: 'flex flex-col',
         children: [
-          jsx('div', { className: 'text-(--ui-text-primary)', children: op.kind }),
+          jsx('div', { className: 'text-(--ui-text-primary)', children: str(op.kind) }),
           jsx('div', {
             className: 'text-(--ui-text-tertiary)',
-            children: `${op.gateway || ''} · ${new Date(op.at).toLocaleString()}`
+            children: `${str(op.gateway) === 'none' ? '' : str(op.gateway)} · ${new Date(op.at).toLocaleString()}`
           }),
-          op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${op.error}` }) : null,
-          op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${op.args.substatus}` }) : null
+          op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${str(op.error)}` }) : null,
+          op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${str(op.args.substatus)}` }) : null
         ]
       }),
-      jsx('span', { className: opPillClass(op.status), children: OP_STATUS_PILL[op.status] || op.status })
+      jsx('span', { className: opPillClass(op.status), children: str(OP_STATUS_PILL[op.status] || op.status) })
     ]
   })
 }
@@ -1003,7 +1017,7 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
       : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No active operations.' })
   } else if (tab === 'awaiting') {
     body = awaiting.length
-      ? jsx('div', { className: 'flex flex-col gap-1', children: awaiting.map((entry, i) => jsx('div', { key: entry.id || i, className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', children: `${entry.id}${entry.version != null ? ` · v${entry.version}` : ''} (from pool_status)` })) })
+      ? jsx('div', { className: 'flex flex-col gap-1', children: awaiting.map((entry, i) => jsx('div', { key: str(entry && entry.id) !== 'none' ? str(entry.id) : i, className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', children: `${str(entry && entry.id)}${entry && entry.version != null ? ` · v${str(entry.version)}` : ''} (from pool_status)` })) })
       : jsx('div', { className: 'text-(--ui-text-tertiary)', children: poolStatus ? 'Nothing awaiting approval in the last pool_status snapshot.' : 'No pool_status snapshot yet — hit Refresh or request a status report.' })
   } else if (tab === 'claims') {
     body = jsxs('div', {
@@ -1011,7 +1025,7 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
       children: [
         jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Budgets (from pool_status)' }),
         budgets.length
-          ? budgets.map((b, i) => jsx('div', { key: i, className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', children: `${b.line}${b.exhausted ? ' — EXHAUSTED' : ''}` }))
+          ? budgets.map((b, i) => jsx('div', { key: i, className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', children: `${str(b && b.line)}${b && b.exhausted ? ' — EXHAUSTED' : ''}` }))
           : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No budget lines in the last pool_status snapshot.' }),
         jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Claim ops' }),
         claimList.length
@@ -1086,11 +1100,11 @@ function setCollapsed(storage, id, value) {
   storage.set(STORAGE_KEYS.collapsed(id), value)
 }
 
-// --- pane ------------------------------------------------------------------
+// --- console body -------------------------------------------------------------
 
-// The pane body is a plain builder (no hooks of its own) so the guard in
-// PoolPane can catch anything thrown while the tree is assembled. Hook values
-// are read in PoolPane and passed in.
+// The console body is a plain builder (no hooks of its own) so the guard in
+// PoolConsole can catch anything thrown while the tree is assembled. Hook values
+// are read in PoolConsole and passed in.
 function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh, refreshing }) {
   const noSession = !sessionId
   const submitTitle = noSession ? 'no focused chat session — focus a chat to submit' : undefined
@@ -1101,14 +1115,14 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
       jsx('div', { className: 'font-medium', children: 'Agent Pool' }),
       jsx('div', {
         className: 'text-(--ui-text-secondary)',
-        children: `bound session: ${sessionId || 'none'}`
+        children: `bound session: ${str(sessionId)}`
       }),
       jsx(SegmentedControl, {
         options: [
           { id: 'default', label: 'Maintainer' },
           { id: 'pool-contrib', label: 'Contributor' }
         ],
-        value: gateway,
+        value: str(gateway),
         onChange: id => {
           poolPaneStore.gateway = id
           ctx.storage.set(STORAGE_KEYS.gateway, id)
@@ -1118,10 +1132,10 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
       jsxs('div', {
         className: 'flex flex-col gap-1 text-(--ui-text-secondary)',
         children: [
-          jsx('div', { children: `gateway: ${gatewayState == null ? 'unknown' : String(gatewayState)}` }),
+          jsx('div', { children: `gateway: ${str(gatewayState)}` }),
           jsx('div', {
             className: 'text-(--ui-text-tertiary)',
-            children: `tor ready? ${poolPaneStore.tor == null ? 'unknown — awaiting agent' : String(poolPaneStore.tor)}`
+            children: `tor ready? ${poolPaneStore.tor == null ? 'unknown — awaiting agent' : str(poolPaneStore.tor)}`
           })
         ]
       }),
@@ -1148,24 +1162,44 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
 }
 
 function PaneErrorCard({ contributionId, error }) {
-  const detail = error instanceof Error ? error.message : String(error)
+  const detail = error instanceof Error ? error.message : str(error)
 
   return jsxs('div', {
     className: 'flex flex-col gap-1 rounded-md p-3 text-sm',
     children: [
       jsx('div', {
         className: 'font-medium text-(--ui-text-primary)',
-        children: `Agent Pool pane failed (${contributionId})`
+        children: `Agent Pool console failed (${str(contributionId)})`
       }),
-      jsx('div', { className: 'text-(--ui-text-secondary)', children: detail })
+      jsx('div', { className: 'text-(--ui-text-secondary)', children: str(detail) })
     ]
   })
 }
 
-function PoolPane({ ctx }) {
+// Error boundary: any render error in the console tree renders a plain string
+// card instead of taking down the chat UI.
+class PoolErrorBoundary extends Component {
+  constructor(props) {
+    super(props)
+    this.state = { error: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error }
+  }
+
+  render() {
+    if (this.state.error) {
+      return jsx(PaneErrorCard, { contributionId: this.props.contributionId, error: this.state.error })
+    }
+    return this.props.children
+  }
+}
+
+function PoolConsole({ ctx }) {
   const sessionId = useValue(host.state.focusedSessionId)
   const gatewayState = useValue(host.state.gateway)
-  const [gateway, setGateway] = useState(() => poolPaneStore.gateway)
+  const [gateway, setGateway] = useState(() => str(poolPaneStore.gateway))
   const [polling, setPolling] = useState(() => poolPaneStore.polling)
   const [ops, setOps] = useState(() => {
     const stored = ctx.storage.get(OPS_KEY, [])
@@ -1225,31 +1259,13 @@ function PoolPane({ ctx }) {
     }
     return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh: refreshFromSidecar, refreshing })
   } catch (error) {
-    return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.pane, error })
+    return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.page, error })
   }
 }
 
 // --- full page -------------------------------------------------------------
-
-function PoolConsolePage() {
-  return jsxs('div', {
-    className: 'flex h-full flex-col gap-4 p-6 text-sm text-(--ui-text-primary)',
-    children: [
-      jsx('div', { className: 'text-lg font-medium', children: 'Pool Console' }),
-      jsxs('div', {
-        className: 'flex flex-col gap-1 text-(--ui-text-secondary)',
-        children: [
-          jsx('div', { children: 'The Pool Console is initializing…' }),
-          jsx('div', {
-            className: 'text-(--ui-text-tertiary)',
-            children:
-              'Every action is composed into a prompt for the agent session, so the plugin keeps enforcing its own authorization, whitelists and budgets.'
-          })
-        ]
-      })
-    ]
-  })
-}
+// The /agent-pool route renders the full console (bound-session line, gateway
+// selector, status strip, every form, the tracker) inside an error boundary.
 
 // --- settings --------------------------------------------------------------
 
@@ -1258,11 +1274,11 @@ function GeneralSettings() {
     className: 'flex flex-col gap-1',
     children: [
       jsx(ListRow, {
-        description: 'Open the full console from the sidebar (Agent Pool) or from the Pool Console pane.',
+        description: 'Open the full console from the sidebar (Agent Pool).',
         title: 'Where the console lives'
       }),
       jsx(ListRow, {
-        description: 'This plugin contributes a pane, a page and a sidebar row; each is namespaced agent-pool:<id>.',
+        description: 'This plugin contributes a page and a sidebar row; each is namespaced agent-pool:<id>.',
         title: 'Contributions'
       })
     ]
@@ -1306,22 +1322,16 @@ export default {
   register(ctx) {
     hydratePaneStore(ctx.storage)
 
-    // The Pool Console pane — the form-driven half of the plugin.
-    ctx.register({
-      id: 'pane',
-      area: PANES_AREA,
-      title: 'Agent Pool',
-      data: { placement: 'right', width: '420px' },
-      render: () => jsx(PoolPane, { ctx })
-    })
-
     // The full-page Pool Console, paired with its sidebar nav row.
     ctx.registerMany([
       {
         id: 'page',
         area: ROUTES_AREA,
         data: { path: '/agent-pool' },
-        render: () => jsx(PoolConsolePage, {})
+        render: () => jsx(PoolErrorBoundary, {
+          contributionId: CONTRIBUTION_IDS.page,
+          children: jsx(PoolConsole, { ctx })
+        })
       },
       {
         id: 'nav',
