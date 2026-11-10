@@ -12,8 +12,9 @@
 // come out of the host's palette. No literal colours.
 
 import { host, ListRow, PANES_AREA, ROUTES_AREA, SegmentedControl, SIDEBAR_NAV_AREA, ToggleRow, useValue } from '@hermes/plugin-sdk'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
+import { auditShowPrompt, applyPaneStateToOps, BATCHED_STATUS_PROMPT, isActiveStatus, migrateOps, normalizeKind, OPS_KEEP, OPS_KEY, parsePaneState } from './track.js'
 import { addRepoLinkPrompt, addRepoOwnerPrompt, approvePrompt, claimPrompt, fetchTaskListPrompt, mergePrompt, pullPrompt, pushDeliverPrompt, pushGrantPrompt, pushPackagePrompt } from './prompts.js'
 
 // Contribution ids are namespaced by the host as '<plugin id>:<local id>'.
@@ -41,8 +42,6 @@ const KNOWN_GATEWAYS = [
 ]
 
 const DISPLAY_COMPACT_KEY = 'display.compact'
-const OPS_KEY = 'ops'
-const OPS_KEEP = 200
 
 const STORAGE_KEYS = {
   gateway: 'gateways.active',
@@ -56,7 +55,7 @@ const STORAGE_KEYS = {
 // register time so it survives close/reopen of the pane.
 export const poolPaneStore = {
   gateway: 'default',
-  polling: true,
+  polling: false,
   tor: null,
   highlight: null,
   collapsed: {}
@@ -64,9 +63,13 @@ export const poolPaneStore = {
 
 function hydratePaneStore(storage) {
   poolPaneStore.gateway = storage.get(STORAGE_KEYS.gateway, 'default')
-  poolPaneStore.polling = Boolean(storage.get(STORAGE_KEYS.polling, true))
+  // Default OFF; respect whatever the user last persisted.
+  poolPaneStore.polling = Boolean(storage.get(STORAGE_KEYS.polling, false))
   poolPaneStore.tor = storage.get(STORAGE_KEYS.tor, null)
   poolPaneStore.highlight = storage.get(STORAGE_KEYS.highlighted, null)
+  // Migrate any pre-Task-8 op records (e.g. kind 'add-repo') in place.
+  const { ops, changed } = migrateOps(storage.get(OPS_KEY, []))
+  if (changed) storage.set(OPS_KEY, ops)
 }
 
 // Notify the user of an op result and persist which op is highlighted.
@@ -90,11 +93,12 @@ function notifyOp(ctx, kind, message, detail) {
 export async function submitOp(ctx, sessionId, op) {
   const record = {
     id: op.id || `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: op.kind,
+    kind: normalizeKind(op.kind),
     gateway: op.gateway,
     args: op.args || {},
     status: 'submitted',
-    at: Date.now()
+    at: Date.now(),
+    replyRef: null
   }
 
   const ok = await host.composer.submit(sessionId, op.text)
@@ -203,7 +207,7 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
       ? addRepoOwnerPrompt({ gateway, repoId: repoId.trim(), path: path.trim(), version: v })
       : addRepoLinkPrompt({ gateway, repoId: repoId.trim(), path: path.trim(), version: v, maintainerGateway })
     await recordOp({
-      kind: mode === 'owner' ? 'add-repo' : 'add-repo-link',
+      kind: mode === 'owner' ? 'add-repo-owner' : 'add-repo-link',
       gateway,
       args: { mode, repoId: repoId.trim(), path: path.trim(), version: v ?? null, maintainerGateway: mode === 'link' ? maintainerGateway : undefined, substatus: mode === 'link' ? 'build bundle → deliver' : undefined },
       text
@@ -711,41 +715,122 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
   })
 }
 
-function renderTracker(ops) {
-  if (!ops.length) {
-    return jsx('div', {
-      className: 'text-(--ui-text-tertiary)',
-      children: 'No operations tracked yet.'
+const TRACKER_TABS = [
+  { id: 'active', label: 'Active ops' },
+  { id: 'awaiting', label: 'Awaiting approval' },
+  { id: 'claims', label: 'Claims & budgets' },
+  { id: 'audit', label: 'Audit' }
+]
+
+function opRow(op) {
+  return jsxs('div', {
+    className: 'flex items-center justify-between gap-2 rounded-md px-2 py-1',
+    key: op.id,
+    children: [
+      jsxs('div', {
+        className: 'flex flex-col',
+        children: [
+          jsx('div', { className: 'text-(--ui-text-primary)', children: op.kind }),
+          jsx('div', {
+            className: 'text-(--ui-text-tertiary)',
+            children: `${op.gateway || ''} · ${new Date(op.at).toLocaleString()}`
+          }),
+          op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${op.error}` }) : null,
+          op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${op.args.substatus}` }) : null
+        ]
+      }),
+      jsx('span', { className: opPillClass(op.status), children: OP_STATUS_PILL[op.status] || op.status })
+    ]
+  })
+}
+
+// The tracker: filter tabs over the pane-local op log plus the last parsed
+// pool_status snapshot. The Awaiting-approval tab renders ONLY entries from
+// snapshot.poolStatus.awaitingApproval (i.e. real pool_status output), never
+// inferred from ops.
+function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing }) {
+  const [tab, setTab] = useState('active')
+  const [auditTicket, setAuditTicket] = useState('')
+  const list = Array.isArray(ops) ? ops : []
+  const awaiting = (poolStatus && Array.isArray(poolStatus.awaitingApproval)) ? poolStatus.awaitingApproval : []
+  const budgets = (poolStatus && Array.isArray(poolStatus.budgets)) ? poolStatus.budgets : []
+  const claimList = list.filter(op => op && op.kind === 'claim')
+
+  let body = null
+  if (tab === 'active') {
+    const active = list.filter(op => op && isActiveStatus(op.status))
+    body = active.length
+      ? jsx('div', { className: 'flex flex-col gap-1', children: active.slice(0, 20).map(opRow) })
+      : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No active operations.' })
+  } else if (tab === 'awaiting') {
+    body = awaiting.length
+      ? jsx('div', { className: 'flex flex-col gap-1', children: awaiting.map((entry, i) => jsx('div', { key: entry.id || i, className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', children: `${entry.id}${entry.version != null ? ` · v${entry.version}` : ''} (from pool_status)` })) })
+      : jsx('div', { className: 'text-(--ui-text-tertiary)', children: poolStatus ? 'Nothing awaiting approval in the last pool_status snapshot.' : 'No pool_status snapshot yet — hit Refresh or request a status report.' })
+  } else if (tab === 'claims') {
+    body = jsxs('div', {
+      className: 'flex flex-col gap-1',
+      children: [
+        jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Budgets (from pool_status)' }),
+        budgets.length
+          ? budgets.map((b, i) => jsx('div', { key: i, className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', children: `${b.line}${b.exhausted ? ' — EXHAUSTED' : ''}` }))
+          : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No budget lines in the last pool_status snapshot.' }),
+        jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Claim ops' }),
+        claimList.length
+          ? claimList.slice(0, 20).map(opRow)
+          : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No claim ops recorded.' })
+      ]
+    })
+  } else if (tab === 'audit') {
+    body = jsxs('div', {
+      className: 'flex flex-col gap-2',
+      children: [
+        field('ticket id (optional)', jsx('input', { className: inputClass, value: auditTicket, onChange: e => setAuditTicket(e.target.value), placeholder: 'ticket_id' })),
+        submitButton({
+          disabled: noSession,
+          title: noSession ? submitTitle : undefined,
+          onClick: async () => {
+            if (noSession) return
+            await host.composer.submit(sessionId, auditShowPrompt(gateway, auditTicket))
+          },
+          children: 'Run /audit show'
+        })
+      ]
     })
   }
 
   return jsxs('div', {
     className: 'flex flex-col gap-1',
     children: [
-      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Operations' }),
-      ...ops.slice(0, 20).map(op =>
-        jsxs('div', {
-          className: 'flex items-center justify-between gap-2 rounded-md px-2 py-1',
-          key: op.id,
-          children: [
-            jsxs('div', {
-              className: 'flex flex-col',
-              children: [
-                jsx('div', { className: 'text-(--ui-text-primary)', children: op.kind }),
-                jsx('div', {
-                  className: 'text-(--ui-text-tertiary)',
-                  children: `${op.gateway || ''} · ${new Date(op.at).toLocaleString()}`
-                }),
-                op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${op.error}` }) : null,
-                op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${op.args.substatus}` }) : null,
-                op.args && op.args.worktree_path ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `worktree: ${op.args.worktree_path}` }) : null,
-                op.args && op.args.branch ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `branch: ${op.args.branch}` }) : null
-              ]
-            }),
-            jsx('span', { className: opPillClass(op.status), children: OP_STATUS_PILL[op.status] || op.status })
-          ]
-        })
-      )
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-2',
+        children: [
+          jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Operations' }),
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx('button', { className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', onClick: onRefresh, disabled: refreshing, children: refreshing ? 'Refreshing…' : 'Refresh' }),
+              jsx('button', {
+                className: 'rounded-md px-2 py-1 text-(--ui-text-primary)',
+                disabled: noSession,
+                title: noSession ? submitTitle : 'Ask the agent to run pool_status and report it via pool_pane_report',
+                onClick: async () => {
+                  if (noSession) return
+                  await host.composer.submit(sessionId, BATCHED_STATUS_PROMPT)
+                  onRefresh()
+                },
+                children: 'Report status'
+              })
+            ]
+          })
+        ]
+      }),
+      poolStatus && poolStatus.at ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `pool_status snapshot: ${new Date(poolStatus.at).toLocaleString()}` }) : null,
+      jsx(SegmentedControl, {
+        options: TRACKER_TABS,
+        value: tab,
+        onChange: setTab
+      }),
+      body
     ]
   })
 }
@@ -767,7 +852,7 @@ function setCollapsed(storage, id, value) {
 // The pane body is a plain builder (no hooks of its own) so the guard in
 // PoolPane can catch anything thrown while the tree is assembled. Hook values
 // are read in PoolPane and passed in.
-function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps }) {
+function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh, refreshing }) {
   const noSession = !sessionId
   const submitTitle = noSession ? 'no focused chat session — focus a chat to submit' : undefined
 
@@ -818,7 +903,7 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
       jsx(PushSubmitCard, { ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }),
       jsx(ApproveForm, { ctx, gateway, noSession, submitTitle, recordOp }),
       jsx(MergeForm, { ctx, gateway, noSession, submitTitle, recordOp }),
-      renderTracker(ops)
+      jsx(TrackerSection, { ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing })
     ]
   })
 }
@@ -847,6 +932,47 @@ function PoolPane({ ctx }) {
     const stored = ctx.storage.get(OPS_KEY, [])
     return Array.isArray(stored) ? stored : []
   })
+  const [poolStatus, setPoolStatus] = useState(() => ctx.storage.get('snapshot.poolStatus', null))
+  const [refreshing, setRefreshing] = useState(false)
+  // Agent→UI refresh: poll the pane-state sidecar (written by pool_pane_report,
+  // served by this profile's own /pane-state route). Parsed defensively — a
+  // missing/empty sidecar never throws.
+  const refreshFromSidecar = async () => {
+    setRefreshing(true)
+    try {
+      let raw = null
+      try {
+        raw = await ctx.rest('/pane-state')
+      } catch {
+        raw = null
+      }
+      const parsed = parsePaneState(raw)
+      const { ops: nextOps } = applyPaneStateToOps(ctx.storage.get(OPS_KEY, []), parsed)
+      ctx.storage.set(OPS_KEY, nextOps)
+      setOps(nextOps)
+      const snap = {
+        at: parsed.at || Date.now(),
+        awaitingApproval: parsed.awaitingApproval,
+        budgets: parsed.budgets,
+        poolStatus: parsed.poolStatus || null
+      }
+      ctx.storage.set('snapshot.poolStatus', snap)
+      setPoolStatus(snap)
+      if (parsed.tasks) ctx.storage.set('snapshot.tasks', { at: snap.at, table: parsed.tasks })
+      if (parsed.claims) ctx.storage.set('snapshot.claims', parsed.claims)
+    } finally {
+      setRefreshing(false)
+    }
+  }
+  // 60s poll — only while the user left polling ON. Check storage before
+  // every timer set so a user-disabled toggle is never re-enabled.
+  useEffect(() => {
+    if (!polling) return undefined
+    if (!poolPaneStore.polling || !ctx.storage.get(STORAGE_KEYS.polling, false)) return undefined
+    const id = setInterval(() => { refreshFromSidecar() }, 60000)
+    return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [polling])
   const recordOp = async op => {
     const record = await submitOp(ctx, sessionId, op)
     setOps(prev => [record, ...prev].slice(0, OPS_KEEP))
@@ -858,7 +984,7 @@ function PoolPane({ ctx }) {
       const stored = ctx.storage.get(OPS_KEY, [])
       setOps(Array.isArray(stored) ? stored : [])
     }
-    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps })
+    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh: refreshFromSidecar, refreshing })
   } catch (error) {
     return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.pane, error })
   }
