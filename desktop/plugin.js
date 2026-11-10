@@ -81,7 +81,7 @@ export function isActiveStatus(status) {
 // --- sidecar parsing (defensive: empty/missing never throws) ----------------
 
 export function parsePaneState(raw) {
-  const empty = { poolStatus: null, tasks: null, claims: null, discovered: null, awaitingApproval: [], budgets: [], at: null, substeps: null }
+  const empty = { poolStatus: null, tasks: null, claims: null, discovered: null, awaitingApproval: [], budgets: [], at: null, substeps: null, opReplies: {} }
   if (!raw || typeof raw !== 'object') return empty
   const ps = raw.pool_status || raw.poolStatus || raw.status || null
   const parsed = { ...empty, at: typeof raw.at === 'number' ? raw.at : (typeof raw.updated_at === 'number' ? raw.updated_at : Date.now()) }
@@ -110,6 +110,24 @@ export function parsePaneState(raw) {
   if (transferTicket) parsed.transferTicket = str(transferTicket)
   const manifest = raw.manifest || raw.manifest_json || null
   if (manifest) parsed.manifest = typeof manifest === 'string' ? manifest : JSON.stringify(manifest)
+  // Per-op verbatim replies from the sidecar: either an id→reply map object
+  // or a list of { id, reply|detail|text } entries. Last write wins per id.
+  const repliesRaw = raw.op_replies || raw.opReplies || raw.replies || raw.op_details || null
+  const opReplies = {}
+  if (repliesRaw && typeof repliesRaw === 'object' && !Array.isArray(repliesRaw)) {
+    for (const [k, v] of Object.entries(repliesRaw)) {
+      if (v == null) continue
+      opReplies[String(k)] = typeof v === 'string' ? v : str((v && (v.reply || v.detail || v.text)) ?? JSON.stringify(v))
+    }
+  } else if (Array.isArray(repliesRaw)) {
+    for (const entry of repliesRaw) {
+      if (!entry || typeof entry !== 'object') continue
+      const id = entry.id ?? entry.op_id ?? entry.opId
+      const reply = entry.reply ?? entry.detail ?? entry.text
+      if (id != null && reply != null) opReplies[String(id)] = str(reply)
+    }
+  }
+  parsed.opReplies = opReplies
   const worktreePath = raw.worktree_path || raw.worktreePath || null
   if (worktreePath) parsed.worktreePath = str(worktreePath)
   return parsed
@@ -224,6 +242,75 @@ export function applyPaneStateToOps(ops, parsed) {
     return op
   })
   return { ops: next, changed }
+}
+
+// Merge sidecar-reported per-op replies into the op list. Last reply per op
+// id wins; ops not mentioned are untouched. Pure.
+export function applyOpReplies(ops, opReplies) {
+  const list = Array.isArray(ops) ? ops : []
+  const replies = opReplies && typeof opReplies === 'object' ? opReplies : {}
+  const ids = Object.keys(replies)
+  if (!ids.length) return { ops: list, changed: false }
+  let changed = false
+  const next = list.map(op => {
+    if (!op || typeof op !== 'object' || op.id == null) return op
+    const reply = replies[String(op.id)]
+    if (reply == null) return op
+    if (op.reply === reply) return op
+    changed = true
+    return { ...op, reply: str(reply) }
+  })
+  return { ops: next, changed }
+}
+
+// summarizeOp(op, snapshotLookup): the what-was-picked one-liner for a row.
+// Human names come from snapshot lookups (repo title from snapshot.repos,
+// ticket title from snapshot.tasks), falling back to raw ids. Always str()-ed.
+// snapshotLookup = { repos: [...], tasks: [...] } (plain item arrays).
+export function summarizeOp(op, snapshotLookup) {
+  if (!op || typeof op !== 'object') return ''
+  const lookup = snapshotLookup && typeof snapshotLookup === 'object' ? snapshotLookup : {}
+  const repos = asArray(lookup.repos)
+  const tasks = asArray(lookup.tasks)
+  const args = op.args && typeof op.args === 'object' ? op.args : {}
+  const parts = [str(op.kind || 'op')]
+  const repoId = args.repoId ?? args.repo ?? args.repo_id ?? null
+  if (repoId != null && str(repoId) !== 'none') {
+    const hit = repos.find(r => r && typeof r === 'object' && str(r.repo_id ?? r.repo ?? r.id ?? r.name ?? '') === str(repoId))
+    const name = hit ? str(hit.title || hit.name || hit.repo_id || hit.repo || hit.id || repoId) : str(repoId)
+    const version = args.version != null ? args.version : (hit && hit.version != null ? hit.version : null)
+    parts.push(version != null ? `${name} v${str(version)}` : name)
+  }
+  const ticketId = args.ticketId ?? args.ticket ?? args.key ?? null
+  if (ticketId != null && str(ticketId) !== 'none') {
+    const hit = tasks.find(t => t && typeof t === 'object' && str(t.ticket_id ?? t.ticket ?? t.id ?? '') === str(ticketId))
+    const title = hit ? (hit.title || hit.name || null) : null
+    parts.push(title ? `ticket ${str(ticketId)}: ${str(title)}` : `ticket ${str(ticketId)}`)
+  }
+  if (op.gateway && str(op.gateway) !== 'none') parts.push(`gateway ${str(op.gateway)}`)
+  if (op.at) {
+    const d = new Date(op.at)
+    if (!Number.isNaN(d.getTime())) {
+      parts.push(`${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`)
+    }
+  }
+  return parts.join(' · ')
+}
+
+// retryLegality(op): which retry action (if any) a row may offer.
+//   {push, failed}                → 'deliver'  (grant is not consumed by deliver)
+//   any op failed 'composer unreachable' → 'resubmit' (re-submits op.text verbatim)
+//   refused / anything else       → null (a plugin refusal is not transient)
+export function retryLegality(op) {
+  if (!op || typeof op !== 'object') return null
+  if (op.status === 'refused') return null
+  if (op.status !== 'failed') return null
+  const err = str(op.error || '')
+  const sub = str((op.args && op.args.substatus) || '')
+  if (/composer unreachable/i.test(err)) return 'resubmit'
+  if (op.kind === 'push') return 'deliver'
+  if (/deliver/i.test(err) || /deliver/i.test(sub)) return 'deliver'
+  return null
 }
 
 // --- ctx.storage snapshot schema (defensive: malformed reads return []) -----
@@ -560,7 +647,8 @@ export async function submitOp(ctx, sessionId, op) {
     args: op.args || {},
     status: 'submitted',
     at: Date.now(),
-    replyRef: null
+    replyRef: null,
+    text: op.text != null ? str(op.text) : ''
   }
 
   const ok = await host.composer.submit(sessionId, op.text)
@@ -1436,7 +1524,7 @@ const APPROVE_FAILURES = [
 
 // --- form: approve (OWNER ONLY) --------------------------------------------
 
-function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }) {
+function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops, prefill, onPrefillConsumed }) {
   const snapSrc = snapshotSources(ctx)
   const repos = snapSrc.repos
   const tasks = snapSrc.tasks
@@ -1447,6 +1535,23 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
   const [ticketId, setTicketId] = useState('')
   const [deny, setDeny] = useState(false)
   const [pendingConfirm, setPendingConfirm] = useState(null)
+
+  // Deep-link from the tracker's Awaiting-approval tab: pre-fill the form
+  // (still confirm-gated — nothing submits until the operator confirms).
+  useEffect(() => {
+    if (!prefill) return
+    if (prefill.ticket) {
+      setTargetKind('ticket')
+      setTicketId(str(prefill.ticket))
+    } else {
+      setTargetKind('repo')
+      setRepoId(str(prefill.repo || prefill.id || ''))
+      if (prefill.version != null) setVersion(str(prefill.version))
+    }
+    setDeny(Boolean(prefill.deny))
+    if (onPrefillConsumed) onPrefillConsumed()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill])
 
   const onPickAwaiting = id => {
     const entry = awaiting.find(e => str(e && e.id) === str(id))
@@ -1727,29 +1832,96 @@ const TRACKER_TABS = [
   { id: 'audit', label: 'Audit' }
 ]
 
-function opRow(op) {
+// Per-row details fold: sandbox-safe toggled div (no <details> assumptions).
+// Carries the agent's verbatim reply (op.reply, kept last-per-op-id by the
+// refresh loop) plus the composed prompt text. Default collapsed.
+function OpDetailsFold({ op }) {
+  const [open, setOpen] = useState(false)
+  const unparsed = Boolean(op && op.reply) && isActiveStatus(op && op.status)
   return jsxs('div', {
-    className: 'flex items-center justify-between gap-2 rounded-md px-2 py-1',
+    className: 'flex flex-col gap-1',
+    children: [
+      jsxs('button', {
+        className: 'rounded-md px-2 py-0.5 text-left text-(--ui-text-tertiary)',
+        onClick: () => setOpen(v => !v),
+        children: [
+          jsx('span', { children: open ? '▾ details' : '▸ details' }),
+          unparsed ? jsx('span', { className: 'text-(--ui-text-secondary)', children: ' · review manually' }) : null
+        ]
+      }),
+      open
+        ? jsxs('div', {
+            className: 'flex flex-col gap-1 rounded-md px-2 py-1 text-(--ui-text-secondary)',
+            children: [
+              jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'agent reply (verbatim)' }),
+              jsx('pre', { className: 'whitespace-pre-wrap text-(--ui-text-primary)', children: op && op.reply ? str(op.reply) : '(no reply captured yet)' }),
+              jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'composed prompt' }),
+              jsx('pre', { className: 'whitespace-pre-wrap text-(--ui-text-primary)', children: op && op.text ? str(op.text) : '(prompt text not recorded for this op)' })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function opRow(op, lookup, handlers) {
+  const retry = retryLegality(op)
+  const hs = handlers || {}
+  const substepsLine = op && op.args && Array.isArray(op.args.substeps)
+    ? op.args.substeps.map(s => {
+        const done = asArray(op.args.substepsDone).map(String).includes(String(s))
+        return `${str(s)} ${done ? '✓' : '○'}`
+      }).join(' → ')
+    : null
+  return jsxs('div', {
+    className: 'flex flex-col gap-1 rounded-md px-2 py-1',
     key: str(op.id),
     children: [
       jsxs('div', {
-        className: 'flex flex-col',
+        className: 'flex items-center justify-between gap-2',
         children: [
-          jsx('div', { className: 'text-(--ui-text-primary)', children: str(op.kind) }),
-          jsx('div', {
-            className: 'text-(--ui-text-tertiary)',
-            children: `${str(op.gateway) === 'none' ? '' : str(op.gateway)} · ${new Date(op.at).toLocaleString()}`
+          jsxs('div', {
+            className: 'flex flex-col',
+            children: [
+              jsx('div', { className: 'text-(--ui-text-primary)', children: summarizeOp(op, lookup) }),
+              jsx('div', {
+                className: 'text-(--ui-text-tertiary)',
+                children: `${str(op.gateway) === 'none' ? '' : str(op.gateway)}${op.at ? ` · ${new Date(op.at).toLocaleString()}` : ''}`
+              }),
+              op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${str(op.error)}` }) : null,
+              substepsLine
+                ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: substepsLine })
+                : (op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${str(op.args.substatus)}` }) : null)
+            ]
           }),
-          op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${str(op.error)}` }) : null,
-          op.args && Array.isArray(op.args.substeps)
-            ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: op.args.substeps.map(s => {
-                const done = asArray(op.args.substepsDone).map(String).includes(String(s))
-                return `${done ? '✓' : '○'} ${str(s)}`
-              }).join('  ') })
-            : (op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${str(op.args.substatus)}` }) : null)
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              retry === 'deliver'
+                ? jsx('button', {
+                    className: 'rounded-md px-2 py-0.5 text-xs text-(--ui-text-primary)',
+                    title: 'grant not consumed',
+                    onClick: () => hs.onRetryDeliver && hs.onRetryDeliver(op),
+                    children: 'Retry deliver'
+                  })
+                : null,
+              retry === 'resubmit'
+                ? jsx('button', {
+                    className: 'rounded-md px-2 py-0.5 text-xs text-(--ui-text-primary)',
+                    title: 're-submits the exact same op text',
+                    onClick: () => hs.onResubmit && hs.onResubmit(op),
+                    children: 'Retry'
+                  })
+                : null,
+              op.status === 'refused'
+                ? jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'read the refusal; fix the cause, then re-run the flow.' })
+                : null,
+              jsx('span', { className: opPillClass(op.status), children: str(OP_STATUS_PILL[op.status] || op.status) })
+            ]
+          })
         ]
       }),
-      jsx('span', { className: opPillClass(op.status), children: str(OP_STATUS_PILL[op.status] || op.status) })
+      jsx(OpDetailsFold, { op })
     ]
   })
 }
@@ -1758,23 +1930,55 @@ function opRow(op) {
 // pool_status snapshot. The Awaiting-approval tab renders ONLY entries from
 // snapshot.poolStatus.awaitingApproval (i.e. real pool_status output), never
 // inferred from ops.
-function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing }) {
+function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing, onApproveRequest }) {
   const [tab, setTab] = useState('active')
   const [auditTicket, setAuditTicket] = useState('')
   const list = Array.isArray(ops) ? ops : []
   const awaiting = (poolStatus && Array.isArray(poolStatus.awaitingApproval)) ? poolStatus.awaitingApproval : []
   const budgets = (poolStatus && Array.isArray(poolStatus.budgets)) ? poolStatus.budgets : []
   const claimList = list.filter(op => op && op.kind === 'claim')
+  const lookup = (() => {
+    const s = snapshotSources(ctx)
+    return { repos: s.repos, tasks: s.tasks }
+  })()
+  const onRetryDeliver = async op => {
+    if (noSession) return
+    const a = (op && op.args) || {}
+    if (a.repoId == null || a.manifest == null || a.transferTicket == null || a.grantToken == null) return
+    const text = pushDeliverPrompt({ gateway, repoId: str(a.repoId), version: a.version != null ? str(a.version) : '', ticketJson: str(a.manifest), transferTicket: str(a.transferTicket), grantToken: str(a.grantToken) })
+    const ok = await host.composer.submit(sessionId, text)
+    updateOp(ctx, op.id, { args: { substatus: 'deliver' }, status: ok ? 'awaiting agent' : 'failed', ...(ok ? {} : { error: 'composer unreachable' }) })
+    onRefresh()
+    notifyOp(ctx, ok ? 'info' : 'failed', ok ? 'push deliver re-submitted — awaiting agent' : 'composer unreachable', { id: op.id })
+  }
+  const onResubmit = async op => {
+    if (noSession || !op || !op.text) return
+    const ok = await host.composer.submit(sessionId, op.text)
+    updateOp(ctx, op.id, { status: ok ? 'awaiting agent' : 'failed', ...(ok ? {} : { error: 'composer unreachable' }) })
+    onRefresh()
+    notifyOp(ctx, ok ? 'info' : 'failed', ok ? `${str(op.kind)} re-submitted — awaiting agent` : 'composer unreachable', { id: op.id })
+  }
+  const rowHandlers = { onRetryDeliver, onResubmit }
+  const renderRow = op => opRow(op, lookup, rowHandlers)
 
   let body = null
   if (tab === 'active') {
     const active = list.filter(op => op && isActiveStatus(op.status))
     body = active.length
-      ? jsx('div', { className: 'flex flex-col gap-1', children: active.slice(0, 20).map(opRow) })
+      ? jsx('div', { className: 'flex flex-col gap-1', children: active.slice(0, 20).map(renderRow) })
       : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No active operations.' })
   } else if (tab === 'awaiting') {
     body = awaiting.length
-      ? jsx('div', { className: 'flex flex-col gap-1', children: awaiting.map((entry, i) => jsx('div', { key: str(entry && entry.id) !== 'none' ? str(entry.id) : i, className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', children: `${str(entry && entry.id)}${entry && entry.version != null ? ` · v${str(entry.version)}` : ''} (from pool_status)` })) })
+      ? jsx('div', { className: 'flex flex-col gap-1', children: awaiting.map((entry, i) => jsxs('div', { key: str(entry && entry.id) !== 'none' ? str(entry.id) : i, className: 'flex items-center justify-between gap-2 rounded-md px-2 py-1 text-(--ui-text-primary)', children: [
+          jsx('span', { children: `${str(entry && entry.id)}${entry && entry.version != null ? ` · v${str(entry.version)}` : ''} (from pool_status)` }),
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx('button', { className: 'rounded-md px-2 py-0.5 text-xs text-(--ui-text-primary)', disabled: noSession, title: noSession ? submitTitle : 'Pre-fill the Approve confirm card', onClick: () => onApproveRequest && onApproveRequest(entry, false), children: 'Approve' }),
+              jsx('button', { className: 'rounded-md px-2 py-0.5 text-xs text-(--ui-text-secondary)', disabled: noSession, title: noSession ? submitTitle : 'Pre-fill the Deny confirm card', onClick: () => onApproveRequest && onApproveRequest(entry, true), children: 'Deny' })
+            ]
+          })
+        ] })) })
       : jsx('div', { className: 'text-(--ui-text-tertiary)', children: poolStatus ? 'Nothing awaiting approval in the last pool_status snapshot.' : 'No pool_status snapshot yet — hit Refresh or request a status report.' })
   } else if (tab === 'claims') {
     body = jsxs('div', {
@@ -1786,7 +1990,7 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
           : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No budget lines in the last pool_status snapshot.' }),
         jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Claim ops' }),
         claimList.length
-          ? claimList.slice(0, 20).map(opRow)
+          ? claimList.slice(0, 20).map(renderRow)
           : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No claim ops recorded.' })
       ]
     })
@@ -1800,6 +2004,7 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
           value: auditTicket,
           onChange: setAuditTicket,
           emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
+          selectLabel: '(all tickets)',
           refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
           refreshKind: 'fetch-tasks',
           ops: list,
@@ -1875,7 +2080,7 @@ function setCollapsed(storage, id, value) {
 // The console body is a plain builder (no hooks of its own) so the guard in
 // PoolConsole can catch anything thrown while the tree is assembled. Hook values
 // are read in PoolConsole and passed in.
-function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh, refreshing }) {
+function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh, refreshing, approvePrefill, onApproveRequest, onApprovePrefillConsumed }) {
   const noSession = !sessionId
   const submitTitle = noSession ? 'no focused chat session — focus a chat to submit' : undefined
 
@@ -1919,14 +2124,14 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
           setPolling(value)
         }
       }),
+      jsx(TrackerSection, { ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing, onApproveRequest }),
       jsx(AddRepoForm, { ctx, sessionId, gateway, noSession, submitTitle, recordOp, ops }),
       jsx(FetchTasksForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
       jsx(ClaimForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
       jsx(PullRepoForm, { ctx, gateway, noSession, submitTitle, recordOp, ops }),
       jsx(PushSubmitCard, { ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }),
-      jsx(ApproveForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
-      jsx(MergeForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
-      jsx(TrackerSection, { ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing })
+      jsx(ApproveForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops, prefill: approvePrefill, onPrefillConsumed: onApprovePrefillConsumed }),
+      jsx(MergeForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops })
     ]
   })
 }
@@ -1977,6 +2182,18 @@ function PoolConsole({ ctx }) {
   })
   const [poolStatus, setPoolStatus] = useState(() => ctx.storage.get('snapshot.poolStatus', null))
   const [refreshing, setRefreshing] = useState(false)
+  const [approvePrefill, setApprovePrefill] = useState(null)
+  const onApproveRequest = (entry, deny) => {
+    if (!entry) return
+    setApprovePrefill({
+      id: entry.id != null ? str(entry.id) : '',
+      repo: entry.repo != null ? str(entry.repo) : null,
+      ticket: entry.ticket != null ? str(entry.ticket) : null,
+      version: entry.version != null ? entry.version : null,
+      deny: Boolean(deny),
+      nonce: Date.now()
+    })
+  }
   // Agent→UI refresh: poll the pane-state sidecar (written by pool_pane_report,
   // served by this profile's own /pane-state route). Parsed defensively — a
   // missing/empty sidecar never throws.
@@ -1990,7 +2207,7 @@ function PoolConsole({ ctx }) {
         raw = null
       }
       const parsed = parsePaneState(raw)
-      const { ops: nextOps } = applyPaneStateToOps(ctx.storage.get(OPS_KEY, []), parsed)
+      const { ops: nextOps } = applyOpReplies(applyPaneStateToOps(ctx.storage.get(OPS_KEY, []), parsed).ops, parsed.opReplies)
       ctx.storage.set(OPS_KEY, nextOps)
       setOps(nextOps)
       const snap = {
@@ -2033,7 +2250,7 @@ function PoolConsole({ ctx }) {
       const stored = ctx.storage.get(OPS_KEY, [])
       setOps(Array.isArray(stored) ? stored : [])
     }
-    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh: refreshFromSidecar, refreshing })
+    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh: refreshFromSidecar, refreshing, approvePrefill, onApproveRequest, onApprovePrefillConsumed: () => setApprovePrefill(null) })
   } catch (error) {
     return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.page, error })
   }

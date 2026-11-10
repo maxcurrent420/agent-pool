@@ -677,3 +677,98 @@ def test_push_card_autofill_wiring_and_step3_gate():
     assert "auto-filled from the package op reply" in src
     assert "grantDone && packageDone" in src  # step-3 gating intact
     assert "PRIMARY_BUTTONS.push" in src
+
+
+# --- Task 5: tracker as the operational dashboard ------------------------------
+
+def _run_task5(src, body):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    patterns = [
+        r"function str\(v\) \{.*?\n\}\n",
+        r"function asArray\(v\) \{[^\n]*\n",
+        r"export function extractAwaitingApproval\(ps\) \{.*?\n\}\n",
+        r"export function extractBudgets\(ps\) \{.*?\n\}\n",
+        r"export function parsePaneState\(raw\) \{.*?\n\}\n",
+        r"export function summarizeOp\(op, snapshotLookup\) \{.*?\n\}\n",
+        r"export function retryLegality\(op\) \{.*?\n\}\n",
+    ]
+    parts = []
+    for pattern in patterns:
+        m = re.search(pattern, src, re.S)
+        assert m, f"missing piece: {pattern}"
+        parts.append(m.group(0))
+    harness = "".join(parts) + "\n" + body
+    out = subprocess.run([node, "-e", harness], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip().splitlines()
+
+
+def test_summarize_op_push_with_repo_and_ticket_labels():
+    src = (DESKTOP / "plugin.js").read_text()
+    body = (
+        "const op = { kind: 'push', gateway: 'pool-contrib', at: 0, args: { repoId: 'my-repo', version: 3, ticketId: '42' } };\n"
+        "const lookup = { repos: [{ id: 'my-repo', title: 'my-repo', version: 3 }], tasks: [{ ticket_id: '42', title: 'fix parser' }] };\n"
+        "console.log(JSON.stringify(summarizeOp(op, lookup)));\n"
+        "const empty = { repos: [], tasks: [] };\n"
+        "console.log(JSON.stringify(summarizeOp(op, empty)));\n"
+    )
+    out = _run_task5(src, body)
+    labeled, fallback = (json.loads(l) for l in out)
+    assert labeled.startswith('push · my-repo v3 · ticket 42: fix parser · gateway pool-contrib')
+    assert 'my-repo v3' in fallback and 'ticket 42' in fallback
+    assert 'fix parser' not in fallback
+
+
+def test_retry_legality_mapping():
+    src = (DESKTOP / "plugin.js").read_text()
+    body = (
+        "console.log(JSON.stringify(["
+        " retryLegality({ kind: 'push', status: 'failed', error: 'deliver failed', args: { substatus: 'deliver' } }),"
+        " retryLegality({ kind: 'approve', status: 'refused', error: 'nope', args: {} }),"
+        " retryLegality({ kind: 'claim', status: 'failed', error: 'composer unreachable', args: {} }),"
+        " retryLegality({ kind: 'approve', status: 'failed', error: 'plugin said no', args: {} }),"
+        " retryLegality({ kind: 'push', status: 'awaiting agent', args: {} })"
+        "]));\n"
+    )
+    out = _run_task5(src, body)
+    assert json.loads(out[0]) == ['deliver', None, 'resubmit', None, None]
+
+
+def test_awaiting_tab_sourced_only_from_pool_status():
+    src = (DESKTOP / "plugin.js").read_text()
+    # An op-log entry alone never creates an awaiting-approval row: with no
+    # pool_status in the sidecar, parsePaneState yields an empty list even if
+    # the payload carries op-like entries.
+    body = (
+        "const parsed = parsePaneState({ ops: [{ id: 'op-1', kind: 'approve', status: 'done (awaiting approval)' }], detail: 'x' });\n"
+        "console.log(JSON.stringify(parsed.awaitingApproval));\n"
+    )
+    out = _run_task5(src, body)
+    assert json.loads(out[0]) == []
+    # Source-level: the awaiting tab reads poolStatus.awaitingApproval only.
+    m = re.search(r"\} else if \(tab === 'awaiting'\) \{.*?\n  \} else if", src, re.S)
+    assert m, "awaiting tab branch missing"
+    assert "poolStatus.awaitingApproval" in m.group(0) or "awaiting" in m.group(0)
+    assert "list.filter" not in m.group(0)
+    # Awaiting entries get inline Approve / Deny deep-links.
+    assert "onApproveRequest(entry, false)" in src
+    assert "onApproveRequest(entry, true)" in src
+
+
+def test_refused_rows_have_no_retry_button():
+    src = (DESKTOP / "plugin.js").read_text()
+    m = re.search(r"function opRow\(.*?\n\}\n", src, re.S)
+    assert m
+    body = m.group(0)
+    assert "retryLegality(op)" in body
+    assert "read the refusal; fix the cause, then re-run the flow." in body
+    # Retry buttons render only behind the retryLegality result.
+    assert "retry === 'deliver'" in body and "retry === 'resubmit'" in body
+
+
+def test_audit_dropdown_all_tickets_default_and_run_button():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert "selectLabel: '(all tickets)'" in src
+    assert "auditShowPrompt(gateway, auditTicket)" in src
