@@ -582,3 +582,98 @@ def test_add_repo_form_rework_markers():
     # Manual path only behind the disclosure; the standalone absolute-path field is gone.
     assert "field('local path (absolute)'" not in src
     assert "field('repo_id'" not in src
+
+
+# --- Task 4: one primary button per flow + confirm gates ----------------------
+
+def _load_confirm_helpers(src):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    parts = []
+    for pattern in [
+        r"function str\(v\) \{.*?\n\}\n",
+        r"export const PRIMARY_BUTTONS = \{.*?\n\}\n",
+        r"export function buildConfirmCard\(target, gateway, commandText\) \{.*?\n\}\n",
+        r"export function approveCommandText\(\{ repoId, version, ticketId, deny \} = \{\}\) \{.*?\n\}\n",
+        r"export function mergeCommandText\(\{ repoId, ticketId, checkoutPath \} = \{\}\) \{.*?\n\}\n",
+        r"export function finalizeOp\(draft, confirmState\) \{.*?\n\}\n",
+    ]:
+        m = re.search(pattern, src, re.S)
+        assert m, f"missing piece: {pattern}"
+        parts.append(m.group(0))
+    return node, "".join(parts)
+
+
+def _run_confirm_node(src, body):
+    node, harness = _load_confirm_helpers(src)
+    out = subprocess.run([node, "-e", harness + body],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip()
+
+
+def test_build_confirm_card_text_and_command():
+    src = (DESKTOP / "plugin.js").read_text()
+    cmd = json.loads(_run_confirm_node(src, "console.log(JSON.stringify(approveCommandText({ repoId: 'my-repo', version: 3 })));"))
+    assert cmd == "scripts/pool-approve.py --repo my-repo --version 3"
+    card = json.loads(_run_confirm_node(src, "console.log(JSON.stringify(buildConfirmCard('Approve `my-repo v3`', 'default', approveCommandText({ repoId: 'my-repo', version: 3 }))));"))
+    assert "my-repo" in card["text"] and "v3" in card["text"]
+    assert "scripts/pool-approve.py --repo my-repo --version 3" in card["text"]
+    assert card["commandText"] == "scripts/pool-approve.py --repo my-repo --version 3"
+    assert card["banner"] == "OWNER ONLY"
+    deny_cmd = json.loads(_run_confirm_node(src, "console.log(JSON.stringify(approveCommandText({ ticketId: '42', deny: true })));"))
+    assert deny_cmd == "scripts/pool-approve.py --ticket 42 --deny"
+
+
+def test_finalize_op_requires_confirmed():
+    src = (DESKTOP / "plugin.js").read_text()
+    body = (
+        "const draft = { kind: 'approve', gateway: 'default', args: { repoId: 'my-repo', version: 3 },"
+        " text: \"On the default gateway, OWNER ONLY: run scripts/pool-approve.py --repo my-repo --version 3. Return the plugin's reply verbatim.\" };\n"
+        "console.log(JSON.stringify(["
+        " finalizeOp(draft, { confirmed: false }),"
+        " finalizeOp(draft, {}),"
+        " finalizeOp(draft, null),"
+        " finalizeOp(draft, { confirmed: true })"
+        "]));"
+    )
+    out = json.loads(_run_confirm_node(src, body))
+    assert out[0] is None and out[1] is None and out[2] is None
+    assert out[3]["kind"] == "approve"
+    assert "scripts/pool-approve.py --repo my-repo --version 3" in out[3]["text"]
+
+
+def test_seven_primary_flows_have_exactly_one_button_label():
+    src = (DESKTOP / "plugin.js").read_text()
+    m = re.search(r"export const PRIMARY_BUTTONS = \{.*?\n\}", src, re.S)
+    assert m, "PRIMARY_BUTTONS table missing"
+    table = m.group(0)
+    for label in ["Add repo", "Fetch tasks", "Claim", "Pull repo",
+                  "Submit work (push)", "Approve", "Merge"]:
+        assert f"'{label}'" in table, label
+    for label in ["'Add repo'", "'Fetch tasks'", "'Claim'", "'Pull repo'",
+                  "'Submit work (push)'", "'Approve'", "'Merge'", "'Deny'"]:
+        assert label in table
+    for key in ["addRepo", "fetchTasks", "claim", "pull", "push", "approve", "deny", "merge"]:
+        assert f"PRIMARY_BUTTONS.{key}" in src, key
+
+
+def test_confirm_gate_wired_in_approve_and_merge():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert "function ConfirmCard(" in src
+    assert "buildConfirmCard(" in src
+    assert "finalizeOp(" in src
+    assert src.count("finalizeOp(") >= 4
+    assert "confirmed: true" in src
+    assert "card.banner" in src
+
+
+def test_push_card_autofill_wiring_and_step3_gate():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert "effectiveGrantToken" in src and "effectiveTransferTicket" in src and "effectiveManifest" in src
+    assert "onPickClaim" in src
+    assert "auto-filled from the grant op reply" in src
+    assert "auto-filled from the package op reply" in src
+    assert "grantDone && packageDone" in src  # step-3 gating intact
+    assert "PRIMARY_BUTTONS.push" in src

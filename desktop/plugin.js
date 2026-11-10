@@ -103,6 +103,15 @@ export function parsePaneState(raw) {
   // substeps: ['build bundle', 'deliver']). A flat string list.
   const substeps = raw.substeps || raw.sub_steps || null
   if (Array.isArray(substeps)) parsed.substeps = substeps.map(s => str(s)).filter(s => s && s !== 'none')
+  // Op-linked auto-fill payloads for the push card (grant reply / package reply).
+  const grantToken = raw.grant_token || raw.grantToken || null
+  if (grantToken) parsed.grantToken = str(grantToken)
+  const transferTicket = raw.transfer_ticket || raw.transferTicket || null
+  if (transferTicket) parsed.transferTicket = str(transferTicket)
+  const manifest = raw.manifest || raw.manifest_json || null
+  if (manifest) parsed.manifest = typeof manifest === 'string' ? manifest : JSON.stringify(manifest)
+  const worktreePath = raw.worktree_path || raw.worktreePath || null
+  if (worktreePath) parsed.worktreePath = str(worktreePath)
   return parsed
 }
 
@@ -188,6 +197,17 @@ export function applyPaneStateToOps(ops, parsed) {
         changed = true
         op = { ...op, args: { ...op.args, substepsDone: merged } }
       }
+    }
+    // Merge sidecar-reported auto-fill payloads into active push/claim ops.
+    const autoFill = {}
+    if (parsed.grantToken) autoFill.grantToken = str(parsed.grantToken)
+    if (parsed.transferTicket) autoFill.transferTicket = str(parsed.transferTicket)
+    if (parsed.manifest) autoFill.manifest = str(parsed.manifest)
+    if (parsed.worktreePath && op.kind === 'claim') autoFill.worktreePath = str(parsed.worktreePath)
+    if (Object.keys(autoFill).length && isActiveStatus(op.status)
+        && ((op.kind === 'push' && !autoFill.worktreePath) || (op.kind === 'claim' && autoFill.worktreePath))) {
+      changed = true
+      op = { ...op, args: { ...op.args, ...autoFill } }
     }
     if (op.status === 'done' || op.status === 'failed') return op
     let status = op.status
@@ -636,14 +656,62 @@ export function resolveAddRepoSelection({ discoveredId, manualPath, discovered }
   return { path: hit.path, repoId: hit.name || repoNameFromPath(hit.path) }
 }
 
+// --- Task 4: one primary button per flow + confirm gates -------------------
+// The seven primary flows. Exactly one primary button per flow carries one of
+// these labels; everything else is a sub-step or a secondary action.
+export const PRIMARY_BUTTONS = {
+  addRepo: 'Add repo',
+  fetchTasks: 'Fetch tasks',
+  claim: 'Claim',
+  pull: 'Pull repo',
+  push: 'Submit work (push)',
+  approve: 'Approve',
+  deny: 'Deny',
+  merge: 'Merge'
+}
+
+// buildConfirmCard(target, gateway, commandText): pure. The confirm card that
+// stands between the primary button and the submit. `text` names the target in
+// plain words and carries the literal command the prompt will run.
+export function buildConfirmCard(target, gateway, commandText) {
+  const t = str(target)
+  const gw = str(gateway)
+  const cmd = str(commandText)
+  const text = `${t} on gateway \`${gw}\`? This asks the agent to run \`${cmd}\`.`
+  return { target: t, gateway: gw, commandText: cmd, banner: 'OWNER ONLY', text }
+}
+
+// The literal command strings the confirm card shows and the golden tests pin.
+export function approveCommandText({ repoId, version, ticketId, deny } = {}) {
+  const target = ticketId
+    ? `--ticket ${ticketId}`
+    : `--repo ${repoId}${version != null && version !== '' ? ` --version ${version}` : ''}`
+  return `scripts/pool-approve.py ${target}${deny ? ' --deny' : ''}`
+}
+
+export function mergeCommandText({ repoId, ticketId, checkoutPath } = {}) {
+  const target = ticketId ? `ticket ${ticketId}` : `repo ${repoId}`
+  return `git fetch <approved bundle> && git merge into ${checkoutPath || `work/integrate/${repoId}/`} (${target})`
+}
+
+// finalizeOp(draft, confirmState): pure. Returns null unless the operator
+// pressed Confirm — the op can never compose without confirmed === true.
+export function finalizeOp(draft, confirmState) {
+  if (!confirmState || confirmState.confirmed !== true) return null
+  return draft
+}
+
 const inputClass = 'rounded-md px-2 py-1 text-(--ui-text-primary)'
 const labelClass = 'text-(--ui-text-secondary)'
 
 // Reusable snapshot-fed dropdown. Opt-in manual fallback per field per
 // session (never persisted); refresh button disabled while an op of the
 // refresh kind is 'awaiting agent'.
-function SnapshotSelect({ label, items, value, onChange, emptyHint, refreshAction, refreshKind, ops, allowManual, manualPlaceholder, manualValue, onManualChange, selectLabel }) {
+function SnapshotSelect({ label, items, value, onChange, emptyHint, refreshAction, refreshKind, ops, allowManual, manualPlaceholder, manualValue, onManualChange, selectLabel, resetKey }) {
   const [manual, setManual] = useState(false)
+  // Flow reset: the manual disclosure is closed by default and un-checks
+  // itself whenever the flow's reset key changes.
+  useEffect(() => { setManual(false) }, [resetKey])
   const list = asArray(items)
   const options = buildOptions(list, emptyHint || 'Nothing loaded yet', selectLabel, Boolean(allowManual))
   const refreshAwaiting = refreshKind
@@ -736,6 +804,30 @@ function failureHints(items) {
   })
 }
 
+// The two-step confirm gate for owner actions (Approve / Deny / Merge).
+// Shows the plain-words target, the literal command the prompt will carry and
+// the OWNER ONLY banner. The op fires only on Confirm.
+function ConfirmCard({ card, onConfirm, onCancel }) {
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: card.banner }),
+      jsx('div', { className: 'text-(--ui-text-primary)', children: str(card.text) }),
+      jsxs('div', {
+        className: 'text-(--ui-text-secondary)',
+        children: [jsx('span', { children: 'command: ' }), jsx('code', { children: str(card.commandText) })]
+      }),
+      jsxs('div', {
+        className: 'flex items-center gap-2',
+        children: [
+          submitButton({ disabled: false, title: undefined, onClick: onConfirm, children: 'Confirm' }),
+          jsx('button', { className: 'rounded-md px-3 py-1.5 text-(--ui-text-secondary)', title: 'Back to the form', onClick: onCancel, children: 'Cancel' })
+        ]
+      })
+    ]
+  })
+}
+
 function submitButton({ disabled, title, children, onClick }) {
   return jsx('button', {
     className: 'rounded-md px-3 py-1.5 text-left text-(--ui-text-primary)',
@@ -779,7 +871,7 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
     : !pathOk
       ? (manualPathActive
           ? 'path must be an absolute local path (no URLs)'
-          : 'pick a discovered repo, or choose (enter manually…) and type an absolute path')
+          : 'pick a discovered repo first')
     : !versionOk ? '--version must be a positive integer'
     : undefined
 
@@ -824,7 +916,8 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
         manualPlaceholder: '/home/you/src/my-repo',
         manualValue: manualPath,
         onManualChange: setManualPath,
-        selectLabel: '(select a discovered repo)'
+        selectLabel: '(select a discovered repo)',
+        resetKey: mode
       }),
       skipped > 0 ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `${skipped} entries skipped (non-local paths)` }) : null,
       manualPathActive && !isAbsoluteLocalPath(manualPath)
@@ -840,10 +933,14 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
             refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
             ops,
             allowManual: false,
-            selectLabel: '(select a pool)'
+            selectLabel: '(select a pool)',
+            resetKey: mode
           })
         : null,
       jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'version auto-resolves (agent asks /fetch repo for accepted_version)' }),
+      version.trim() && !/^\d+$/.test(version.trim())
+        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: '--version must be a positive integer.' })
+        : null,
       jsx(SnapshotSelect, {
         label: '--version (optional)',
         items: [],
@@ -853,7 +950,8 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
         allowManual: true,
         manualPlaceholder: 'N',
         manualValue: version,
-        onManualChange: setVersion
+        onManualChange: setVersion,
+        resetKey: mode
       }),
       mode === 'link'
         ? jsx(SnapshotSelect, {
@@ -863,7 +961,8 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
             onChange: setMaintainerGateway,
             emptyHint: SNAPSHOT_KIND_EMPTY.gateways,
             allowManual: false,
-            selectLabel: '(select a gateway)'
+            selectLabel: '(select a gateway)',
+            resetKey: mode
           })
         : null,
       jsx('div', { className: 'flex items-center gap-2', children: [
@@ -878,7 +977,7 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
         })
       ] }),
       failureHints(ADD_REPO_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: mode === 'owner' ? 'Add repo' : 'Contribute repo' })
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: mode === 'owner' ? PRIMARY_BUTTONS.addRepo : 'Contribute repo' })
     ]
   })
 }
@@ -921,9 +1020,10 @@ function FetchTasksForm({ ctx, gateway, noSession, submitTitle, recordOp, sessio
         allowManual: true,
         manualPlaceholder: 'repo_id',
         manualValue: repoFilter,
-        onManualChange: setRepoFilter
+        onManualChange: setRepoFilter,
+        resetKey: 'fetch'
       }),
-      submitButton({ disabled: !ready, title: noSession ? submitTitle : undefined, onClick: onSubmit, children: 'Fetch tasks (/fetch repo list → /fetch task list)' })
+      submitButton({ disabled: !ready, title: noSession ? submitTitle : undefined, onClick: onSubmit, children: PRIMARY_BUTTONS.fetchTasks })
     ]
   })
 }
@@ -948,7 +1048,7 @@ function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
   const disabledTitle = noSession
     ? submitTitle
     : autoAssign ? (ticketReady ? undefined : 'max-tasks must be a positive integer')
-    : 'a ticket id is required — pick one from the snapshot or type it'
+    : 'pick a ticket first'
 
   const onSubmit = async () => {
     if (!ready) return
@@ -978,7 +1078,12 @@ function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
         onChange: setAutoAssign
       }),
       autoAssign
-        ? field('--max-tasks N', jsx('input', { className: inputClass, value: maxTasks, onChange: e => setMaxTasks(e.target.value), inputMode: 'numeric' }))
+        ? jsxs('div', { className: 'flex flex-col gap-1', children: [
+            field('--max-tasks N', jsx('input', { className: inputClass, value: maxTasks, onChange: e => setMaxTasks(e.target.value), inputMode: 'numeric' })),
+            !/^\d+$/.test(maxTasks.trim()) || Number(maxTasks.trim()) <= 0
+              ? jsx('div', { className: 'text-(--ui-text-secondary)', children: 'max-tasks must be a positive integer.' })
+              : null
+          ] })
         : jsxs('div', {
             className: 'flex flex-col gap-2',
             children: [
@@ -994,14 +1099,15 @@ function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
                 allowManual: true,
                 manualPlaceholder: 'ticket_id',
                 manualValue: ticket,
-                onManualChange: setTicket
+                onManualChange: setTicket,
+                resetKey: String(autoAssign)
               })
             ]
           }),
       field('claimant identity note (optional)', jsx('input', { className: inputClass, value: note, onChange: e => setNote(e.target.value), placeholder: 'who is claiming, for the record' })),
       jsx('div', { className: 'text-(--ui-text-tertiary)', children: `target profile: ${str(gateway)} (plugin binds claim to key + Discord id automatically)` }),
       failureHints(CLAIM_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: autoAssign ? 'Auto-assign (/claim --any-project)' : 'Claim ticket (/claim)' })
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: PRIMARY_BUTTONS.claim })
     ]
   })
 }
@@ -1050,8 +1156,8 @@ function PullRepoForm({ ctx, gateway, noSession, submitTitle, recordOp, ops }) {
   const ready = !noSession && Boolean(effectiveTicket) && Boolean(dest.trim()) && isAbsoluteLocalPath(dest)
   const disabledTitle = noSession
     ? submitTitle
-    : !effectiveTicket ? 'ticket id is required — pick a claim op or type it'
-    : !dest.trim() ? 'destination directory is required'
+    : !effectiveTicket ? 'pick a ticket first'
+    : !dest.trim() ? 'enter an absolute destination directory'
     : !isAbsoluteLocalPath(dest) ? 'destination must be an absolute local path'
     : undefined
 
@@ -1091,8 +1197,11 @@ function PullRepoForm({ ctx, gateway, noSession, submitTitle, recordOp, ops }) {
       field('ticket id', jsx('input', { className: inputClass, value: effectiveTicket, onChange: e => { setClaimId(''); setTicketId(e.target.value) }, placeholder: 'ticket_id' })),
       field('saved claim reply json (--reply-file)', jsx('input', { className: inputClass, value: effectiveReplyFile, onChange: e => setReplyFile(e.target.value), placeholder: '/path/to/claim-reply.json' })),
       field('destination directory (--dest, absolute)', jsx('input', { className: inputClass, value: dest, onChange: e => setDest(e.target.value), placeholder: '/home/you/work/ticket' })),
+      dest.trim() && !isAbsoluteLocalPath(dest)
+        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Destination must be absolute (starts with /) and must not look like a URL.' })
+        : null,
       failureHints(PULL_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: 'Pull repo (scripts/contributor-claim.py)' })
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: PRIMARY_BUTTONS.pull })
     ]
   })
 }
@@ -1112,6 +1221,11 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
   const tasks = snapSrc.tasks
   const pools = itemsFor({ repos, poolStatus: snapSrc.poolStatus }, 'pools')
   const existing = (Array.isArray(ops) ? ops : []).find(op => op && op.kind === 'push' && op.status !== 'done' && op.status !== 'done (awaiting approval)' && op.status !== 'failed') || null
+  const claims = claimOps(ops)
+  const claimItems = claims.map(op => ({
+    id: str(op && op.id),
+    title: `${str((op && op.args && (op.args.ticket || op.args.key)) || (op && op.id) || '')}${op && op.at ? ` · ${new Date(op.at).toLocaleString()}` : ''}`
+  }))
   const [pushOpId, setPushOpId] = useState(() => existing && existing.id != null ? str(existing.id) : undefined)
   const [repoId, setRepoId] = useState(() => str((existing && existing.args && existing.args.repoId) || ''))
   const [ticketId, setTicketId] = useState(() => str((existing && existing.args && existing.args.ticketId) || ''))
@@ -1123,6 +1237,25 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
   const [manifest, setManifest] = useState(() => str((existing && existing.args && existing.args.manifest) || ''))
   const [grantDone, setGrantDone] = useState(() => Boolean(existing && existing.args && existing.args.grantDone))
   const [packageDone, setPackageDone] = useState(() => Boolean(existing && existing.args && existing.args.packageDone))
+  const [manualTransfer, setManualTransfer] = useState(false)
+  const [manualManifest, setManualManifest] = useState(false)
+
+  const livePushOp = (Array.isArray(ops) ? ops : []).find(op => op && op.id != null && str(op.id) === str(pushOpId || (existing && existing.id) || '')) || existing
+  const liveArgs = (livePushOp && livePushOp.args) || {}
+  const autoGrantToken = liveArgs.grantToken != null ? str(liveArgs.grantToken) : ''
+  const autoTransferTicket = liveArgs.transferTicket != null ? str(liveArgs.transferTicket) : ''
+  const autoManifest = liveArgs.manifest != null ? str(liveArgs.manifest) : ''
+  const effectiveGrantToken = grantToken.trim() || autoGrantToken
+  const effectiveTransferTicket = transferTicket.trim() || autoTransferTicket
+  const effectiveManifest = manifest.trim() || autoManifest
+
+  const onPickClaim = id => {
+    const op = claims.find(o => str(o && o.id) === str(id))
+    if (!op || !op.args) return
+    const t = op.args.ticket || op.args.key || ''
+    if (t) setTicketId(str(t))
+    if (op.args.worktreePath) setWorktreePath(str(op.args.worktreePath))
+  }
 
   const substatus = grantDone && packageDone ? 'deliver' : grantDone ? 'package' : 'grant'
 
@@ -1138,15 +1271,16 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
     return record
   }
 
-  // Step 3 gating: disabled until steps 1-2 statuses are filled (ticket,
-  // grant token and manifest path linked/filled).
-  const deliverReady = !noSession && grantDone && packageDone && Boolean(transferTicket.trim()) && Boolean(grantToken.trim()) && Boolean(manifest.trim())
+  // Step 3 gating: deliver cannot fire before steps 1-2 are done (grant+package)
+  // AND the transfer ticket, grant token and manifest are present — via dropdown/
+  // op-linked auto-fill or the manual disclosure.
+  const deliverReady = !noSession && grantDone && packageDone && Boolean(effectiveTransferTicket) && Boolean(effectiveGrantToken) && Boolean(effectiveManifest)
   const deliverTitle = noSession ? submitTitle
     : !grantDone ? 'step 1 (grant) must complete first — the grant token comes from the /push repo reply'
     : !packageDone ? 'step 2 (package) must complete first — the manifest comes from scripts/contributor-push.py'
-    : !transferTicket.trim() ? 'transfer ticket is required (from the package reply)'
-    : !grantToken.trim() ? 'grant token is required (from the /push repo reply)'
-    : !manifest.trim() ? 'manifest json (or path) is required'
+    : !effectiveTransferTicket ? 'transfer ticket is required (from the package reply)'
+    : !effectiveGrantToken ? 'grant token is required (from the /push repo reply)'
+    : !effectiveManifest ? 'manifest json (or path) is required'
     : undefined
 
   const submitGrant = async () => {
@@ -1165,15 +1299,15 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
 
   const submitDeliver = async () => {
     if (!deliverReady) return
-    const text = pushDeliverPrompt({ gateway, repoId: repoId.trim(), version: version.trim(), ticketJson: manifest.trim(), transferTicket: transferTicket.trim(), grantToken: grantToken.trim() })
-    await ensureOp({ transferTicket: transferTicket.trim(), grantToken: grantToken.trim(), manifest: manifest.trim(), substatus: 'deliver' }, text)
+    const text = pushDeliverPrompt({ gateway, repoId: repoId.trim(), version: version.trim(), ticketJson: effectiveManifest, transferTicket: effectiveTransferTicket, grantToken: effectiveGrantToken })
+    await ensureOp({ transferTicket: effectiveTransferTicket, grantToken: effectiveGrantToken, manifest: effectiveManifest, substatus: 'deliver' }, text)
   }
 
   // Retry deliver: re-submits ONLY the deliver prompt. The grant is not
   // consumed by deliver, so redelivery is legal on transport failure.
   const retryDeliver = async () => {
-    if (noSession || !(pushOpId || existing) || !grantToken.trim() || !transferTicket.trim() || !manifest.trim()) return
-    const text = pushDeliverPrompt({ gateway, repoId: repoId.trim(), version: version.trim(), ticketJson: manifest.trim(), transferTicket: transferTicket.trim(), grantToken: grantToken.trim() })
+    if (noSession || !(pushOpId || existing) || !effectiveGrantToken || !effectiveTransferTicket || !effectiveManifest) return
+    const text = pushDeliverPrompt({ gateway, repoId: repoId.trim(), version: version.trim(), ticketJson: effectiveManifest, transferTicket: effectiveTransferTicket, grantToken: effectiveGrantToken })
     const id = pushOpId || (existing && existing.id)
     const ok = await host.composer.submit(sessionId, text)
     updateOp(ctx, id, { args: { substatus: 'deliver' }, status: ok ? 'awaiting agent' : 'failed', ...(ok ? {} : { error: 'composer unreachable' }) })
@@ -1190,6 +1324,16 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
       jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Push / submit work (grant → package → deliver)' }),
       jsx('div', { className: 'text-(--ui-text-tertiary)', children: `one tracked op of kind push · substatus: ${str(substatus)}` }),
       jsx(SnapshotSelect, {
+        label: 'claim (prefills ticket + worktree)',
+        items: claimItems,
+        value: '',
+        onChange: onPickClaim,
+        emptyHint: SNAPSHOT_KIND_EMPTY.claims,
+        allowManual: false,
+        selectLabel: '(pick a claim)',
+        resetKey: substatus
+      }),
+      jsx(SnapshotSelect, {
         label: 'repo_id',
         items: repos,
         value: repoId,
@@ -1200,7 +1344,8 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
         allowManual: true,
         manualPlaceholder: 'my-repo',
         manualValue: repoId,
-        onManualChange: setRepoId
+        onManualChange: setRepoId,
+        resetKey: substatus
       }),
       jsx(SnapshotSelect, {
         label: 'ticket id',
@@ -1214,20 +1359,22 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
         allowManual: true,
         manualPlaceholder: 'ticket_id',
         manualValue: ticketId,
-        onManualChange: setTicketId
+        onManualChange: setTicketId,
+        resetKey: substatus
       }),
       jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 1 — grant (/push repo)' }),
       submitButton({ disabled: !grantReady, title: noSession ? submitTitle : (!repoId.trim() || !ticketId.trim() ? 'repo_id and ticket id are required' : undefined), onClick: submitGrant, children: grantDone ? 'Step 1 — grant submitted ✓ (re-request)' : 'Step 1 — request grant (/push repo)' }),
       jsx(SnapshotSelect, {
-        label: 'grant token (from the /push repo reply)',
-        items: grantToken.trim() ? [{ id: grantToken.trim(), title: 'grant token' }] : [],
-        value: grantToken,
+        label: autoGrantToken && !grantToken.trim() ? 'grant token (auto-filled from the grant op reply)' : 'grant token (from the /push repo reply)',
+        items: effectiveGrantToken ? [{ id: effectiveGrantToken, title: 'grant token' }] : [],
+        value: effectiveGrantToken,
         onChange: setGrantToken,
         emptyHint: SNAPSHOT_KIND_EMPTY.grant,
         allowManual: true,
         manualPlaceholder: 'grant_token',
         manualValue: grantToken,
-        onManualChange: setGrantToken
+        onManualChange: setGrantToken,
+        resetKey: substatus
       }),
       jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 2 — package (scripts/contributor-push.py). Caveat: take next_version from the grant reply or re-ask /fetch repo <repo_id> for accepted_version; never trust the enroll-time chain_tips.' }),
       field('worktree path', jsx('input', { className: inputClass, value: worktreePath, onChange: e => setWorktreePath(e.target.value), placeholder: '/path/to/worktree' })),
@@ -1242,8 +1389,12 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
         allowManual: true,
         manualPlaceholder: 'pool_id',
         manualValue: poolId,
-        onManualChange: setPoolId
+        onManualChange: setPoolId,
+        resetKey: substatus
       }),
+      version.trim() && !/^\d+$/.test(version.trim())
+        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: '--version must be a positive integer.' })
+        : null,
       jsx(SnapshotSelect, {
         label: '--version N (auto-resolves; manual fallback)',
         items: [],
@@ -1253,14 +1404,25 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
         allowManual: true,
         manualPlaceholder: 'N',
         manualValue: version,
-        onManualChange: setVersion
+        onManualChange: setVersion,
+        resetKey: substatus
       }),
       submitButton({ disabled: !packageReady, title: noSession ? submitTitle : !grantDone ? 'step 1 (grant) must complete first' : 'worktree, repo_id, pool_id and a numeric --version are required', onClick: submitPackage, children: packageDone ? 'Step 2 — package submitted ✓ (re-package)' : 'Step 2 — package (scripts/contributor-push.py)' }),
       jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 3 — deliver (/push repo --deliver). Redelivery is legal: the grant is not consumed by deliver.' }),
-      field('transfer ticket (from the package reply)', jsx('input', { className: inputClass, value: transferTicket, onChange: e => setTransferTicket(e.target.value), placeholder: 'transfer_ticket' })),
-      field('manifest json (or path)', jsx('input', { className: inputClass, value: manifest, onChange: e => setManifest(e.target.value), placeholder: '{"manifest": …} or /path/to/manifest.json' })),
-      submitButton({ disabled: !deliverReady, title: deliverTitle, onClick: submitDeliver, children: 'Step 3 — deliver (/push repo --deliver)' }),
-      submitButton({ disabled: noSession || !(pushOpId || existing) || !grantToken.trim() || !transferTicket.trim() || !manifest.trim(), title: 'Re-submits only the deliver prompt (grant not consumed by deliver)', onClick: retryDeliver, children: 'Retry deliver (grant not consumed)' }),
+      autoTransferTicket && !transferTicket.trim() && !manualTransfer
+        ? jsxs('div', { className: 'flex items-center gap-2', children: [
+            jsx('div', { className: 'text-(--ui-text-tertiary)', children: `transfer ticket auto-filled from the package op reply: ${str(autoTransferTicket)}` }),
+            jsx('button', { className: 'rounded-md px-2 py-0.5 text-(--ui-text-secondary)', title: 'Enter the transfer ticket manually', onClick: () => setManualTransfer(true), children: '(enter manually…)' })
+          ] })
+        : field('transfer ticket (from the package reply)', jsx('input', { className: inputClass, value: transferTicket, onChange: e => setTransferTicket(e.target.value), placeholder: autoTransferTicket ? `auto-filled: ${autoTransferTicket}` : 'transfer_ticket' })),
+      autoManifest && !manifest.trim() && !manualManifest
+        ? jsxs('div', { className: 'flex items-center gap-2', children: [
+            jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'manifest auto-filled from the package op reply' }),
+            jsx('button', { className: 'rounded-md px-2 py-0.5 text-(--ui-text-secondary)', title: 'Enter the manifest manually', onClick: () => setManualManifest(true), children: '(enter manually…)' })
+          ] })
+        : field('manifest json (or path)', jsx('input', { className: inputClass, value: manifest, onChange: e => setManifest(e.target.value), placeholder: autoManifest ? 'auto-filled from the package op reply' : '{"manifest": …} or /path/to/manifest.json' })),
+      submitButton({ disabled: !deliverReady, title: deliverTitle, onClick: submitDeliver, children: PRIMARY_BUTTONS.push }),
+      submitButton({ disabled: noSession || !(pushOpId || existing) || !effectiveGrantToken || !effectiveTransferTicket || !effectiveManifest, title: 'Re-submits only the deliver prompt (grant not consumed by deliver)', onClick: retryDeliver, children: 'Retry deliver (grant not consumed)' }),
       failureHints(PUSH_FAILURES)
     ]
   })
@@ -1284,6 +1446,7 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
   const [version, setVersion] = useState('')
   const [ticketId, setTicketId] = useState('')
   const [deny, setDeny] = useState(false)
+  const [pendingConfirm, setPendingConfirm] = useState(null)
 
   const onPickAwaiting = id => {
     const entry = awaiting.find(e => str(e && e.id) === str(id))
@@ -1307,22 +1470,42 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
   const disabledTitle = noSession
     ? submitTitle
     : !versionOk ? '--version must be a number'
-    : targetKind === 'repo' ? (!repoId.trim() ? 'repo_id is required for a repo version approval' : undefined)
-    : (!ticketId.trim() ? 'ticket_id is required for a pushed-claim approval' : undefined)
+    : targetKind === 'repo' ? (!repoId.trim() ? 'pick a repo first' : undefined)
+    : (!ticketId.trim() ? 'pick a ticket first' : undefined)
 
-  const onSubmit = async () => {
+  // The primary button only OPENS the confirm card; the op composes and
+  // submits strictly on Confirm (finalizeOp returns null without confirmed).
+  const onSubmit = () => {
     if (!ready) return
+    const v = targetKind === 'repo' && version.trim() ? Number(version.trim()) : undefined
     const args = targetKind === 'repo'
-      ? { repoId: repoId.trim(), ...(version.trim() ? { version: Number(version.trim()) } : {}), deny }
+      ? { repoId: repoId.trim(), ...(v != null ? { version: v } : {}), deny }
       : { ticketId: ticketId.trim(), deny }
     const text = approvePrompt({
       gateway,
       repoId: targetKind === 'repo' ? repoId.trim() : undefined,
-      version: targetKind === 'repo' && version.trim() ? Number(version.trim()) : undefined,
+      version: v,
       ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
       deny
     })
-    await recordOp({ kind: 'approve', gateway, args: { ...args, target: targetKind }, text })
+    const commandText = approveCommandText({
+      repoId: targetKind === 'repo' ? repoId.trim() : undefined,
+      version: v,
+      ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
+      deny
+    })
+    const target = targetKind === 'repo'
+      ? `${deny ? 'Deny' : 'Approve'} \`${repoId.trim()}${v != null ? ` v${v}` : ''}\``
+      : `${deny ? 'Deny' : 'Approve'} pushed claim \`${ticketId.trim()}\``
+    const card = buildConfirmCard(target, gateway, commandText)
+    setPendingConfirm({ draft: { kind: 'approve', gateway, args: { ...args, target: targetKind }, text }, card })
+  }
+
+  const onConfirmOp = async () => {
+    const op = finalizeOp(pendingConfirm && pendingConfirm.draft, { confirmed: true })
+    setPendingConfirm(null)
+    if (!op) return
+    await recordOp(op)
   }
 
   return jsxs('div', {
@@ -1347,7 +1530,8 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
         refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
         ops,
         allowManual: false,
-        selectLabel: '(pick an awaiting-approval target)'
+        selectLabel: '(pick an awaiting-approval target)',
+        resetKey: targetKind
       }),
       targetKind === 'repo'
         ? jsx(SnapshotSelect, {
@@ -1361,7 +1545,8 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
             allowManual: true,
             manualPlaceholder: 'my-repo',
             manualValue: repoId,
-            onManualChange: setRepoId
+            onManualChange: setRepoId,
+            resetKey: targetKind
           })
         : jsx(SnapshotSelect, {
             label: 'ticket_id',
@@ -1375,10 +1560,16 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
             allowManual: true,
             manualPlaceholder: 'ticket_id',
             manualValue: ticketId,
-            onManualChange: setTicketId
+            onManualChange: setTicketId,
+            resetKey: targetKind
           }),
       targetKind === 'repo'
-        ? field('--version N (optional)', jsx('input', { className: inputClass, value: version, onChange: e => setVersion(e.target.value), inputMode: 'numeric', placeholder: 'N' }))
+        ? jsx('div', { className: 'flex flex-col gap-1', children: [
+            field('--version N (optional)', jsx('input', { className: inputClass, value: version, onChange: e => setVersion(e.target.value), inputMode: 'numeric', placeholder: 'N' })),
+            version.trim() && !/^\d+$/.test(version.trim())
+              ? jsx('div', { className: 'text-(--ui-text-secondary)', children: '--version must be a positive integer.' })
+              : null
+          ] })
         : null,
       jsx(ToggleRow, {
         checked: deny,
@@ -1387,7 +1578,9 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
         onChange: value => setDeny(value)
       }),
       failureHints(APPROVE_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: deny ? 'Deny (pool-approve.py --deny)' : 'Approve (pool-approve.py)' })
+      pendingConfirm
+        ? jsx(ConfirmCard, { card: pendingConfirm.card, onConfirm: onConfirmOp, onCancel: () => setPendingConfirm(null) })
+        : submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: deny ? PRIMARY_BUTTONS.deny : PRIMARY_BUTTONS.approve })
     ]
   })
 }
@@ -1409,6 +1602,7 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
   const [repoId, setRepoId] = useState('')
   const [ticketId, setTicketId] = useState('')
   const [checkoutPath, setCheckoutPath] = useState('')
+  const [pendingConfirm, setPendingConfirm] = useState(null)
 
   const onPickAwaiting = id => {
     const entry = awaiting.find(e => str(e && e.id) === str(id))
@@ -1427,10 +1621,11 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
   const ready = !noSession && (targetKind === 'repo' ? Boolean(repoId.trim()) : Boolean(ticketId.trim())) && Boolean(effectiveCheckout)
   const disabledTitle = noSession
     ? submitTitle
-    : targetKind === 'repo' ? (!repoId.trim() ? 'repo_id is required' : undefined)
-    : (!ticketId.trim() ? 'ticket_id is required' : undefined)
+    : targetKind === 'repo' ? (!repoId.trim() ? 'pick a repo first' : undefined)
+    : (!ticketId.trim() ? 'pick a ticket first' : undefined)
 
-  const onSubmit = async () => {
+  // Primary button opens the confirm card; the op composes strictly on Confirm.
+  const onSubmit = () => {
     if (!ready) return
     const args = targetKind === 'repo'
       ? { repoId: repoId.trim(), checkoutPath: effectiveCheckout }
@@ -1441,7 +1636,23 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
       ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
       checkoutPath: effectiveCheckout
     })
-    await recordOp({ kind: 'merge', gateway, args: { ...args, target: targetKind }, text })
+    const commandText = mergeCommandText({
+      repoId: targetKind === 'repo' ? repoId.trim() : undefined,
+      ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
+      checkoutPath: effectiveCheckout
+    })
+    const target = targetKind === 'repo'
+      ? `Merge approved bundle for \`${repoId.trim()}\``
+      : `Merge approved bundle for pushed claim \`${ticketId.trim()}\``
+    const card = buildConfirmCard(target, gateway, commandText)
+    setPendingConfirm({ draft: { kind: 'merge', gateway, args: { ...args, target: targetKind }, text }, card })
+  }
+
+  const onConfirmOp = async () => {
+    const op = finalizeOp(pendingConfirm && pendingConfirm.draft, { confirmed: true })
+    setPendingConfirm(null)
+    if (!op) return
+    await recordOp(op)
   }
 
   return jsxs('div', {
@@ -1466,7 +1677,8 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
         refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
         ops,
         allowManual: false,
-        selectLabel: '(pick an awaiting-approval target)'
+        selectLabel: '(pick an awaiting-approval target)',
+        resetKey: targetKind
       }),
       targetKind === 'repo'
         ? jsx(SnapshotSelect, {
@@ -1480,7 +1692,8 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
             allowManual: true,
             manualPlaceholder: 'my-repo',
             manualValue: repoId,
-            onManualChange: setRepoId
+            onManualChange: setRepoId,
+            resetKey: targetKind
           })
         : jsx(SnapshotSelect, {
             label: 'ticket_id',
@@ -1494,12 +1707,15 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
             allowManual: true,
             manualPlaceholder: 'ticket_id',
             manualValue: ticketId,
-            onManualChange: setTicketId
+            onManualChange: setTicketId,
+            resetKey: targetKind
           }),
       field('canonical checkout path (default: work/integrate/<repo_id>/)', jsx('input', { className: inputClass, value: checkoutPath, onChange: e => setCheckoutPath(e.target.value), placeholder: repoId.trim() ? `work/integrate/${repoId.trim()}/` : 'work/integrate/<repo_id>/' })),
       jsx('div', { className: 'text-(--ui-text-tertiary)', children: `effective checkout: ${str(effectiveCheckout) || '(enter a repo_id to prefill the work/integrate/ convention)'}` }),
       failureHints(MERGE_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: 'Merge approved bundle (agent runs git fetch + git merge)' })
+      pendingConfirm
+        ? jsx(ConfirmCard, { card: pendingConfirm.card, onConfirm: onConfirmOp, onCancel: () => setPendingConfirm(null) })
+        : submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: PRIMARY_BUTTONS.merge })
     ]
   })
 }
