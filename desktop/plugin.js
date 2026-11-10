@@ -11,7 +11,7 @@
 // --ui-text-secondary / --ui-text-tertiary), so light and dark mode both
 // come out of the host's palette. No literal colours.
 
-import { ListRow, PANES_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA, ToggleRow } from '@hermes/plugin-sdk'
+import { host, ListRow, PANES_AREA, ROUTES_AREA, SegmentedControl, SIDEBAR_NAV_AREA, ToggleRow, useValue } from '@hermes/plugin-sdk'
 import { useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -41,25 +41,111 @@ const KNOWN_GATEWAYS = [
 
 const DISPLAY_COMPACT_KEY = 'display.compact'
 
+const STORAGE_KEYS = {
+  gateway: 'gateways.active',
+  polling: 'display.polling',
+  tor: 'status.tor',
+  highlighted: 'ops.highlighted',
+  collapsed: id => `display.collapsed.${id}`
+}
+
+// Module-level holder for pane state, hydrated from plugin-scoped storage at
+// register time so it survives close/reopen of the pane.
+export const poolPaneStore = {
+  gateway: 'default',
+  polling: true,
+  tor: null,
+  highlight: null,
+  collapsed: {}
+}
+
+function hydratePaneStore(storage) {
+  poolPaneStore.gateway = storage.get(STORAGE_KEYS.gateway, 'default')
+  poolPaneStore.polling = Boolean(storage.get(STORAGE_KEYS.polling, true))
+  poolPaneStore.tor = storage.get(STORAGE_KEYS.tor, null)
+  poolPaneStore.highlight = storage.get(STORAGE_KEYS.highlighted, null)
+}
+
+// Notify the user of an op result and persist which op is highlighted.
+function notifyOp(ctx, kind, message, detail) {
+  host.notify({
+    title: kind,
+    message,
+    detail,
+    kind: kind === 'failed' || kind === 'refused' ? 'error' : 'info'
+  })
+  if (detail != null && typeof detail === 'object' && detail.id != null) {
+    poolPaneStore.highlight = detail.id
+    ctx.storage.set(STORAGE_KEYS.highlighted, detail.id)
+  }
+}
+
+function isCollapsed(storage, id) {
+  if (id in poolPaneStore.collapsed) {
+    return Boolean(poolPaneStore.collapsed[id])
+  }
+  return Boolean(storage.get(STORAGE_KEYS.collapsed(id), false))
+}
+
+function setCollapsed(storage, id, value) {
+  poolPaneStore.collapsed[id] = value
+  storage.set(STORAGE_KEYS.collapsed(id), value)
+}
+
 // --- pane ------------------------------------------------------------------
 
 // The pane body is a plain builder (no hooks of its own) so the guard in
-// PoolPane can catch anything thrown while the tree is assembled.
-function buildPaneBody() {
+// PoolPane can catch anything thrown while the tree is assembled. Hook values
+// are read in PoolPane and passed in.
+function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling }) {
+  const noSession = !sessionId
+  const submitTitle = noSession ? 'no focused chat session — focus a chat to submit' : undefined
+
   return jsxs('div', {
     className: 'flex h-full flex-col gap-3 p-3 text-sm text-(--ui-text-primary)',
     children: [
       jsx('div', { className: 'font-medium', children: 'Agent Pool' }),
+      jsx('div', {
+        className: 'text-(--ui-text-secondary)',
+        children: `bound session: ${sessionId || 'none'}`
+      }),
+      jsx(SegmentedControl, {
+        options: [
+          { id: 'default', label: 'Maintainer' },
+          { id: 'pool-contrib', label: 'Contributor' }
+        ],
+        value: gateway,
+        onChange: id => {
+          poolPaneStore.gateway = id
+          ctx.storage.set(STORAGE_KEYS.gateway, id)
+          setGateway(id)
+        }
+      }),
       jsxs('div', {
         className: 'flex flex-col gap-1 text-(--ui-text-secondary)',
         children: [
-          jsx('div', { children: 'Pool Console is initializing…' }),
+          jsx('div', { children: `gateway: ${gatewayState == null ? 'unknown' : String(gatewayState)}` }),
           jsx('div', {
             className: 'text-(--ui-text-tertiary)',
-            children:
-              'The console forms (add-repo, fetch tasks, claim, pull, push, approve, merge) arrive in a later release.'
+            children: `tor ready? ${poolPaneStore.tor == null ? 'unknown — awaiting agent' : String(poolPaneStore.tor)}`
           })
         ]
+      }),
+      jsx(ToggleRow, {
+        checked: polling,
+        description: 'Poll the gateway for status updates. Saved in this profile’s plugin storage.',
+        label: 'Polling',
+        onChange: value => {
+          poolPaneStore.polling = value
+          ctx.storage.set(STORAGE_KEYS.polling, value)
+          setPolling(value)
+        }
+      }),
+      jsx('button', {
+        className: 'rounded-md px-3 py-2 text-left text-(--ui-text-primary)',
+        disabled: noSession,
+        title: submitTitle,
+        children: 'Submit (forms arrive in a later release)'
       })
     ]
   })
@@ -80,9 +166,14 @@ function PaneErrorCard({ contributionId, error }) {
   })
 }
 
-function PoolPane() {
+function PoolPane({ ctx }) {
+  const sessionId = useValue(host.state.focusedSessionId)
+  const gatewayState = useValue(host.state.gateway)
+  const [gateway, setGateway] = useState(() => poolPaneStore.gateway)
+  const [polling, setPolling] = useState(() => poolPaneStore.polling)
+
   try {
-    return buildPaneBody()
+    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling })
   } catch (error) {
     return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.pane, error })
   }
@@ -163,13 +254,15 @@ export default {
   id: 'agent-pool',
   name: 'Agent Pool',
   register(ctx) {
+    hydratePaneStore(ctx.storage)
+
     // The Pool Console pane — the form-driven half of the plugin.
     ctx.register({
       id: 'pane',
       area: PANES_AREA,
       title: 'Agent Pool',
       data: { placement: 'right', width: '420px' },
-      render: () => jsx(PoolPane, {})
+      render: () => jsx(PoolPane, { ctx })
     })
 
     // The full-page Pool Console, paired with its sidebar nav row.
