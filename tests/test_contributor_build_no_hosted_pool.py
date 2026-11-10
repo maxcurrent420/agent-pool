@@ -90,7 +90,7 @@ def test_contributor_build_without_hosted_pool(tmp_path):
     w["contrib_svc"].record_pool_context(POOL, ctx)
 
     bundle = w["contrib_svc"].add_repo_build_bundle(
-        str(w["src"]), REPO, pool_id=POOL)
+        str(w["src"]), REPO, pool_id=POOL, version=1)
     assert bundle["manifest"]["state"] == "submitted"
     assert bundle["deliver_command"].startswith("/add-repo --deliver ")
     assert f"--repo {REPO}" in bundle["deliver_command"]
@@ -107,7 +107,8 @@ def test_contributor_build_without_hosted_pool(tmp_path):
 def test_contributor_build_pool_id_none_uses_single_gateway_record(tmp_path):
     w = _world(tmp_path)
     w["contrib_svc"].record_pool_context(POOL, w["enrolled"]["pool_context"])
-    bundle = w["contrib_svc"].add_repo_build_bundle(str(w["src"]), REPO)
+    bundle = w["contrib_svc"].add_repo_build_bundle(
+        str(w["src"]), REPO, version=1)
     assert bundle["manifest"]["state"] == "submitted"
     assert bundle["deliver_command"].startswith("/add-repo --deliver ")
 
