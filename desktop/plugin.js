@@ -337,6 +337,63 @@ export function readSnapshot(ctx, key) {
   }
 }
 
+// --- first-run predicate + stale-sidecar strip (pure; testable) ----------
+// firstRun(storage): true when no snapshot has ever landed and no op was ever
+// submitted. Accepts a ctx-like object ({ storage }), a storage-like object
+// ({ get }), or a plain object map of keys. Never throws.
+export function firstRun(source) {
+  try {
+    const store = source && typeof source === 'object' && source.storage && typeof source.storage.get === 'function'
+      ? source.storage
+      : (source && typeof source === 'object' && typeof source.get === 'function' ? source : null)
+    const get = (k, dflt) => {
+      if (store) return store.get(k, dflt)
+      return source && typeof source === 'object' && k in source ? source[k] : dflt
+    }
+    const ps = get('snapshot.poolStatus', null)
+    const hasPoolStatus = ps && typeof ps === 'object' && (ps.poolStatus || ps.at != null || (Array.isArray(ps.items) && ps.items.length > 0))
+    const repos = get('snapshot.repos', null)
+    const hasRepos = Array.isArray(repos) ? repos.length > 0 : Boolean(repos && Array.isArray(repos.items) && repos.items.length > 0)
+    const ops = get('ops', null)
+    const hasOps = Array.isArray(ops) && ops.length > 0
+    return !(hasPoolStatus || hasRepos || hasOps)
+  } catch {
+    return false
+  }
+}
+
+// staleStripText(lastAt): the one-line strip shown when /pane-state is
+// unreachable. Pure — the renderer decides when to show it (sidecar down AND
+// no snapshot exists).
+export function staleStripText(lastAt) {
+  const ts = typeof lastAt === 'number' && Number.isFinite(lastAt) ? new Date(lastAt).toISOString() : str(lastAt ?? 'never')
+  return `sidecar unreachable — state may be stale (last update: ${ts})`
+}
+
+// --- per-snapshot loading flags (generalizes the tracker's `refreshing`) ---
+const loadingState = { map: {}, listeners: new Set() }
+export function setSnapshotLoading(name, on) {
+  loadingState.map = { ...loadingState.map, [name]: Boolean(on) }
+  for (const listener of [...loadingState.listeners]) listener()
+}
+export function snapshotLoading(name) {
+  return Boolean(loadingState.map[name])
+}
+function clearSnapshotLoading() {
+  loadingState.map = {}
+  for (const listener of [...loadingState.listeners]) listener()
+}
+function useSnapshotLoading(name) {
+  const [, force] = useState(0)
+  useEffect(() => {
+    if (!name) return undefined
+    const listener = () => force(v => v + 1)
+    loadingState.listeners.add(listener)
+    return () => { loadingState.listeners.delete(listener) }
+  }, [name])
+  return name ? snapshotLoading(name) : false
+}
+
 // One literal prompt asking the agent to enumerate local git repositories.
 // This instructs the AGENT — the pane itself never touches the filesystem.
 // Discovery is outside the slash-command manifest parity set on purpose: it
@@ -363,10 +420,14 @@ export function refreshSnapshot(ctx, sessionId, name, gateway) {
   }
   const text = prompts[name]
   if (!text) return Promise.resolve(null)
+  const flagNames = name === 'full' ? ['full', 'repos', 'tasks', 'poolStatus'] : [name]
+  for (const flag of flagNames) setSnapshotLoading(flag, true)
+  const clear = () => { for (const flag of flagNames) setSnapshotLoading(flag, false) }
   if (name === 'discovered') {
     return submitOp(ctx, sessionId, { kind: 'discover', gateway: gw, args: { snapshot: 'snapshot.discovered' }, text })
+      .then(result => { if (!result || result.status === 'failed') clear(); return result })
   }
-  return host.composer.submit(sessionId, text)
+  return Promise.resolve(host.composer.submit(sessionId, text)).then(ok => { if (!ok) clear(); return ok })
 }
 
 // --- SnapshotSelect support (pure option builders; testable without a renderer)
@@ -795,8 +856,9 @@ const labelClass = 'text-(--ui-text-secondary)'
 // Reusable snapshot-fed dropdown. Opt-in manual fallback per field per
 // session (never persisted); refresh button disabled while an op of the
 // refresh kind is 'awaiting agent'.
-function SnapshotSelect({ label, items, value, onChange, emptyHint, refreshAction, refreshKind, ops, allowManual, manualPlaceholder, manualValue, onManualChange, selectLabel, resetKey }) {
+function SnapshotSelect({ label, items, value, onChange, emptyHint, refreshAction, refreshKind, ops, allowManual, manualPlaceholder, manualValue, onManualChange, selectLabel, resetKey, loadingKey }) {
   const [manual, setManual] = useState(false)
+  const loading = useSnapshotLoading(loadingKey)
   // Flow reset: the manual disclosure is closed by default and un-checks
   // itself whenever the flow's reset key changes.
   useEffect(() => { setManual(false) }, [resetKey])
@@ -831,6 +893,14 @@ function SnapshotSelect({ label, items, value, onChange, emptyHint, refreshActio
         jsx('input', { className: inputClass, value: manualValue || '', onChange: e => onManualChange && onManualChange(e.target.value), placeholder: manualPlaceholder || '', autoFocus: true }),
         jsx('button', { className: 'rounded-md px-2 py-1 text-(--ui-text-secondary)', title: 'Back to the list', onClick: () => setManual(false), children: 'list' })
       ]
+    }))
+  } else if (loading) {
+    childNodes.push(jsx('select', {
+      key: 'select',
+      className: inputClass,
+      value: '',
+      disabled: true,
+      children: jsx('option', { value: '', children: 'Loading…' })
     }))
   } else {
     childNodes.push(jsx('select', {
@@ -998,6 +1068,7 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
         onChange: setDiscoveredId,
         emptyHint: 'No discovered repos yet — click Discover repos',
         refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'discovered', gateway) : undefined,
+        loadingKey: 'discovered',
         refreshKind: 'discover',
         ops,
         allowManual: true,
@@ -1019,6 +1090,7 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
             onChange: setPoolId,
             emptyHint: SNAPSHOT_KIND_EMPTY.pools,
             refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
+        loadingKey: 'poolStatus',
             ops,
             allowManual: false,
             selectLabel: '(select a pool)',
@@ -1104,6 +1176,7 @@ function FetchTasksForm({ ctx, gateway, noSession, submitTitle, recordOp, sessio
         emptyHint: SNAPSHOT_KIND_EMPTY.repos,
         selectLabel: '(all repos)',
         refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
+        loadingKey: 'repos',
         ops,
         allowManual: true,
         manualPlaceholder: 'repo_id',
@@ -1182,6 +1255,7 @@ function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
                 onChange: setTicket,
                 emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
                 refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+        loadingKey: 'tasks',
                 refreshKind: 'fetch-tasks',
                 ops,
                 allowManual: true,
@@ -1428,6 +1502,7 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
         onChange: setRepoId,
         emptyHint: SNAPSHOT_KIND_EMPTY.repos,
         refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
+        loadingKey: 'repos',
         ops,
         allowManual: true,
         manualPlaceholder: 'my-repo',
@@ -1442,6 +1517,7 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
         onChange: setTicketId,
         emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
         refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+        loadingKey: 'tasks',
         refreshKind: 'fetch-tasks',
         ops,
         allowManual: true,
@@ -1473,6 +1549,7 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
         onChange: setPoolId,
         emptyHint: SNAPSHOT_KIND_EMPTY.pools,
         refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
+        loadingKey: 'poolStatus',
         ops,
         allowManual: true,
         manualPlaceholder: 'pool_id',
@@ -1633,6 +1710,7 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
         onChange: onPickAwaiting,
         emptyHint: SNAPSHOT_KIND_EMPTY.awaiting,
         refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
+        loadingKey: 'poolStatus',
         ops,
         allowManual: false,
         selectLabel: '(pick an awaiting-approval target)',
@@ -1646,6 +1724,7 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
             onChange: setRepoId,
             emptyHint: SNAPSHOT_KIND_EMPTY.repos,
             refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
+        loadingKey: 'repos',
             ops,
             allowManual: true,
             manualPlaceholder: 'my-repo',
@@ -1660,6 +1739,7 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId
             onChange: setTicketId,
             emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
             refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+        loadingKey: 'tasks',
             refreshKind: 'fetch-tasks',
             ops,
             allowManual: true,
@@ -1780,6 +1860,7 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
         onChange: onPickAwaiting,
         emptyHint: SNAPSHOT_KIND_EMPTY.awaiting,
         refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
+        loadingKey: 'poolStatus',
         ops,
         allowManual: false,
         selectLabel: '(pick an awaiting-approval target)',
@@ -1793,6 +1874,7 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
             onChange: setRepoId,
             emptyHint: SNAPSHOT_KIND_EMPTY.repos,
             refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
+        loadingKey: 'repos',
             ops,
             allowManual: true,
             manualPlaceholder: 'my-repo',
@@ -1807,6 +1889,7 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, 
             onChange: setTicketId,
             emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
             refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+        loadingKey: 'tasks',
             refreshKind: 'fetch-tasks',
             ops,
             allowManual: true,
@@ -2006,6 +2089,7 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
           emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
           selectLabel: '(all tickets)',
           refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+        loadingKey: 'tasks',
           refreshKind: 'fetch-tasks',
           ops: list,
           allowManual: true,
@@ -2080,9 +2164,40 @@ function setCollapsed(storage, id, value) {
 // The console body is a plain builder (no hooks of its own) so the guard in
 // PoolConsole can catch anything thrown while the tree is assembled. Hook values
 // are read in PoolConsole and passed in.
-function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh, refreshing, approvePrefill, onApproveRequest, onApprovePrefillConsumed }) {
+// First-run onboarding card: replaces the flow-card wall when no snapshot
+// has ever landed. Both actions live inside the card.
+function OnboardingCard({ ctx, sessionId, gateway, recordOp, noSession }) {
+  const onRefresh = () => { if (sessionId) refreshSnapshot(ctx, sessionId, 'full', gateway) }
+  const onDiscover = async () => {
+    if (noSession) return
+    await recordOp({ kind: 'discover', gateway, args: { snapshot: 'snapshot.discovered' }, text: discoverReposPrompt() })
+  }
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Welcome to your Pool Console' }),
+      jsx('div', {
+        className: 'text-(--ui-text-secondary)',
+        children: '① Click Refresh pools to load your pools, repos and approval queue ② (optional) Discover repos to index local git worktrees. Everything after that is dropdowns and buttons.'
+      }),
+      jsxs('div', {
+        className: 'flex items-center gap-2',
+        children: [
+          submitButton({ disabled: noSession, title: noSession ? 'no focused chat session — focus a chat to submit' : 'Load pools, repos and the approval queue', onClick: onRefresh, children: 'Refresh pools' }),
+          submitButton({ disabled: noSession, title: noSession ? 'no focused chat session — focus a chat to submit' : 'Ask the agent to enumerate local git repositories (read-only)', onClick: onDiscover, children: 'Discover repos' })
+        ]
+      })
+    ]
+  })
+}
+
+function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh, refreshing, approvePrefill, onApproveRequest, onApprovePrefillConsumed, sidecarDownAt }) {
   const noSession = !sessionId
   const submitTitle = noSession ? 'no focused chat session — focus a chat to submit' : undefined
+  const isFirstRun = firstRun(ctx)
+  const hasSnapshot = Boolean(poolStatus) || readSnapshot(ctx, 'snapshot.repos').length > 0 || readSnapshot(ctx, 'snapshot.tasks').length > 0
+  const lastUpdate = poolStatus && typeof poolStatus === 'object' && poolStatus.at != null ? poolStatus.at : null
+  const showStaleStrip = Boolean(sidecarDownAt) && !hasSnapshot
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-3 p-3 text-sm text-(--ui-text-primary)',
@@ -2124,14 +2239,24 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
           setPolling(value)
         }
       }),
+      showStaleStrip
+        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: staleStripText(lastUpdate ?? sidecarDownAt) })
+        : null,
       jsx(TrackerSection, { ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing, onApproveRequest }),
-      jsx(AddRepoForm, { ctx, sessionId, gateway, noSession, submitTitle, recordOp, ops }),
-      jsx(FetchTasksForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
-      jsx(ClaimForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
-      jsx(PullRepoForm, { ctx, gateway, noSession, submitTitle, recordOp, ops }),
-      jsx(PushSubmitCard, { ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }),
-      jsx(ApproveForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops, prefill: approvePrefill, onPrefillConsumed: onApprovePrefillConsumed }),
-      jsx(MergeForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops })
+      isFirstRun
+        ? jsx(OnboardingCard, { ctx, sessionId, gateway, recordOp, noSession })
+        : jsxs('div', {
+            className: 'flex flex-col gap-3',
+            children: [
+              jsx(AddRepoForm, { ctx, sessionId, gateway, noSession, submitTitle, recordOp, ops }),
+              jsx(FetchTasksForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
+              jsx(ClaimForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
+              jsx(PullRepoForm, { ctx, gateway, noSession, submitTitle, recordOp, ops }),
+              jsx(PushSubmitCard, { ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }),
+              jsx(ApproveForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops, prefill: approvePrefill, onPrefillConsumed: onApprovePrefillConsumed }),
+              jsx(MergeForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops })
+            ]
+          })
     ]
   })
 }
@@ -2182,6 +2307,7 @@ function PoolConsole({ ctx }) {
   })
   const [poolStatus, setPoolStatus] = useState(() => ctx.storage.get('snapshot.poolStatus', null))
   const [refreshing, setRefreshing] = useState(false)
+  const [sidecarDownAt, setSidecarDownAt] = useState(null)
   const [approvePrefill, setApprovePrefill] = useState(null)
   const onApproveRequest = (entry, deny) => {
     if (!entry) return
@@ -2203,8 +2329,11 @@ function PoolConsole({ ctx }) {
       let raw = null
       try {
         raw = await ctx.rest('/pane-state')
+        setSidecarDownAt(null)
+        clearSnapshotLoading()
       } catch {
         raw = null
+        setSidecarDownAt(Date.now())
       }
       const parsed = parsePaneState(raw)
       const { ops: nextOps } = applyOpReplies(applyPaneStateToOps(ctx.storage.get(OPS_KEY, []), parsed).ops, parsed.opReplies)
@@ -2250,7 +2379,7 @@ function PoolConsole({ ctx }) {
       const stored = ctx.storage.get(OPS_KEY, [])
       setOps(Array.isArray(stored) ? stored : [])
     }
-    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh: refreshFromSidecar, refreshing, approvePrefill, onApproveRequest, onApprovePrefillConsumed: () => setApprovePrefill(null) })
+    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh: refreshFromSidecar, refreshing, approvePrefill, onApproveRequest, onApprovePrefillConsumed: () => setApprovePrefill(null), sidecarDownAt })
   } catch (error) {
     return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.page, error })
   }

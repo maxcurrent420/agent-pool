@@ -772,3 +772,79 @@ def test_audit_dropdown_all_tickets_default_and_run_button():
     src = (DESKTOP / "plugin.js").read_text()
     assert "selectLabel: '(all tickets)'" in src
     assert "auditShowPrompt(gateway, auditTicket)" in src
+
+
+# --- Task 6: empty / loading / error states ----------------------------------
+
+def _run_first_run(src, storage_obj):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    m = re.search(r"function str\(v\) \{.*?\n\}\n", src, re.S)
+    assert m
+    m2 = re.search(r"export function firstRun\(source\) \{.*?\n\}\n", src, re.S)
+    assert m2, "firstRun export missing"
+    harness = (
+        m.group(0) + m2.group(0)
+        + "\nconst storage = JSON.parse(process.argv[1]);\n"
+        + "const ctx = { storage: { get: (k, d) => (k in storage ? storage[k] : d) } };\n"
+        + "console.log(JSON.stringify(firstRun(ctx)));\n"
+    )
+    out = subprocess.run([node, "-e", harness, json.dumps(storage_obj)],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_first_run_true_on_empty_storage():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert _run_first_run(src, {}) is True
+
+
+def test_first_run_false_once_any_snapshot_or_ops_key_exists():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert _run_first_run(src, {"snapshot.poolStatus": {"at": 123, "poolStatus": {"awaiting_approval": []}}}) is False
+    assert _run_first_run(src, {"snapshot.repos": {"at": 123, "items": [{"id": "my-repo"}]}}) is False
+    assert _run_first_run(src, {"ops": [{"id": "op-1", "kind": "discover"}]}) is False
+    # Empty collections do not count as "a snapshot has landed".
+    assert _run_first_run(src, {"snapshot.repos": {"at": 123, "items": []}, "ops": []}) is True
+
+
+def _run_stale_strip(src, last_at):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    m = re.search(r"function str\(v\) \{.*?\n\}\n", src, re.S)
+    assert m
+    m2 = re.search(r"export function staleStripText\(lastAt\) \{.*?\n\}\n", src, re.S)
+    assert m2, "staleStripText export missing"
+    harness = (
+        m.group(0) + m2.group(0)
+        + "\nconsole.log(JSON.stringify(staleStripText(Number(process.argv[1]))));\n"
+    )
+    out = subprocess.run([node, "-e", harness, str(last_at)],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_stale_strip_contains_marker_and_timestamp():
+    src = (DESKTOP / "plugin.js").read_text()
+    text = _run_stale_strip(src, 1700000000000)
+    assert "sidecar unreachable" in text
+    assert "1970-01-01T00:00:00.000Z" not in text  # sanity: real ts rendered
+    assert "last update:" in text
+    assert "2023-11-14T22:13:20.000Z" in text
+
+
+def test_stale_strip_absent_when_snapshot_exists():
+    src = (DESKTOP / "plugin.js").read_text()
+    # The renderer gates the strip on `!hasSnapshot`; verify the wiring exists.
+    assert "const showStaleStrip = Boolean(sidecarDownAt) && !hasSnapshot" in src
+    assert "staleStripText(lastUpdate ?? sidecarDownAt)" in src
+    # ...and the onboarding/first-run wiring is present.
+    assert "export function firstRun(" in src
+    assert "Welcome to your Pool Console" in src
+    assert "① Click Refresh pools" in src
+    assert "Loading…" in src
+    assert "loadingKey: 'repos'" in src and "loadingKey: 'tasks'" in src and "loadingKey: 'discovered'" in src
