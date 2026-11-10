@@ -305,6 +305,7 @@ class PoolService:
                  "box_pubkey_hex": m.box_pubkey_hex or ""}
                 for m in members.values()
             ],
+            "chain_tips": L.accepted_chain_tips(self._conn),
         }
 
     def _contributor_propagator(self, pool_id, context) -> RepoPropagator:
@@ -1422,7 +1423,9 @@ class PoolService:
                 "ticket_id": ticket_id, "token": token,
                 "push_link": {"token": token, "gateway": gateway,
                               "repo_id": ticket["repo_id"],
-                              "ticket_id": ticket_id},
+                              "ticket_id": ticket_id,
+                              "next_version": L.next_repo_version(
+                                  self._conn, ticket["repo_id"])},
                 "gateway": gateway, "grant": grant, "notice": notice}
 
     def push_build_bundle(self, repo_path, repo_id, *, version=None,

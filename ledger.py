@@ -1267,6 +1267,15 @@ def next_repo_version(conn, repo_id) -> int:
     return int(row[0]) + 1
 
 
+def accepted_chain_tips(conn) -> dict:
+    """Per-repo highest ACCEPTED version: {repo_id: max_version}. The
+    chain tip published to contributor gateways (enrollment contexts)."""
+    rows = conn.execute(
+        "SELECT repo_id, MAX(version) FROM repo_versions "
+        "WHERE state='accepted' GROUP BY repo_id").fetchall()
+    return {r[0]: int(r[1]) for r in rows}
+
+
 def get_audit(conn, repo_id, version=None) -> dict | None:
     if version is None:
         row = conn.execute(
