@@ -1450,18 +1450,21 @@ class PoolService:
         context = None
         try:
             resolved = self._resolve_pool(pool_id, source=source)
-            prop = self._propagator(resolved)
-            hosted = True
+            hosted = self._gateway_hosts_pool(resolved)
+            if hosted:
+                prop = self._propagator(resolved)
         except PoolNotLocalError:
+            hosted = False
+        if not hosted:
             # Contributor gateway: this gateway hosts no pool. Build
             # against the maintainer pool's enrollment context (pool id
             # + maintainer + member wrap targets, recorded via
             # record_pool_context from enroll_member's pool_context).
             # A maintainer gateway (single hosted pool, pool_id=None)
             # never reaches here, so its behavior is unchanged.
-            hosted = False
             if pool_id and str(pool_id).strip() in L.list_local_pools(self._conn):
-                raise  # hosted but refused (e.g. multi-pool DB): keep error
+                if self._gateway_hosts_pool(str(pool_id).strip()):
+                    raise  # hosted but refused (e.g. multi-pool DB): keep error
             if pool_id:
                 resolved = str(pool_id).strip()
                 context = self.get_pool_context(resolved)
@@ -1504,6 +1507,23 @@ class PoolService:
             pusher=pusher, pusher_signing_key=self._caller_sk)
         result["manifest_json"] = json.dumps(result["manifest"], sort_keys=True)
         return result
+
+    def _gateway_hosts_pool(self, pool_id) -> bool:
+        """True iff THIS ledger holds a locally registered pool.
+
+        register_pool (create_pool, the only caller) always writes
+        owner_discord_user_id; a contributor gateway only ever holds the
+        enrollment stub row (record_context_members), which never sets
+        it and no migration backfills. Immune to the Phase-2
+        owner_gateway_key_id backfill, which copies the foreign
+        maintainer key onto stub rows too. Ledger-level, never
+        caller-level: a member service on a maintainer gateway still
+        resolves versions from the local ledger.
+        """
+        row = self._conn.execute(
+            "SELECT owner_discord_user_id FROM pools WHERE pool_id=?",
+            (str(pool_id),)).fetchone()
+        return bool(row is not None and (row[0] or "").strip())
 
     def _contributor_next_version(self, repo_id, pool_id, context) -> int:
         """Contributor gateways have no pool chain rows; mint from the pool's
