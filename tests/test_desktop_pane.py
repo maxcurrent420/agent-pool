@@ -394,3 +394,82 @@ def test_discover_repos_button_present():
     src = (DESKTOP / "plugin.js").read_text()
     assert "Discover repos" in src
     assert src.count("Discover repos") >= 1
+
+
+# --- Task 2: dropdown-fed selectors ------------------------------------------
+# Discovery prompt remains outside the manifest parity set (see Task 1 note).
+
+def _load_options_for(src):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    parts = []
+    for pattern in [
+        r"function str\(v\) \{.*?\n\}\n",
+        r"function asArray\(v\) \{[^\n]*\n",
+        r"export function labelFor\(entry\) \{.*?\n\}\n",
+        r"export const SNAPSHOT_KIND_EMPTY = \{.*?\n\}\n",
+        r"const SNAPSHOT_KIND_SELECT = \{.*?\n\}\n",
+        r"export const MANUAL_OPTION = '[^']+'\n",
+        r"function entryId\(entry, fallback\) \{.*?\n\}\n",
+        r"export function itemsFor\(snapshot, kind\) \{.*?\n\}\n",
+        r"export function buildOptions\(items, emptyHint, selectLabel, allowManual\) \{.*?\n\}\n",
+        r"export function optionsFor\(snapshot, kind, allowManual = true\) \{.*?\n\}\n",
+    ]:
+        m = re.search(pattern, src, re.S)
+        assert m, f"missing piece: {pattern}"
+        parts.append(m.group(0))
+    harness = (
+        "".join(parts)
+        + "\nconst snapshot = JSON.parse(process.argv[1]);\n"
+        + "const kind = process.argv[2];\n"
+        + "console.log(JSON.stringify(optionsFor(snapshot, kind)));\n"
+    )
+    return node, harness
+
+
+def _run_options_for(src, snapshot, kind):
+    node, harness = _load_options_for(src)
+    out = subprocess.run([node, "-e", harness, json.dumps(snapshot), kind],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_options_for_tasks_contains_label_shape():
+    src = (DESKTOP / "plugin.js").read_text()
+    options = _run_options_for(src,
+        {"tasks": [{"ticket_id": "ticket 42", "title": "fix parser", "repo": "my-repo"}]},
+        "tasks")
+    labels = [o["label"] for o in options]
+    assert any("ticket 42: fix parser" in label for label in labels), labels
+
+
+def test_options_for_empty_snapshot_exact_placeholder_and_manual():
+    src = (DESKTOP / "plugin.js").read_text()
+    options = _run_options_for(src, {}, "tasks")
+    labels = [o["label"] for o in options]
+    assert labels == ["No tasks fetched yet — click Fetch tasks", "(enter manually…)"], labels
+    assert options[0]["value"] == ""
+
+
+def test_label_for_falls_back_to_id():
+    src = (DESKTOP / "plugin.js").read_text()
+    options = _run_options_for(src, {"tasks": [{"ticket_id": "ticket 7"}]}, "tasks")
+    labels = [o["label"] for o in options]
+    assert "ticket 7" in labels
+
+
+def test_snapshot_select_and_helpers_exist():
+    src = (DESKTOP / "plugin.js").read_text()
+    assert "function SnapshotSelect(" in src
+    assert "export function optionsFor(" in src
+    assert "export function labelFor(" in src
+    for hint in ["No pools loaded yet — click Refresh pools",
+                 "No repos in the pool yet — click Refresh pools or Add repo",
+                 "No tasks fetched yet — click Fetch tasks",
+                 "No claims yet — claim a ticket first",
+                 "Nothing awaiting approval right now",
+                 "Request the grant first (Step 1)",
+                 "Version resolves automatically"]:
+        assert hint in src, hint

@@ -249,6 +249,115 @@ export function refreshSnapshot(ctx, sessionId, name, gateway) {
   return host.composer.submit(sessionId, text)
 }
 
+// --- SnapshotSelect support (pure option builders; testable without a renderer)
+// labelFor(entry): 'id: title' when a title exists, 'id — repo/version' when a
+// repo/version exists, otherwise the bare id. Always str()-ed.
+export function labelFor(entry) {
+  if (entry == null) return ''
+  if (typeof entry === 'string' || typeof entry === 'number') return str(entry)
+  const id = entry.ticket_id ?? entry.ticket ?? entry.repo_id ?? entry.repo
+    ?? entry.pool_id ?? entry.pool ?? entry.id ?? entry.name ?? ''
+  const title = entry.title || entry.name || null
+  if (title && str(title) !== str(id)) return `${str(id)}: ${str(title)}`
+  const repo = entry.repo
+  if (repo && str(repo) !== str(id)) return `${str(id)} — ${str(repo)}`
+  if (entry.version != null && str(entry.version) !== str(id)) return `${str(id)} — v${str(entry.version)}`
+  return str(id)
+}
+
+export const SNAPSHOT_KIND_EMPTY = {
+  pools: 'No pools loaded yet — click Refresh pools',
+  repos: 'No repos in the pool yet — click Refresh pools or Add repo',
+  tasks: 'No tasks fetched yet — click Fetch tasks',
+  claims: 'No claims yet — claim a ticket first',
+  awaiting: 'Nothing awaiting approval right now',
+  grant: 'Request the grant first (Step 1)',
+  version: 'Version resolves automatically',
+  gateways: 'default'
+}
+
+const SNAPSHOT_KIND_SELECT = {
+  pools: '(select a pool)',
+  repos: '(select a repo)',
+  tasks: '(select a ticket)',
+  claims: '(pick a claim)',
+  awaiting: '(pick an awaiting-approval target)',
+  grant: '(grant token)',
+  version: '(auto)',
+  gateways: '(select a gateway)'
+}
+
+export const MANUAL_OPTION = '(enter manually…)'
+
+function entryId(entry, fallback) {
+  if (entry == null) return str(fallback)
+  if (typeof entry === 'string' || typeof entry === 'number') return str(entry)
+  return str(entry.id ?? entry.ticket_id ?? entry.repo_id ?? entry.pool_id ?? entry.ticket ?? entry.repo ?? entry.name ?? fallback)
+}
+
+// itemsFor(snapshot, kind): pull the item list for a kind out of a plain
+// snapshot object (never ctx, never a renderer). Malformed input → [].
+export function itemsFor(snapshot, kind) {
+  const s = snapshot && typeof snapshot === 'object' ? snapshot : {}
+  switch (kind) {
+    case 'pools': {
+      const fromStatus = s.poolStatus && Array.isArray(s.poolStatus.pools) ? s.poolStatus.pools : []
+      const fromRepos = asArray(s.repos).map(r => (r && typeof r === 'object') ? (r.pool || r.pool_id) : null).filter(Boolean).map(p => ({ id: p }))
+      const seen = new Set()
+      const out = []
+      for (const e of [...fromStatus, ...fromRepos]) {
+        const id = entryId(e, '')
+        if (!id || seen.has(id)) continue
+        seen.add(id)
+        out.push(typeof e === 'string' ? { id: e } : e)
+      }
+      return out
+    }
+    case 'repos': return asArray(s.repos)
+    case 'tasks': return asArray(s.tasks)
+    case 'claims':
+      return asArray(s.claims).map(op => {
+        if (!op || typeof op !== 'object') return { id: str(op), title: str(op) }
+        const ticket = str((op.args && (op.args.ticket || op.args.key)) || op.id || '')
+        const when = op.at ? new Date(op.at).toLocaleString() : ''
+        return { id: str(op.id), title: when ? `${ticket} · ${when}` : ticket }
+      })
+    case 'awaiting': return asArray(s.awaitingApproval ?? (s.poolStatus && s.poolStatus.awaitingApproval))
+    case 'grant': return s.grantToken ? [{ id: str(s.grantToken), title: 'grant token' }] : []
+    case 'version': return asArray(s.versions)
+    case 'gateways': return asArray(s.gateways)
+    default: return []
+  }
+}
+
+// buildOptions(items, emptyHint, selectLabel, allowManual): the flat option
+// list — placeholder first (label IS the empty hint when items is empty,
+// disabled once items exist), one str()-ed label per item, then the opt-in
+// manual fallback.
+export function buildOptions(items, emptyHint, selectLabel, allowManual) {
+  const list = asArray(items)
+  const placeholder = list.length
+    ? (selectLabel || '(select…)')
+    : (emptyHint || 'Nothing loaded yet')
+  const options = [{ value: '', label: str(placeholder) }]
+  list.forEach((entry, i) => {
+    options.push({ value: entryId(entry, i), label: labelFor(entry) })
+  })
+  if (allowManual) options.push({ value: '__manual__', label: MANUAL_OPTION })
+  return options
+}
+
+// optionsFor(snapshot, kind, allowManual): pure — the option list for a kind,
+// straight from a snapshot object. Tests call this directly.
+export function optionsFor(snapshot, kind, allowManual = true) {
+  return buildOptions(
+    itemsFor(snapshot, kind),
+    SNAPSHOT_KIND_EMPTY[kind] || 'Nothing loaded yet',
+    SNAPSHOT_KIND_SELECT[kind] || '(select…)',
+    allowManual
+  )
+}
+
 // The one batched UI→agent prompt used for the initial/fallback refresh.
 export const BATCHED_STATUS_PROMPT = 'Report pool status now: run pool_status and /fetch repo list, call pool_pane_report with the results.'
 
@@ -470,6 +579,87 @@ function isAbsoluteLocalPath(value) {
 const inputClass = 'rounded-md px-2 py-1 text-(--ui-text-primary)'
 const labelClass = 'text-(--ui-text-secondary)'
 
+// Reusable snapshot-fed dropdown. Opt-in manual fallback per field per
+// session (never persisted); refresh button disabled while an op of the
+// refresh kind is 'awaiting agent'.
+function SnapshotSelect({ label, items, value, onChange, emptyHint, refreshAction, refreshKind, ops, allowManual, manualPlaceholder, manualValue, onManualChange, selectLabel }) {
+  const [manual, setManual] = useState(false)
+  const list = asArray(items)
+  const options = buildOptions(list, emptyHint || 'Nothing loaded yet', selectLabel, Boolean(allowManual))
+  const refreshAwaiting = refreshKind
+    ? asArray(ops).some(op => op && op.kind === refreshKind && op.status === 'awaiting agent')
+    : false
+  const childNodes = [
+    jsxs('div', {
+      key: 'row',
+      className: 'flex items-center justify-between gap-2',
+      children: [
+        jsx('span', { className: labelClass, children: label }),
+        refreshAction
+          ? jsx('button', {
+              className: 'rounded-md px-1.5 py-0.5 text-(--ui-text-secondary)',
+              disabled: refreshAwaiting,
+              title: refreshAwaiting ? 'Refresh already awaiting agent' : 'Refresh',
+              onClick: refreshAction,
+              children: '↻'
+            })
+          : null
+      ]
+    })
+  ]
+  if (manual) {
+    childNodes.push(jsxs('div', {
+      key: 'manual',
+      className: 'flex items-center gap-1',
+      children: [
+        jsx('input', { className: inputClass, value: manualValue || '', onChange: e => onManualChange && onManualChange(e.target.value), placeholder: manualPlaceholder || '', autoFocus: true }),
+        jsx('button', { className: 'rounded-md px-2 py-1 text-(--ui-text-secondary)', title: 'Back to the list', onClick: () => setManual(false), children: 'list' })
+      ]
+    }))
+  } else {
+    childNodes.push(jsx('select', {
+      key: 'select',
+      className: inputClass,
+      value: value || '',
+      onChange: e => {
+        const v = e.target.value
+        if (v === '__manual__') {
+          setManual(true)
+          onManualChange && onManualChange('')
+          return
+        }
+        onChange(v)
+      },
+      children: options.map(o => jsx('option', {
+        key: `${o.value}::${o.label}`,
+        value: o.value,
+        disabled: o.value === '' && list.length > 0,
+        children: str(o.label)
+      }))
+    }))
+  }
+  return jsx('div', { className: 'flex flex-col gap-1', children: childNodes })
+}
+
+// Snapshot source builders (read ctx.storage defensively; never throw).
+function snapshotSources(ctx) {
+  const poolStatus = ctx.storage.get('snapshot.poolStatus', null)
+  const ps = poolStatus && typeof poolStatus === 'object' ? (poolStatus.poolStatus && typeof poolStatus.poolStatus === 'object' ? poolStatus.poolStatus : poolStatus) : null
+  const awaiting = poolStatus && Array.isArray(poolStatus.awaitingApproval)
+    ? poolStatus.awaitingApproval
+    : (ps && Array.isArray(ps.awaitingApproval) ? ps.awaitingApproval : [])
+  const repos = readSnapshot(ctx, 'snapshot.repos')
+  const tasks = readSnapshot(ctx, 'snapshot.tasks')
+  const claimsRaw = ctx.storage.get('snapshot.claims', null)
+  const claims = Array.isArray(claimsRaw) ? claimsRaw : (claimsRaw && Array.isArray(claimsRaw.items) ? claimsRaw.items : [])
+  const gateways = readSnapshot(ctx, 'snapshot.gateways')
+  return { repos, tasks, claims, poolStatus: ps, awaitingApproval: awaiting, gateways }
+}
+
+function snapshotRepos(ctx) {
+  return snapshotSources(ctx).repos
+}
+
 function field(label, input) {
   return jsxs('label', {
     className: 'flex flex-col gap-1',
@@ -503,7 +693,8 @@ const ADD_REPO_FAILURES = [
   'version too low — pass an explicit --version greater than the tip'
 ]
 
-function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp }) {
+function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp, ops }) {
+  const gateways = snapshotSources(ctx).gateways.map(g => ({ id: str(g && g.id), title: str((g && g.role) || '') }))
   const [mode, setMode] = useState('owner')
   const [repoId, setRepoId] = useState('')
   const [path, setPath] = useState('')
@@ -549,9 +740,30 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
       field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' })),
       field('local path (absolute)', jsx('input', { className: inputClass, value: path, onChange: e => setPath(e.target.value), placeholder: '/home/you/src/my-repo' })),
       !pathOk && path.trim() ? jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Path must be absolute (starts with /) and must not look like a URL.' }) : null,
-      field('--version (optional)', jsx('input', { className: inputClass, value: version, onChange: e => setVersion(e.target.value), placeholder: 'N', inputMode: 'numeric' })),
+      jsx(SnapshotSelect, {
+        label: '--version (optional — auto-resolves)',
+        items: [],
+        value: version,
+        onChange: setVersion,
+        emptyHint: SNAPSHOT_KIND_EMPTY.version,
+        allowManual: true,
+        manualPlaceholder: 'N',
+        manualValue: version,
+        onManualChange: setVersion
+      }),
       mode === 'link'
-        ? field('maintainer gateway (profile)', jsx('input', { className: inputClass, value: maintainerGateway, onChange: e => setMaintainerGateway(e.target.value), placeholder: 'default' }))
+        ? jsx(SnapshotSelect, {
+            label: 'maintainer gateway (profile)',
+            items: gateways,
+            value: maintainerGateway,
+            onChange: setMaintainerGateway,
+            emptyHint: SNAPSHOT_KIND_EMPTY.gateways,
+            allowManual: true,
+            manualPlaceholder: 'default',
+            manualValue: maintainerGateway,
+            onManualChange: setMaintainerGateway,
+            selectLabel: '(select a gateway)'
+          })
         : null,
       jsx('div', { className: 'flex items-center gap-2', children: [
         submitButton({
@@ -572,21 +784,8 @@ function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp
 
 // --- form: fetch task list --------------------------------------------------
 
-function snapshotRepos(ctx) {
-  const snap = ctx.storage.get('snapshot.repos', null)
-  if (Array.isArray(snap)) return snap
-  if (snap && Array.isArray(snap.repos)) return snap.repos
-  return []
-}
-
-function repoIdOf(entry) {
-  if (entry == null) return ''
-  if (typeof entry === 'string') return entry
-  return str(entry.repo_id || entry.repo || entry.id || entry.name || '')
-}
-
-function FetchTasksForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
-  const repos = snapshotRepos(ctx)
+function FetchTasksForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }) {
+  const repos = snapshotSources(ctx).repos
   const [repoFilter, setRepoFilter] = useState('')
   const ready = !noSession
 
@@ -609,20 +808,20 @@ function FetchTasksForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
     className: 'flex flex-col gap-2 rounded-md p-2',
     children: [
       jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Fetch task list' }),
-      repos.length
-        ? field('repo filter (from last pool_status / fetch repo list)', jsx('select', {
-            className: inputClass,
-            value: repoFilter,
-            onChange: e => setRepoFilter(e.target.value),
-            children: [
-              jsx('option', { key: '__all', value: '', children: '(all repos)' }),
-              ...repos.map(entry => {
-                const id = repoIdOf(entry)
-                return jsx('option', { key: id, value: id, children: id })
-              })
-            ]
-          }))
-        : field('repo filter (optional — no snapshot yet)', jsx('input', { className: inputClass, value: repoFilter, onChange: e => setRepoFilter(e.target.value), placeholder: 'repo_id' })),
+      jsx(SnapshotSelect, {
+        label: 'repo filter (optional)',
+        items: repos,
+        value: repoFilter,
+        onChange: setRepoFilter,
+        emptyHint: SNAPSHOT_KIND_EMPTY.repos,
+        selectLabel: '(all repos)',
+        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
+        ops,
+        allowManual: true,
+        manualPlaceholder: 'repo_id',
+        manualValue: repoFilter,
+        onManualChange: setRepoFilter
+      }),
       submitButton({ disabled: !ready, title: noSession ? submitTitle : undefined, onClick: onSubmit, children: 'Fetch tasks (/fetch repo list → /fetch task list)' })
     ]
   })
@@ -636,21 +835,8 @@ const CLAIM_FAILURES = [
   'not whitelisted for this pool'
 ]
 
-function snapshotTasks(ctx) {
-  const snap = ctx.storage.get('snapshot.tasks', null)
-  if (!snap) return []
-  const table = Array.isArray(snap) ? snap : (Array.isArray(snap.table) ? snap.table : (Array.isArray(snap.tasks) ? snap.tasks : []))
-  return table
-}
-
-function ticketIdOf(entry) {
-  if (entry == null) return ''
-  if (typeof entry === 'string') return entry
-  return str(entry.ticket_id || entry.ticket || entry.id || '')
-}
-
-function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
-  const tasks = snapshotTasks(ctx)
+function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }) {
+  const tasks = snapshotSources(ctx).tasks
   const [ticket, setTicket] = useState('')
   const [note, setNote] = useState('')
   const [autoAssign, setAutoAssign] = useState(false)
@@ -695,21 +881,20 @@ function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
         : jsxs('div', {
             className: 'flex flex-col gap-2',
             children: [
-              tasks.length
-                ? field('ticket (from fetched task snapshot)', jsx('select', {
-                    className: inputClass,
-                    value: ticket,
-                    onChange: e => setTicket(e.target.value),
-                    children: [
-                      jsx('option', { key: '__none', value: '', children: '(select a ticket)' }),
-                      ...tasks.map(entry => {
-                        const id = ticketIdOf(entry)
-                        return jsx('option', { key: id, value: id, children: id })
-                      })
-                    ]
-                  }))
-                : null,
-              field('ticket id (free-text fallback)', jsx('input', { className: inputClass, value: ticket, onChange: e => setTicket(e.target.value), placeholder: 'ticket_id' }))
+              jsx(SnapshotSelect, {
+                label: 'ticket (from fetched task snapshot)',
+                items: tasks,
+                value: ticket,
+                onChange: setTicket,
+                emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
+                refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+                refreshKind: 'fetch-tasks',
+                ops,
+                allowManual: true,
+                manualPlaceholder: 'ticket_id',
+                manualValue: ticket,
+                onManualChange: setTicket
+              })
             ]
           }),
       field('claimant identity note (optional)', jsx('input', { className: inputClass, value: note, onChange: e => setNote(e.target.value), placeholder: 'who is claiming, for the record' })),
@@ -749,6 +934,10 @@ const PULL_FAILURES = [
 
 function PullRepoForm({ ctx, gateway, noSession, submitTitle, recordOp, ops }) {
   const claims = claimOps(ops)
+  const claimItems = claims.map(op => ({
+    id: str(op && op.id),
+    title: `${str((op && op.args && (op.args.ticket || op.args.key)) || (op && op.id) || '')}${op && op.at ? ` · ${new Date(op.at).toLocaleString()}` : ''}`
+  }))
   const [claimId, setClaimId] = useState('')
   const [ticketId, setTicketId] = useState('')
   const [replyFile, setReplyFile] = useState('')
@@ -789,17 +978,15 @@ function PullRepoForm({ ctx, gateway, noSession, submitTitle, recordOp, ops }) {
     className: 'flex flex-col gap-2 rounded-md p-2',
     children: [
       jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Pull repo (contributor-claim.py)' }),
-      claims.length
-        ? field('prefill from claim op', jsx('select', {
-            className: inputClass,
-            value: claimId,
-            onChange: e => onPickClaim(e.target.value),
-            children: [
-              jsx('option', { key: '__none', value: '', children: '(pick a claim op)' }),
-              ...claims.map(op => jsx('option', { key: str(op.id), value: str(op.id), children: `${str((op.args && (op.args.ticket || op.args.key)) || op.id)} · ${new Date(op.at).toLocaleString()}` }))
-            ]
-          }))
-        : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No claim ops recorded yet — type the ticket id manually.' }),
+      jsx(SnapshotSelect, {
+        label: 'prefill from claim op',
+        items: claimItems,
+        value: claimId,
+        onChange: onPickClaim,
+        emptyHint: SNAPSHOT_KIND_EMPTY.claims,
+        allowManual: false,
+        selectLabel: '(pick a claim op)'
+      }),
       field('ticket id', jsx('input', { className: inputClass, value: effectiveTicket, onChange: e => { setClaimId(''); setTicketId(e.target.value) }, placeholder: 'ticket_id' })),
       field('saved claim reply json (--reply-file)', jsx('input', { className: inputClass, value: effectiveReplyFile, onChange: e => setReplyFile(e.target.value), placeholder: '/path/to/claim-reply.json' })),
       field('destination directory (--dest, absolute)', jsx('input', { className: inputClass, value: dest, onChange: e => setDest(e.target.value), placeholder: '/home/you/work/ticket' })),
@@ -819,6 +1006,10 @@ const PUSH_FAILURES = [
 // --- form: push / submit (one op, three guided sub-steps) -------------------
 
 function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }) {
+  const snapSrc = snapshotSources(ctx)
+  const repos = snapSrc.repos
+  const tasks = snapSrc.tasks
+  const pools = itemsFor({ repos, poolStatus: snapSrc.poolStatus }, 'pools')
   const existing = (Array.isArray(ops) ? ops : []).find(op => op && op.kind === 'push' && op.status !== 'done' && op.status !== 'done (awaiting approval)' && op.status !== 'failed') || null
   const [pushOpId, setPushOpId] = useState(() => existing && existing.id != null ? str(existing.id) : undefined)
   const [repoId, setRepoId] = useState(() => str((existing && existing.args && existing.args.repoId) || ''))
@@ -897,15 +1088,72 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
     children: [
       jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Push / submit work (grant → package → deliver)' }),
       jsx('div', { className: 'text-(--ui-text-tertiary)', children: `one tracked op of kind push · substatus: ${str(substatus)}` }),
-      field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' })),
-      field('ticket id', jsx('input', { className: inputClass, value: ticketId, onChange: e => setTicketId(e.target.value), placeholder: 'ticket_id' })),
+      jsx(SnapshotSelect, {
+        label: 'repo_id',
+        items: repos,
+        value: repoId,
+        onChange: setRepoId,
+        emptyHint: SNAPSHOT_KIND_EMPTY.repos,
+        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
+        ops,
+        allowManual: true,
+        manualPlaceholder: 'my-repo',
+        manualValue: repoId,
+        onManualChange: setRepoId
+      }),
+      jsx(SnapshotSelect, {
+        label: 'ticket id',
+        items: tasks,
+        value: ticketId,
+        onChange: setTicketId,
+        emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
+        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+        refreshKind: 'fetch-tasks',
+        ops,
+        allowManual: true,
+        manualPlaceholder: 'ticket_id',
+        manualValue: ticketId,
+        onManualChange: setTicketId
+      }),
       jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 1 — grant (/push repo)' }),
       submitButton({ disabled: !grantReady, title: noSession ? submitTitle : (!repoId.trim() || !ticketId.trim() ? 'repo_id and ticket id are required' : undefined), onClick: submitGrant, children: grantDone ? 'Step 1 — grant submitted ✓ (re-request)' : 'Step 1 — request grant (/push repo)' }),
-      field('grant token (from the /push repo reply)', jsx('input', { className: inputClass, value: grantToken, onChange: e => setGrantToken(e.target.value), placeholder: 'grant_token' })),
+      jsx(SnapshotSelect, {
+        label: 'grant token (from the /push repo reply)',
+        items: grantToken.trim() ? [{ id: grantToken.trim(), title: 'grant token' }] : [],
+        value: grantToken,
+        onChange: setGrantToken,
+        emptyHint: SNAPSHOT_KIND_EMPTY.grant,
+        allowManual: true,
+        manualPlaceholder: 'grant_token',
+        manualValue: grantToken,
+        onManualChange: setGrantToken
+      }),
       jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 2 — package (scripts/contributor-push.py). Caveat: take next_version from the grant reply or re-ask /fetch repo <repo_id> for accepted_version; never trust the enroll-time chain_tips.' }),
       field('worktree path', jsx('input', { className: inputClass, value: worktreePath, onChange: e => setWorktreePath(e.target.value), placeholder: '/path/to/worktree' })),
-      field('pool_id', jsx('input', { className: inputClass, value: poolId, onChange: e => setPoolId(e.target.value), placeholder: 'pool_id' })),
-      field('--version N (next_version from grant reply or /fetch repo)', jsx('input', { className: inputClass, value: version, onChange: e => setVersion(e.target.value), inputMode: 'numeric', placeholder: 'N' })),
+      jsx(SnapshotSelect, {
+        label: 'pool_id',
+        items: pools,
+        value: poolId,
+        onChange: setPoolId,
+        emptyHint: SNAPSHOT_KIND_EMPTY.pools,
+        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
+        ops,
+        allowManual: true,
+        manualPlaceholder: 'pool_id',
+        manualValue: poolId,
+        onManualChange: setPoolId
+      }),
+      jsx(SnapshotSelect, {
+        label: '--version N (auto-resolves; manual fallback)',
+        items: [],
+        value: version,
+        onChange: setVersion,
+        emptyHint: SNAPSHOT_KIND_EMPTY.version,
+        allowManual: true,
+        manualPlaceholder: 'N',
+        manualValue: version,
+        onManualChange: setVersion
+      }),
       submitButton({ disabled: !packageReady, title: noSession ? submitTitle : !grantDone ? 'step 1 (grant) must complete first' : 'worktree, repo_id, pool_id and a numeric --version are required', onClick: submitPackage, children: packageDone ? 'Step 2 — package submitted ✓ (re-package)' : 'Step 2 — package (scripts/contributor-push.py)' }),
       jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 3 — deliver (/push repo --deliver). Redelivery is legal: the grant is not consumed by deliver.' }),
       field('transfer ticket (from the package reply)', jsx('input', { className: inputClass, value: transferTicket, onChange: e => setTransferTicket(e.target.value), placeholder: 'transfer_ticket' })),
@@ -925,12 +1173,33 @@ const APPROVE_FAILURES = [
 
 // --- form: approve (OWNER ONLY) --------------------------------------------
 
-function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
+function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }) {
+  const snapSrc = snapshotSources(ctx)
+  const repos = snapSrc.repos
+  const tasks = snapSrc.tasks
+  const awaiting = snapSrc.awaitingApproval
   const [targetKind, setTargetKind] = useState('repo')
   const [repoId, setRepoId] = useState('')
   const [version, setVersion] = useState('')
   const [ticketId, setTicketId] = useState('')
   const [deny, setDeny] = useState(false)
+
+  const onPickAwaiting = id => {
+    const entry = awaiting.find(e => str(e && e.id) === str(id))
+    if (!entry) return
+    if (entry.ticket) {
+      setTargetKind('ticket')
+      setTicketId(str(entry.ticket))
+    } else if (entry.repo) {
+      setTargetKind('repo')
+      setRepoId(str(entry.repo))
+      if (entry.version != null) setVersion(str(entry.version))
+    } else {
+      setTargetKind('repo')
+      setRepoId(str(entry.id))
+      if (entry.version != null) setVersion(str(entry.version))
+    }
+  }
 
   const versionOk = !version.trim() || /^\d+$/.test(version.trim())
   const ready = !noSession && versionOk && (targetKind === 'repo' ? Boolean(repoId.trim()) : Boolean(ticketId.trim()))
@@ -968,9 +1237,45 @@ function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
         value: targetKind,
         onChange: id => setTargetKind(id)
       }),
+      jsx(SnapshotSelect, {
+        label: 'awaiting approval (from pool_status)',
+        items: awaiting,
+        value: '',
+        onChange: onPickAwaiting,
+        emptyHint: SNAPSHOT_KIND_EMPTY.awaiting,
+        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
+        ops,
+        allowManual: false,
+        selectLabel: '(pick an awaiting-approval target)'
+      }),
       targetKind === 'repo'
-        ? field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' }))
-        : field('ticket_id', jsx('input', { className: inputClass, value: ticketId, onChange: e => setTicketId(e.target.value), placeholder: 'ticket_id' })),
+        ? jsx(SnapshotSelect, {
+            label: 'repo_id',
+            items: repos,
+            value: repoId,
+            onChange: setRepoId,
+            emptyHint: SNAPSHOT_KIND_EMPTY.repos,
+            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
+            ops,
+            allowManual: true,
+            manualPlaceholder: 'my-repo',
+            manualValue: repoId,
+            onManualChange: setRepoId
+          })
+        : jsx(SnapshotSelect, {
+            label: 'ticket_id',
+            items: tasks,
+            value: ticketId,
+            onChange: setTicketId,
+            emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
+            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+            refreshKind: 'fetch-tasks',
+            ops,
+            allowManual: true,
+            manualPlaceholder: 'ticket_id',
+            manualValue: ticketId,
+            onManualChange: setTicketId
+          }),
       targetKind === 'repo'
         ? field('--version N (optional)', jsx('input', { className: inputClass, value: version, onChange: e => setVersion(e.target.value), inputMode: 'numeric', placeholder: 'N' }))
         : null,
@@ -994,11 +1299,27 @@ const MERGE_FAILURES = [
 
 // --- form: merge (OWNER ONLY) ----------------------------------------------
 
-function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
+function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }) {
+  const snapSrc = snapshotSources(ctx)
+  const repos = snapSrc.repos
+  const tasks = snapSrc.tasks
+  const awaiting = snapSrc.awaitingApproval
   const [targetKind, setTargetKind] = useState('repo')
   const [repoId, setRepoId] = useState('')
   const [ticketId, setTicketId] = useState('')
   const [checkoutPath, setCheckoutPath] = useState('')
+
+  const onPickAwaiting = id => {
+    const entry = awaiting.find(e => str(e && e.id) === str(id))
+    if (!entry) return
+    if (entry.ticket) {
+      setTargetKind('ticket')
+      setTicketId(str(entry.ticket))
+    } else {
+      setTargetKind('repo')
+      setRepoId(str(entry.repo || entry.id))
+    }
+  }
 
   // Default canonical checkout: the pool's work/integrate/<repo_id>/ convention.
   const effectiveCheckout = checkoutPath.trim() || (repoId.trim() ? `work/integrate/${repoId.trim()}/` : '')
@@ -1035,9 +1356,45 @@ function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
         value: targetKind,
         onChange: id => setTargetKind(id)
       }),
+      jsx(SnapshotSelect, {
+        label: 'awaiting approval (from pool_status)',
+        items: awaiting,
+        value: '',
+        onChange: onPickAwaiting,
+        emptyHint: SNAPSHOT_KIND_EMPTY.awaiting,
+        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
+        ops,
+        allowManual: false,
+        selectLabel: '(pick an awaiting-approval target)'
+      }),
       targetKind === 'repo'
-        ? field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' }))
-        : field('ticket_id', jsx('input', { className: inputClass, value: ticketId, onChange: e => setTicketId(e.target.value), placeholder: 'ticket_id' })),
+        ? jsx(SnapshotSelect, {
+            label: 'repo_id',
+            items: repos,
+            value: repoId,
+            onChange: setRepoId,
+            emptyHint: SNAPSHOT_KIND_EMPTY.repos,
+            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
+            ops,
+            allowManual: true,
+            manualPlaceholder: 'my-repo',
+            manualValue: repoId,
+            onManualChange: setRepoId
+          })
+        : jsx(SnapshotSelect, {
+            label: 'ticket_id',
+            items: tasks,
+            value: ticketId,
+            onChange: setTicketId,
+            emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
+            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+            refreshKind: 'fetch-tasks',
+            ops,
+            allowManual: true,
+            manualPlaceholder: 'ticket_id',
+            manualValue: ticketId,
+            onManualChange: setTicketId
+          }),
       field('canonical checkout path (default: work/integrate/<repo_id>/)', jsx('input', { className: inputClass, value: checkoutPath, onChange: e => setCheckoutPath(e.target.value), placeholder: repoId.trim() ? `work/integrate/${repoId.trim()}/` : 'work/integrate/<repo_id>/' })),
       jsx('div', { className: 'text-(--ui-text-tertiary)', children: `effective checkout: ${str(effectiveCheckout) || '(enter a repo_id to prefill the work/integrate/ convention)'}` }),
       failureHints(MERGE_FAILURES),
@@ -1115,7 +1472,20 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
     body = jsxs('div', {
       className: 'flex flex-col gap-2',
       children: [
-        field('ticket id (optional)', jsx('input', { className: inputClass, value: auditTicket, onChange: e => setAuditTicket(e.target.value), placeholder: 'ticket_id' })),
+        jsx(SnapshotSelect, {
+          label: 'ticket id (optional)',
+          items: snapshotSources(ctx).tasks,
+          value: auditTicket,
+          onChange: setAuditTicket,
+          emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
+          refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
+          refreshKind: 'fetch-tasks',
+          ops: list,
+          allowManual: true,
+          manualPlaceholder: 'ticket_id',
+          manualValue: auditTicket,
+          onManualChange: setAuditTicket
+        }),
         submitButton({
           disabled: noSession,
           title: noSession ? submitTitle : undefined,
@@ -1227,13 +1597,13 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
           setPolling(value)
         }
       }),
-      jsx(AddRepoForm, { ctx, sessionId, gateway, noSession, submitTitle, recordOp }),
-      jsx(FetchTasksForm, { ctx, gateway, noSession, submitTitle, recordOp }),
-      jsx(ClaimForm, { ctx, gateway, noSession, submitTitle, recordOp }),
+      jsx(AddRepoForm, { ctx, sessionId, gateway, noSession, submitTitle, recordOp, ops }),
+      jsx(FetchTasksForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
+      jsx(ClaimForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
       jsx(PullRepoForm, { ctx, gateway, noSession, submitTitle, recordOp, ops }),
       jsx(PushSubmitCard, { ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }),
-      jsx(ApproveForm, { ctx, gateway, noSession, submitTitle, recordOp }),
-      jsx(MergeForm, { ctx, gateway, noSession, submitTitle, recordOp }),
+      jsx(ApproveForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
+      jsx(MergeForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
       jsx(TrackerSection, { ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing })
     ]
   })
