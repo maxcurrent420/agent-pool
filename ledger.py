@@ -541,14 +541,35 @@ def record_submission(conn, repo_id, version, manifest_hash_value,
                       manifest_json) -> None:
     """Record a submitted (awaiting approval) repo version.
 
-    Writes ONLY the repo_versions row with state 'submitted' — never a
-    manifest_chain row, so the later owner approval can append the
-    accepted manifest without violating UNIQUE(repo_id, version).
+    Guarded write — NEVER overwrites an existing repo_versions row:
+    - existing row 'submitted' with the SAME manifest_hash: idempotent
+      no-op (identical re-delivery);
+    - existing row 'accepted': VersionCollisionError (the accepted chain
+      would be clobbered — re-mint the next version);
+    - existing row 'submitted' with a DIFFERENT manifest_hash:
+      VersionCollisionError (same version number, different content).
     """
+    version = int(version)
+    row = conn.execute(
+        "SELECT state, manifest_hash FROM repo_versions WHERE repo_id=? AND version=?",
+        (repo_id, version)).fetchone()
+    if row is not None:
+        if row["state"] == "submitted" and row["manifest_hash"] == manifest_hash_value:
+            return  # idempotent re-delivery of identical bytes
+        if row["state"] == "accepted":
+            raise VersionCollisionError(
+                f"{repo_id} v{version} is already ACCEPTED in the pool chain — "
+                f"delivering it again would overwrite accepted state; "
+                f"re-mint with version {next_repo_version(conn, repo_id)} "
+                f"(next_repo_version).")
+        raise VersionCollisionError(
+            f"{repo_id} v{version} already exists as {row['state']!r} with a "
+            f"different manifest hash — refusing to overwrite; mint the next "
+            f"version instead.")
     conn.execute(
-        "INSERT OR REPLACE INTO repo_versions (repo_id, version, manifest_json, manifest_hash, state)"
+        "INSERT INTO repo_versions (repo_id, version, manifest_json, manifest_hash, state)"
         " VALUES (?,?,?,?,?)",
-        (repo_id, int(version), manifest_json, manifest_hash_value, "submitted"))
+        (repo_id, version, manifest_json, manifest_hash_value, "submitted"))
     conn.commit()
 
 
@@ -628,6 +649,9 @@ BUDGET_DEFAULTS = {"max_turns": 25, "max_tasks_per_day": 5, "token_cap": 50000,
 
 class ClaimRefused(Exception):
     """A claim violated a ledger rule (double-claim, overlap, frozen, no paths)."""
+class VersionCollisionError(RuntimeError):
+    """A delivery/build targeted a repo version that already exists in a
+    non-submitted state. Never clobber pool state — mint the next version."""
 
 
 def is_frozen(conn, pool_id) -> bool:
