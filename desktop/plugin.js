@@ -14,7 +14,7 @@
 import { host, ListRow, PANES_AREA, ROUTES_AREA, SegmentedControl, SIDEBAR_NAV_AREA, ToggleRow, useValue } from '@hermes/plugin-sdk'
 import { useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { addRepoLinkPrompt, addRepoOwnerPrompt, claimPrompt, fetchTaskListPrompt, pullPrompt, pushDeliverPrompt, pushGrantPrompt, pushPackagePrompt } from './prompts.js'
+import { addRepoLinkPrompt, addRepoOwnerPrompt, approvePrompt, claimPrompt, fetchTaskListPrompt, mergePrompt, pullPrompt, pushDeliverPrompt, pushGrantPrompt, pushPackagePrompt } from './prompts.js'
 
 // Contribution ids are namespaced by the host as '<plugin id>:<local id>'.
 // The pane's error card names the contribution it came from.
@@ -582,6 +582,135 @@ function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, s
   })
 }
 
+const APPROVE_FAILURES = [
+  'non-owner refusal — the plugin refuses; the pane records the plugin\'s message verbatim as op status refused (authorization lives only in the plugin)',
+  'audit not clean — fix the audit findings before approving',
+  'no accepted bundle for the version — push/deliver a version first, then approve'
+]
+
+// --- form: approve (OWNER ONLY) --------------------------------------------
+
+function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
+  const [targetKind, setTargetKind] = useState('repo')
+  const [repoId, setRepoId] = useState('')
+  const [version, setVersion] = useState('')
+  const [ticketId, setTicketId] = useState('')
+  const [deny, setDeny] = useState(false)
+
+  const versionOk = !version.trim() || /^\d+$/.test(version.trim())
+  const ready = !noSession && versionOk && (targetKind === 'repo' ? Boolean(repoId.trim()) : Boolean(ticketId.trim()))
+  const disabledTitle = noSession
+    ? submitTitle
+    : !versionOk ? '--version must be a number'
+    : targetKind === 'repo' ? (!repoId.trim() ? 'repo_id is required for a repo version approval' : undefined)
+    : (!ticketId.trim() ? 'ticket_id is required for a pushed-claim approval' : undefined)
+
+  const onSubmit = async () => {
+    if (!ready) return
+    const args = targetKind === 'repo'
+      ? { repoId: repoId.trim(), ...(version.trim() ? { version: Number(version.trim()) } : {}), deny }
+      : { ticketId: ticketId.trim(), deny }
+    const text = approvePrompt({
+      gateway,
+      repoId: targetKind === 'repo' ? repoId.trim() : undefined,
+      version: targetKind === 'repo' && version.trim() ? Number(version.trim()) : undefined,
+      ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
+      deny
+    })
+    await recordOp({ kind: 'approve', gateway, args: { ...args, target: targetKind }, text })
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'OWNER ONLY — Approve / deny (pool-approve.py)' }),
+      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'OWNER ONLY. The pane has no owner check of its own — authorization lives only in the plugin. A non-owner profile still submits; the plugin refuses and the pane records the refusal verbatim as op status refused.' }),
+      jsx(SegmentedControl, {
+        options: [
+          { id: 'repo', label: 'Repo version' },
+          { id: 'ticket', label: 'Pushed claim' }
+        ],
+        value: targetKind,
+        onChange: id => setTargetKind(id)
+      }),
+      targetKind === 'repo'
+        ? field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' }))
+        : field('ticket_id', jsx('input', { className: inputClass, value: ticketId, onChange: e => setTicketId(e.target.value), placeholder: 'ticket_id' })),
+      targetKind === 'repo'
+        ? field('--version N (optional)', jsx('input', { className: inputClass, value: version, onChange: e => setVersion(e.target.value), inputMode: 'numeric', placeholder: 'N' }))
+        : null,
+      jsx(ToggleRow, {
+        checked: deny,
+        description: 'Pass --deny instead of approving.',
+        label: 'Deny',
+        onChange: value => setDeny(value)
+      }),
+      failureHints(APPROVE_FAILURES),
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: deny ? 'Deny (pool-approve.py --deny)' : 'Approve (pool-approve.py)' })
+    ]
+  })
+}
+
+const MERGE_FAILURES = [
+  'non-owner refusal — the plugin refuses; the pane records the plugin\'s message verbatim as op status refused (authorization lives only in the plugin)',
+  'audit not clean — the merge must not proceed until the audit is clean',
+  'no accepted bundle for the version — approve an accepted bundle first'
+]
+
+// --- form: merge (OWNER ONLY) ----------------------------------------------
+
+function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
+  const [targetKind, setTargetKind] = useState('repo')
+  const [repoId, setRepoId] = useState('')
+  const [ticketId, setTicketId] = useState('')
+  const [checkoutPath, setCheckoutPath] = useState('')
+
+  // Default canonical checkout: the pool's work/integrate/<repo_id>/ convention.
+  const effectiveCheckout = checkoutPath.trim() || (repoId.trim() ? `work/integrate/${repoId.trim()}/` : '')
+  const ready = !noSession && (targetKind === 'repo' ? Boolean(repoId.trim()) : Boolean(ticketId.trim())) && Boolean(effectiveCheckout)
+  const disabledTitle = noSession
+    ? submitTitle
+    : targetKind === 'repo' ? (!repoId.trim() ? 'repo_id is required' : undefined)
+    : (!ticketId.trim() ? 'ticket_id is required' : undefined)
+
+  const onSubmit = async () => {
+    if (!ready) return
+    const args = targetKind === 'repo'
+      ? { repoId: repoId.trim(), checkoutPath: effectiveCheckout }
+      : { ticketId: ticketId.trim(), checkoutPath: effectiveCheckout }
+    const text = mergePrompt({
+      gateway,
+      repoId: targetKind === 'repo' ? repoId.trim() : undefined,
+      ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
+      checkoutPath: effectiveCheckout
+    })
+    await recordOp({ kind: 'merge', gateway, args: { ...args, target: targetKind }, text })
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'OWNER ONLY — Merge approved bundle' }),
+      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'OWNER ONLY. The plugin never merges — the agent performs git fetch <approved bundle> + git merge into the canonical checkout itself. Where the maintainer flow uses the merge_approved service path (tickets.py:2249), it goes through the agent executing the plugin\'s documented flow, never a pane-side import. A non-owner profile still submits; the plugin refuses and the pane records the refusal verbatim as op status refused.' }),
+      jsx(SegmentedControl, {
+        options: [
+          { id: 'repo', label: 'Repo' },
+          { id: 'ticket', label: 'Ticket' }
+        ],
+        value: targetKind,
+        onChange: id => setTargetKind(id)
+      }),
+      targetKind === 'repo'
+        ? field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' }))
+        : field('ticket_id', jsx('input', { className: inputClass, value: ticketId, onChange: e => setTicketId(e.target.value), placeholder: 'ticket_id' })),
+      field('canonical checkout path (default: work/integrate/<repo_id>/)', jsx('input', { className: inputClass, value: checkoutPath, onChange: e => setCheckoutPath(e.target.value), placeholder: repoId.trim() ? `work/integrate/${repoId.trim()}/` : 'work/integrate/<repo_id>/' })),
+      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `effective checkout: ${effectiveCheckout || '(enter a repo_id to prefill the work/integrate/ convention)'}` }),
+      failureHints(MERGE_FAILURES),
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: 'Merge approved bundle (agent runs git fetch + git merge)' })
+    ]
+  })
+}
+
 function renderTracker(ops) {
   if (!ops.length) {
     return jsx('div', {
@@ -687,6 +816,8 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
       jsx(ClaimForm, { ctx, gateway, noSession, submitTitle, recordOp }),
       jsx(PullRepoForm, { ctx, gateway, noSession, submitTitle, recordOp, ops }),
       jsx(PushSubmitCard, { ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }),
+      jsx(ApproveForm, { ctx, gateway, noSession, submitTitle, recordOp }),
+      jsx(MergeForm, { ctx, gateway, noSession, submitTitle, recordOp }),
       renderTracker(ops)
     ]
   })

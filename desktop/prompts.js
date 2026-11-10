@@ -68,5 +68,5 @@ export function approvePrompt({ gateway, repoId, version, ticketId, deny }) {
 export function mergePrompt({ gateway, repoId, ticketId, checkoutPath }) {
   const target = ticketId ? `ticket ${ticketId}` : `repo ${repoId}`
   const dest = checkoutPath || `work/integrate/${repoId}/`
-  return `On the ${gateway} gateway, merge the approved bundle for ${target}: the plugin never merges — run the merge yourself. git fetch <approved bundle> and git merge it into the canonical checkout at ${dest}. Where the maintainer flow calls the merge_approved service path, do it through the plugin's documented flow, never a side import. If the audit is not clean or there is no accepted bundle, stop and report it verbatim. ${replySuffix()}`
+  return `On the ${gateway} gateway, OWNER ONLY: merge the approved bundle for ${target}: the plugin never merges — run the merge yourself. git fetch <approved bundle> and git merge it into the canonical checkout at ${dest}. Where the maintainer flow calls the merge_approved service path (tickets.py:2249), do it through the plugin's documented flow, never a side import. If the audit is not clean, there is no accepted bundle for the version, or the plugin refuses because this profile is not the pool owner, report the refusal/failure verbatim and do not retry. ${replySuffix()}`
 }
