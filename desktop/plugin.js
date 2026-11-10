@@ -14,6 +14,7 @@
 import { host, ListRow, PANES_AREA, ROUTES_AREA, SegmentedControl, SIDEBAR_NAV_AREA, ToggleRow, useValue } from '@hermes/plugin-sdk'
 import { useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
+import { addRepoLinkPrompt, addRepoOwnerPrompt, claimPrompt, fetchTaskListPrompt } from './prompts.js'
 
 // Contribution ids are namespaced by the host as '<plugin id>:<local id>'.
 // The pane's error card names the contribution it came from.
@@ -129,6 +130,260 @@ function opPillClass(status) {
   return 'rounded-full px-2 py-0.5 text-xs text-(--ui-text-tertiary)'
 }
 
+// Absolute local path shape only: must start with '/', no scheme, no '://',
+// no git@host: scp-like syntax. The pane never carries remote URLs.
+function isAbsoluteLocalPath(value) {
+  const v = (value || '').trim()
+  if (!v.startsWith('/')) return false
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) return false
+  if (v.includes('://')) return false
+  if (/^[^\s/]+@[^\s/]+:/.test(v)) return false
+  if (/[\s]/.test(v)) return false
+  return true
+}
+
+const inputClass = 'rounded-md px-2 py-1 text-(--ui-text-primary)'
+const labelClass = 'text-(--ui-text-secondary)'
+
+function field(label, input) {
+  return jsxs('label', {
+    className: 'flex flex-col gap-1',
+    children: [jsx('span', { className: labelClass, children: label }), input]
+  })
+}
+
+function failureHints(items) {
+  return jsxs('div', {
+    className: 'flex flex-col gap-0.5 text-(--ui-text-tertiary)',
+    children: items.map(item => jsx('div', { key: item, children: `• ${item}` }))
+  })
+}
+
+function submitButton({ disabled, title, children, onClick }) {
+  return jsx('button', {
+    className: 'rounded-md px-3 py-1.5 text-left text-(--ui-text-primary)',
+    disabled,
+    title: disabled ? title : undefined,
+    onClick,
+    children
+  })
+}
+
+// --- form: add repo ---------------------------------------------------------
+
+const ADD_REPO_FAILURES = [
+  'add-repo: --link is not supported (the pane forbids remote URLs — local absolute paths only)',
+  'not authorized for pool <id> (whitelist refusal)',
+  'manifest signature / transport failure',
+  'version too low — pass an explicit --version greater than the tip'
+]
+
+function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp }) {
+  const [mode, setMode] = useState('owner')
+  const [repoId, setRepoId] = useState('')
+  const [path, setPath] = useState('')
+  const [version, setVersion] = useState('')
+  const [maintainerGateway, setMaintainerGateway] = useState('default')
+
+  const pathOk = isAbsoluteLocalPath(path)
+  const versionOk = !version.trim() || /^\d+$/.test(version.trim())
+  const ready = !noSession && repoId.trim() && pathOk && versionOk
+  const disabledTitle = noSession
+    ? submitTitle
+    : !repoId.trim() ? 'repo_id is required'
+    : !pathOk ? 'path must be an absolute local path (no URLs)'
+    : !versionOk ? '--version must be a positive integer'
+    : undefined
+
+  const onSubmit = async () => {
+    if (!ready) return
+    const v = version.trim() ? Number(version.trim()) : undefined
+    const text = mode === 'owner'
+      ? addRepoOwnerPrompt({ gateway, repoId: repoId.trim(), path: path.trim(), version: v })
+      : addRepoLinkPrompt({ gateway, repoId: repoId.trim(), path: path.trim(), version: v, maintainerGateway })
+    await recordOp({
+      kind: mode === 'owner' ? 'add-repo' : 'add-repo-link',
+      gateway,
+      args: { mode, repoId: repoId.trim(), path: path.trim(), version: v ?? null, maintainerGateway: mode === 'link' ? maintainerGateway : undefined, substatus: mode === 'link' ? 'build bundle → deliver' : undefined },
+      text
+    })
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Add repo' }),
+      jsx(SegmentedControl, {
+        options: [
+          { id: 'owner', label: 'My pool (owner)' },
+          { id: 'link', label: 'Contribute (link flow)' }
+        ],
+        value: mode,
+        onChange: setMode
+      }),
+      field('repo_id', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: 'my-repo' })),
+      field('local path (absolute)', jsx('input', { className: inputClass, value: path, onChange: e => setPath(e.target.value), placeholder: '/home/you/src/my-repo' })),
+      !pathOk && path.trim() ? jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Path must be absolute (starts with /) and must not look like a URL.' }) : null,
+      field('--version (optional)', jsx('input', { className: inputClass, value: version, onChange: e => setVersion(e.target.value), placeholder: 'N', inputMode: 'numeric' })),
+      mode === 'link'
+        ? field('maintainer gateway (profile)', jsx('input', { className: inputClass, value: maintainerGateway, onChange: e => setMaintainerGateway(e.target.value), placeholder: 'default' }))
+        : null,
+      failureHints(ADD_REPO_FAILURES),
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: mode === 'owner' ? 'Add repo (owner fast path)' : 'Add repo (link flow: build bundle → deliver)' })
+    ]
+  })
+}
+
+// --- form: fetch task list --------------------------------------------------
+
+function snapshotRepos(ctx) {
+  const snap = ctx.storage.get('snapshot.repos', null)
+  if (Array.isArray(snap)) return snap
+  if (snap && Array.isArray(snap.repos)) return snap.repos
+  return []
+}
+
+function repoIdOf(entry) {
+  if (entry == null) return ''
+  if (typeof entry === 'string') return entry
+  return entry.repo_id || entry.repo || entry.id || entry.name || ''
+}
+
+function FetchTasksForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
+  const repos = snapshotRepos(ctx)
+  const [repoFilter, setRepoFilter] = useState('')
+  const ready = !noSession
+
+  const onSubmit = async () => {
+    if (!ready) return
+    const filter = repoFilter.trim() || undefined
+    const text = fetchTaskListPrompt({ gateway, repoId: filter })
+    const record = await recordOp({
+      kind: 'fetch-tasks',
+      gateway,
+      args: { repo: filter || null, sequence: ['/fetch repo list', `/fetch task list${filter ? ` --repo ${filter}` : ''}`] },
+      text
+    })
+    // Agent reply snapshot is stored by the refresh loop (Task 8); seed the
+    // key with a timestamp so offline display has a slot to read.
+    ctx.storage.set('snapshot.tasks', { at: Date.now(), opId: record?.id || null, table: null })
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Fetch task list' }),
+      repos.length
+        ? field('repo filter (from last pool_status / fetch repo list)', jsx('select', {
+            className: inputClass,
+            value: repoFilter,
+            onChange: e => setRepoFilter(e.target.value),
+            children: [
+              jsx('option', { key: '__all', value: '', children: '(all repos)' }),
+              ...repos.map(entry => {
+                const id = repoIdOf(entry)
+                return jsx('option', { key: id, value: id, children: id })
+              })
+            ]
+          }))
+        : field('repo filter (optional — no snapshot yet)', jsx('input', { className: inputClass, value: repoFilter, onChange: e => setRepoFilter(e.target.value), placeholder: 'repo_id' })),
+      submitButton({ disabled: !ready, title: noSession ? submitTitle : undefined, onClick: onSubmit, children: 'Fetch tasks (/fetch repo list → /fetch task list)' })
+    ]
+  })
+}
+
+// --- form: claim / assign ---------------------------------------------------
+
+const CLAIM_FAILURES = [
+  'claim refused: user <id> already bound to key <key> (immutable key binding)',
+  'agent budget exhausted: <n> of <allocation> tasks completed',
+  'not whitelisted for this pool'
+]
+
+function snapshotTasks(ctx) {
+  const snap = ctx.storage.get('snapshot.tasks', null)
+  if (!snap) return []
+  const table = Array.isArray(snap) ? snap : (Array.isArray(snap.table) ? snap.table : (Array.isArray(snap.tasks) ? snap.tasks : []))
+  return table
+}
+
+function ticketIdOf(entry) {
+  if (entry == null) return ''
+  if (typeof entry === 'string') return entry
+  return entry.ticket_id || entry.ticket || entry.id || ''
+}
+
+function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp }) {
+  const tasks = snapshotTasks(ctx)
+  const [ticket, setTicket] = useState('')
+  const [note, setNote] = useState('')
+  const [autoAssign, setAutoAssign] = useState(false)
+  const [maxTasks, setMaxTasks] = useState('1')
+
+  const ticketReady = autoAssign ? (/^\d+$/.test(maxTasks.trim()) && Number(maxTasks.trim()) > 0) : Boolean(ticket.trim())
+  const ready = !noSession && ticketReady
+  const disabledTitle = noSession
+    ? submitTitle
+    : autoAssign ? (ticketReady ? undefined : 'max-tasks must be a positive integer')
+    : 'a ticket id is required — pick one from the snapshot or type it'
+
+  const onSubmit = async () => {
+    if (!ready) return
+    const noteSuffix = note.trim() ? ` Claimant identity note: ${note.trim()}.` : ''
+    const text = autoAssign
+      ? claimPrompt({ gateway, maxTasks: Number(maxTasks.trim()) }) + noteSuffix
+      : claimPrompt({ gateway, ticketId: ticket.trim() }) + noteSuffix
+    const key = autoAssign ? `auto-${maxTasks.trim()}` : ticket.trim()
+    const record = await recordOp({
+      kind: 'claim',
+      gateway,
+      args: { ticket: autoAssign ? null : key, autoAssign, maxTasks: autoAssign ? Number(maxTasks.trim()) : null, note: note.trim() || null },
+      text
+    })
+    const claims = ctx.storage.get('snapshot.claims', {})
+    ctx.storage.set('snapshot.claims', { ...(claims && typeof claims === 'object' ? claims : {}), [key]: { at: Date.now(), opId: record?.id || null, reply: null } })
+  }
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Claim / assign' }),
+      jsx(ToggleRow, {
+        checked: autoAssign,
+        description: 'Use /claim --any-project --max-tasks N instead of claiming one ticket.',
+        label: 'Auto-assign',
+        onChange: setAutoAssign
+      }),
+      autoAssign
+        ? field('--max-tasks N', jsx('input', { className: inputClass, value: maxTasks, onChange: e => setMaxTasks(e.target.value), inputMode: 'numeric' }))
+        : jsxs('div', {
+            className: 'flex flex-col gap-2',
+            children: [
+              tasks.length
+                ? field('ticket (from fetched task snapshot)', jsx('select', {
+                    className: inputClass,
+                    value: ticket,
+                    onChange: e => setTicket(e.target.value),
+                    children: [
+                      jsx('option', { key: '__none', value: '', children: '(select a ticket)' }),
+                      ...tasks.map(entry => {
+                        const id = ticketIdOf(entry)
+                        return jsx('option', { key: id, value: id, children: id })
+                      })
+                    ]
+                  }))
+                : null,
+              field('ticket id (free-text fallback)', jsx('input', { className: inputClass, value: ticket, onChange: e => setTicket(e.target.value), placeholder: 'ticket_id' }))
+            ]
+          }),
+      field('claimant identity note (optional)', jsx('input', { className: inputClass, value: note, onChange: e => setNote(e.target.value), placeholder: 'who is claiming, for the record' })),
+      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `target profile: ${gateway} (plugin binds claim to key + Discord id automatically)` }),
+      failureHints(CLAIM_FAILURES),
+      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: autoAssign ? 'Auto-assign (/claim --any-project)' : 'Claim ticket (/claim)' })
+    ]
+  })
+}
+
 function renderTracker(ops) {
   if (!ops.length) {
     return jsx('div', {
@@ -153,7 +408,9 @@ function renderTracker(ops) {
                 jsx('div', {
                   className: 'text-(--ui-text-tertiary)',
                   children: `${op.gateway || ''} · ${new Date(op.at).toLocaleString()}`
-                })
+                }),
+                op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${op.error}` }) : null,
+                op.args && op.args.substatus ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `substatus: ${op.args.substatus}` }) : null
               ]
             }),
             jsx('span', { className: opPillClass(op.status), children: OP_STATUS_PILL[op.status] || op.status })
@@ -181,7 +438,7 @@ function setCollapsed(storage, id, value) {
 // The pane body is a plain builder (no hooks of its own) so the guard in
 // PoolPane can catch anything thrown while the tree is assembled. Hook values
 // are read in PoolPane and passed in.
-function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops }) {
+function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp }) {
   const noSession = !sessionId
   const submitTitle = noSession ? 'no focused chat session — focus a chat to submit' : undefined
 
@@ -225,12 +482,9 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
           setPolling(value)
         }
       }),
-      jsx('button', {
-        className: 'rounded-md px-3 py-2 text-left text-(--ui-text-primary)',
-        disabled: noSession,
-        title: submitTitle,
-        children: 'Submit (forms arrive in a later release)'
-      }),
+      jsx(AddRepoForm, { ctx, sessionId, gateway, noSession, submitTitle, recordOp }),
+      jsx(FetchTasksForm, { ctx, gateway, noSession, submitTitle, recordOp }),
+      jsx(ClaimForm, { ctx, gateway, noSession, submitTitle, recordOp }),
       renderTracker(ops)
     ]
   })
@@ -256,13 +510,18 @@ function PoolPane({ ctx }) {
   const gatewayState = useValue(host.state.gateway)
   const [gateway, setGateway] = useState(() => poolPaneStore.gateway)
   const [polling, setPolling] = useState(() => poolPaneStore.polling)
-  const [ops] = useState(() => {
+  const [ops, setOps] = useState(() => {
     const stored = ctx.storage.get(OPS_KEY, [])
     return Array.isArray(stored) ? stored : []
   })
+  const recordOp = async op => {
+    const record = await submitOp(ctx, sessionId, op)
+    setOps(prev => [record, ...prev].slice(0, OPS_KEEP))
+    return record
+  }
 
   try {
-    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops })
+    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp })
   } catch (error) {
     return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.pane, error })
   }
