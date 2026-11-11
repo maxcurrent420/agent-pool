@@ -556,6 +556,17 @@ add-repo link flow, the claim→push→approve flow, version rules, and what
 fails closed). It is written for any agent running the plugin on any
 machine — no host-specific paths, ports, or test procedures.
 
+## Known housekeeping issue — TODO
+
+Every outbound Tor transfer leaves a `.sendme-send-<id>/` directory next
+to the repo (the sendme fork's staging area: bundle + ticket + manifest
+for one delivery). They are NOT cleaned up automatically and accumulate —
+safe to delete once the transfer completed. TODO: add automatic cleanup
+after a confirmed transfer (on the sender side, post-`transfer_id`
+ack), plus a housekeeping verb or documented manual sweep for old
+directories. Until then: `rm -rf .sendme-send-*` is safe when nothing is
+in flight.
+
 ## See also
 
 - `docs/architecture.md` — command-surface chain, Tor-routed Iroh
