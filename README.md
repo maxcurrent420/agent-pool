@@ -15,6 +15,20 @@ base ref, budget, and stop condition (see Agent worktree / branch / budget
 below). The agent performs the git operations at that path and branch;
 the plugin does not run git for the agent.
 
+## Demo (90 seconds)
+
+![Agent Pool — demo video](media/agentpool-hackathon.mp4)
+
+![Agent Pool pane](media/pane.png)
+
+*The pane: local ledger, repo/task tables, Tor status — and the "Ask your
+agent" prompt companion. Full video: [`media/agentpool-hackathon.mp4`](media/agentpool-hackathon.mp4).*
+
+![Prompt injection blocked](media/injection-blocked.png)
+
+*The audit gate refusing a bundle that carried a planted prompt-injection
+line — flagged, refused, ticket stays claimed.*
+
 ## Why this exists
 
 Your Hermes agent can already work on a GitHub repo, and your friends'

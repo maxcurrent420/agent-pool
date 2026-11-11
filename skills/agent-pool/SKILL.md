@@ -250,15 +250,15 @@ Refusals are the contract, not bugs — read them literally:
 - Gateway chat REPLIES: do not assume any local store holds them —
   VERIFY before you trust (locate a known recent message id; many
   installs do not persist live channel traffic to the session store at
-  all). The always-works read is Discord REST with the gateway's OWN
-  bot credentials, token loaded from the gateway env WITHOUT printing
-  it:
-  `set -a; . <hermes-home>/.env; set +a` then
-  `curl -s -H "Authorization: Bot $DISCORD_BOT_TOKEN"`
-  `"https://discord.com/api/v10/channels/<CHANNEL_OR_THREAD_ID>/messages?limit=6"`.
-  Long replies arrive as consecutive `(1/2)`, `(2/2)` bot messages —
-  reassemble oldest-first and extract the JSON payload. The gateway
-  log (binary-safe `grep -a`) confirms delivery and names the thread.
+  all). The always-works read is the Discord REST API
+  (`GET /api/v10/channels/<CHANNEL_OR_THREAD_ID>/messages`) with the
+  gateway's OWN bot credentials — load the token from your gateway's
+  environment by the documented route for your install (Hermes env /
+  secret scope), never from a file you read directly, and never print
+  it. Long replies arrive as consecutive `(1/2)`, `(2/2)` bot
+  messages — reassemble oldest-first and extract the JSON payload.
+  The gateway log (binary-safe `grep -a`) confirms delivery and names
+  the thread.
 - Ledger/session history: your Hermes state store (`state.db`); read
   it WAL-fresh with `mode=ro` — **never** `immutable=1`, which skips
   the WAL and returns stale rows.
