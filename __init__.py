@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import shlex
+import sqlite3
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -114,10 +116,42 @@ def _tor_config(ctx):
     return control, socks, (str(binary).strip() or None)
 
 
+_TOR_STATUS_CACHE = {"at": 0.0, "block": None}
+_TOR_STATUS_TTL = 60.0
+
+
+def _tor_status_block(ctx):
+    """Tor readiness block (config + local probe), cached ~60s.
+
+    The probe is a localhost socket check by the plugin itself — a local
+    read, not a gateway round-trip. Never raises.
+    """
+    now = time.time()
+    cached = _TOR_STATUS_CACHE.get("block")
+    if cached is not None and (now - _TOR_STATUS_CACHE.get("at", 0.0)) < _TOR_STATUS_TTL:
+        return dict(cached)
+    control, socks, tor_binary = _tor_config(ctx)
+    block = {"control_port": control, "socks_port": socks,
+             "binary": tor_binary or "send_hermes (PATH)"}
+    try:
+        try:
+            from .transport import tor_ready as _tor_ready
+        except ImportError:
+            from transport import tor_ready as _tor_ready
+        block["ready"] = _tor_ready(
+            control_port=control, socks_port=socks, binary=tor_binary)
+    except Exception as exc:
+        block["ready"] = {"ok": False, "error": str(exc)[:300]}
+    _TOR_STATUS_CACHE["at"] = now
+    _TOR_STATUS_CACHE["block"] = dict(block)
+    return block
+
+
 def _status_snapshot(ctx=None):
     """Shared read-only status snapshot used by ``pool_status`` and the
-    dashboard read route. Service/plugin_db reads only — no writes and
-    no Tor probe. Returns the status dict (never raises)."""
+    dashboard read route. Service/plugin_db reads plus a cached local Tor
+    probe (localhost sockets only — no gateway round-trip). Returns the
+    status dict (never raises)."""
     mode, _relay_url, per_pool = _transport_config(ctx)
     # relay_url is deprecated/ignored: no relay in the connection
     # path. Kept as "" for shape compatibility.
@@ -198,6 +232,10 @@ def _status_snapshot(ctx=None):
             pass
     except Exception:
         pass
+    try:
+        status["tor"] = _tor_status_block(ctx)
+    except Exception:
+        pass
     return status
 
 
@@ -207,26 +245,15 @@ def _pool_status(args=None, **kwargs):
     try:
         status = _status_snapshot(ctx)
         # Tor is the only transport: always surface readiness.
-        control, socks, tor_binary = _tor_config(ctx)
-        status["tor"] = {"control_port": control, "socks_port": socks,
-                         "binary": tor_binary or "send_hermes (PATH)"}
-        try:
-            try:
-                from .transport import tor_ready as _tor_ready
-            except ImportError:
-                from transport import tor_ready as _tor_ready
-            status["tor"]["ready"] = _tor_ready(
-                control_port=control, socks_port=socks,
-                binary=tor_binary)
-        except Exception as exc:
-            status["tor"]["ready"] = {"ok": False,
-                                      "error": str(exc)[:300]}
+        tor = status.get("tor") or _tor_status_block(ctx)
+        status["tor"] = tor
+        if isinstance(tor.get("ready"), dict) and tor["ready"].get("ok") is False and tor["ready"].get("error"):
             status["transport_warning"] = (
-                f"Tor anonymity layer is not ready: {str(exc)[:200]} — "
-                "byte transfers fail closed; Iroh-over-Tor is the only "
-                "byte transport (no relay fallback). Start the unit "
-                "named in the error (systemctl start agent-pool-tor) "
-                "and install the tor sidecar (scripts/install-tor.sh).")
+                f"Tor anonymity layer is not ready: {str(tor['ready'].get('error'))[:200]} — "
+                "byte transfers fail closed; Iroh-over-Tor is the only byte "
+                "transport (no relay fallback). Start the unit named in the "
+                "error (systemctl start agent-pool-tor) and install the tor "
+                "sidecar (scripts/install-tor.sh).")
         return json.dumps(status)
     except Exception as exc:  # never raise from a handler
         return json.dumps({"ok": False, "code": "status_unavailable",
@@ -740,7 +767,7 @@ def _handle_release(ctx, raw: str, *, source=None, session_id="", session_key=""
 
 def _handle_fetch(ctx, raw: str, *, source=None, session_id="", session_key="", platform="") -> str:
     """``/fetch repo list`` / ``/fetch task list [--ticket <id>]`` /
-    ``/fetch repo <repo_id>`` / ``/fetch repo --manifest <json> [--dest DIR]``."""
+    ``/fetch repo <repo_id>`` / ``/fetch repo --manifest <json> [--dest DIR] [--ticket FRESH]``."""
     try:
         svc = _service_for(ctx, source=source)
         pos, opts, _flags = _parse_args(raw)
@@ -753,7 +780,9 @@ def _handle_fetch(ctx, raw: str, *, source=None, session_id="", session_key="", 
                     manifest = json.loads(opts["manifest"])
                 except Exception as exc:
                     return _result({"ok": False, "error": f"bad manifest JSON: {exc}"})
-                out = svc.fetch_repo_download(manifest, dest=opts.get("dest", "/tmp/fetch"), source=source)
+                out = svc.fetch_repo_download(manifest, dest=opts.get("dest", "/tmp/fetch"),
+                                               transfer_ticket=opts.get("ticket") or None,
+                                               source=source)
             elif len(pos) > 1 and pos[1] == "list":
                 out = svc.fetch_repo_list(pool_id=opts.get("pool") or opts.get("pool_id") or None, source=source)
             else:
@@ -858,6 +887,137 @@ def _pane_state_read():
         return {"ops": [], "pool_status": {}, "updated_at": None}
 
 
+def _pane_read_conn():
+    """PANE read path: ALWAYS the maintainer ledger (default profile's
+    plugin data dir), read-only. Override with AGENT_POOL_PANE_LEDGER.
+
+    Never writable; a contributor-profile dashboard cannot mutate the
+    maintainer ledger. Never raises — callers handle None.
+    """
+    p = _env_get("AGENT_POOL_PANE_LEDGER") or \
+        str(Path.home() / ".hermes" / "plugin-data" / "agent-pool" / "data.db")
+    conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _pane_ledger_path():
+    return _env_get("AGENT_POOL_PANE_LEDGER") or \
+        str(Path.home() / ".hermes" / "plugin-data" / "agent-pool" / "data.db")
+
+
+def _pane_worktrees():
+    """Enumerate work/integrate/<repo_id>/ under the pane ledger's base dir:
+    worktree-v<N> dirs and bundle-v<N>.git per repo. Pure filesystem listing
+    of the plugin's own records. Never raises."""
+    try:
+        base = Path(_pane_ledger_path()).parent / "work" / "integrate"
+        out = []
+        if not base.is_dir():
+            return out
+        for repo_dir in sorted(base.iterdir()):
+            if not repo_dir.is_dir():
+                continue
+            if repo_dir.name.startswith("branch-t-"):
+                # stale remnants of the deleted integration gate (ec7e9c5)
+                continue
+            bundles = sorted(p.name for p in repo_dir.glob("bundle-v*.git") if p.is_dir() or p.is_file())
+            worktrees = sorted(p.name for p in repo_dir.glob("worktree-v*") if p.is_dir())
+            out.append({"repo_id": repo_dir.name, "bundles": bundles, "worktrees": worktrees})
+        return out
+    except Exception:
+        return []
+
+
+def _pane_lists_snapshot(conn=None):
+    """Read repos + tasks from the local ledger for the pane sidecar.
+
+    Mirrors the shapes produced by ``fetch_repo_list`` / ``fetch_task_list``
+    but performs no authz/freeze checks and never raises — the pane is a
+    read-only dashboard, not a command path. When ``conn`` is None, reads
+    the maintainer ledger via ``_pane_read_conn()``. On any problem returns
+    ``{"repos": [], "tasks": [], "lists_error": str(exc)[:200]}``; zero pools
+    with no error adds a ``lists_warning``.
+    """
+    own_conn = False
+    try:
+        try:
+            from . import ledger as L
+        except ImportError:
+            import ledger as L
+        if conn is None:
+            conn = _pane_read_conn()
+            own_conn = True
+        pools = L.list_local_pools(conn)
+        repos, tasks = [], []
+        for pool_id in pools:
+            for r in L.list_repos(conn, pool_id):
+                available = [dict(t) for t in L.list_tickets(
+                    conn, pool_id=pool_id, state="open", repo_id=r["repo_id"])]
+                repos.append({
+                    "repo_id": r["repo_id"], "pool_id": r["pool_id"],
+                    "display_name": r["display_name"], "name": r["name"],
+                    "accepted_version": r["accepted_version"],
+                    "available_tasks": [
+                        {"ticket_id": t["ticket_id"], "title": t["title"],
+                         "claimed": False,
+                         "claimant_key_id": t.get("claimant_key_id")}
+                        for t in available],
+                    "open_tickets": r["open_tickets"],
+                    "claimed_tickets": r["claimed_tickets"],
+                    "total_tickets": r["total_tickets"],
+                })
+            rows = [dict(t) for t in L.list_tickets(conn, pool_id=pool_id, state="open")]
+            rows += [dict(t) for t in L.list_tickets(conn, pool_id=pool_id, state="claimed")]
+            rows += [dict(t) for t in L.list_tickets(conn, pool_id=pool_id, state="completed")]
+            tasks += [{"ticket_id": t["ticket_id"], "title": t["title"],
+                       "repo_id": t["repo_id"], "state": t["state"],
+                       "claimed": t["state"] == "claimed",
+                       "claimant_key_id": t.get("claimant_key_id"),
+                       "pool_id": pool_id}
+                      for t in rows]
+        result = {"repos": repos, "tasks": tasks,
+                  "worktrees": _pane_worktrees()}
+        if not pools:
+            result["lists_warning"] = "no pools visible in the pane ledger"
+        return result
+    except Exception as exc:
+        logger.warning("pane lists snapshot failed: %s", exc)
+        return {"repos": [], "tasks": [], "worktrees": [],
+                "lists_error": str(exc)[:200]}
+    finally:
+        if own_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _pane_state_computed():
+    """Live computed pane state: ops log from the sidecar (agent-written,
+    historical); every piece of STATE computed fresh per request. Never
+    raises."""
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    iso = now.isoformat()
+    at_ms = int(now.timestamp() * 1000)
+    sidecar = _pane_state_read()
+    try:
+        pool_status = _status_snapshot(None)
+    except Exception as exc:
+        pool_status = {"ok": False, "error": str(exc)[:200]}
+    try:
+        pool_status["tor"] = _tor_status_block(None)
+    except Exception:
+        pass
+    state = {"ops": sidecar.get("ops", []),
+             "pool_status": pool_status,
+             "updated_at": iso,
+             "at": at_ms}
+    state.update(_pane_lists_snapshot())
+    return state
+
+
 _POOL_REPORT_USAGE_SCHEMA = {
     "name": "pool_report_usage",
     "description": ("Record agent-reported usage (turns/tokens/seconds) on a "
@@ -941,8 +1101,11 @@ def _pool_pane_report(args=None, **kwargs):
             pool_status = _status_snapshot(ctx)
         except Exception:
             pool_status = state.get("pool_status") or {}
+        lists = _pane_lists_snapshot()
         new_state = {"ops": ops, "pool_status": pool_status,
-                     "updated_at": now}
+                     "updated_at": now,
+                     "at": int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)}
+        new_state.update(lists)
         path = _pane_state_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(new_state))

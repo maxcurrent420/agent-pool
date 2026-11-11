@@ -15,6 +15,12 @@
       "fields": ["gateway", "repoId", "path", "version", "maintainerGateway"]
     },
     {
+      "kind": "add-task",
+      "commands": ["/task_add"],
+      "script": null,
+      "fields": ["gateway", "repoId", "title", "brief", "poolId"]
+    },
+    {
       "kind": "fetch-tasks",
       "commands": ["/fetch repo list", "/fetch task list"],
       "script": null,
@@ -43,6 +49,12 @@
       "commands": [],
       "script": "scripts/pool-approve.py",
       "fields": ["gateway", "repoId", "version", "ticketId", "deny"]
+    },
+    {
+      "kind": "audit-show",
+      "commands": ["/audit show"],
+      "script": null,
+      "fields": ["gateway", "ticketId"]
     },
     {
       "kind": "merge",

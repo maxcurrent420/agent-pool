@@ -56,6 +56,13 @@ ALLOWLIST = (
     ("propagation.py", "``work/integrate/<repo>``), else the default"),
     ("propagation.py", "``<plugin-data>/work/integrate/<repo_id>`` under the ledger DB's"),
     ("propagation.py", 'return default_db_path().parent / "work" / "integrate" / str(repo_id)'),
+    # Pane read path enumerates the plugin's own work/integrate/<repo>
+    # bundle/worktree records (same canonical checkout dir as above).
+    ("__init__.py", 'base = Path(_pane_ledger_path()).parent / "work" / "integrate"'),
+    ("__init__.py", '"""Enumerate work/integrate/<repo_id>/ under the pane ledger'),
+    ("__init__.py", 'bundles/worktrees, local Tor'),
+    ("__init__.py", 'work/integrate bundles/worktrees'),
+    ("__init__.py", 'repo_versions manifests, work/integrate'),
 )
 
 

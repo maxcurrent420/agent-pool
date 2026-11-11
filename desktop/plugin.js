@@ -1,7 +1,7 @@
 // Agent Pool — Hermes Desktop plugin ("Pool Console").
 //
-// The console lives on its own full page at /agent-pool (sidebar row: Agent
-// Pool). The desktop host loads this file UNCOMPILED,
+// The console lives on its own full page at /agent-pool, reachable from the left
+// sidebar nav row (no right-dock pane). The desktop host loads this file UNCOMPILED,
 // so there is no JSX syntax here — every element is built with jsx()/jsxs()
 // from 'react/jsx-runtime'.
 //
@@ -37,10 +37,10 @@ function str(v) {
 // and the pool_pane_report sidecar (read via ctx.rest('/pane-state')).
 //
 // Op kinds: {add-repo-owner, add-repo-link, fetch-tasks, claim, pull, push,
-// approve, merge, discover}. Older builds wrote 'add-repo' — migrateOps() upgrades
+// approve, merge}. Older builds wrote 'add-repo' — migrateOps() upgrades
 // those records in place so prior ops survive.
 
-export const OP_KINDS = ['add-repo-owner', 'add-repo-link', 'fetch-tasks', 'claim', 'pull', 'push', 'approve', 'merge', 'discover']
+export const OP_KINDS = ['add-repo-owner', 'add-repo-link', 'add-task', 'fetch-tasks', 'claim', 'pull', 'push', 'approve', 'merge', 'prune']
 
 export const OPS_KEY = 'ops'
 export const OPS_KEEP = 200
@@ -81,10 +81,12 @@ export function isActiveStatus(status) {
 // --- sidecar parsing (defensive: empty/missing never throws) ----------------
 
 export function parsePaneState(raw) {
-  const empty = { poolStatus: null, tasks: null, claims: null, discovered: null, awaitingApproval: [], budgets: [], at: null, substeps: null, opReplies: {} }
+  const empty = { poolStatus: null, tasks: null, claims: null, discovered: null, awaitingApproval: [], budgets: [], at: null, substeps: null, opReplies: {}, listsError: null, listsWarning: null, worktrees: null, tor: null, raw: null }
   if (!raw || typeof raw !== 'object') return empty
   const ps = raw.pool_status || raw.poolStatus || raw.status || null
-  const parsed = { ...empty, at: typeof raw.at === 'number' ? raw.at : (typeof raw.updated_at === 'number' ? raw.updated_at : Date.now()) }
+  const iso = typeof raw.updated_at === 'string' ? Date.parse(raw.updated_at) : NaN
+  const at = Number.isFinite(iso) ? iso : (typeof raw.at === 'number' && Number.isFinite(raw.at) ? raw.at : null)
+  const parsed = { ...empty, at }
   if (ps && typeof ps === 'object') {
     parsed.poolStatus = ps
     parsed.awaitingApproval = extractAwaitingApproval(ps)
@@ -92,13 +94,11 @@ export function parsePaneState(raw) {
   }
   const tasks = raw.tasks || raw.task_list || null
   if (tasks) parsed.tasks = tasks
+  const repos = raw.repos || raw.repo_list || null
+  if (repos) parsed.repos = repos
   const claims = raw.claims || null
   if (claims) parsed.claims = claims
-  // Free-form discovery reply (agent-enumerated git repos). Accept either a
-  // pre-split list or a raw detail string; the refresh loop stores it under
-  // snapshot.discovered.
-  const discovered = raw.discovered || raw.discovery || raw.detail || null
-  if (discovered) parsed.discovered = discovered
+  // (No 'discovered' handling: the discover op and snapshot.discovered are gone.)
   // Sub-step progress reported by the sidecar (e.g. link flow:
   // substeps: ['build bundle', 'deliver']). A flat string list.
   const substeps = raw.substeps || raw.sub_steps || null
@@ -130,6 +130,11 @@ export function parsePaneState(raw) {
   parsed.opReplies = opReplies
   const worktreePath = raw.worktree_path || raw.worktreePath || null
   if (worktreePath) parsed.worktreePath = str(worktreePath)
+  if (raw.lists_error) parsed.listsError = str(raw.lists_error)
+  if (raw.lists_warning) parsed.listsWarning = str(raw.lists_warning)
+  if (Array.isArray(raw.worktrees)) parsed.worktrees = raw.worktrees
+  if (ps && typeof ps === 'object' && ps.tor && typeof ps.tor === 'object') parsed.tor = ps.tor
+  if (raw.error) parsed.error = str(raw.error)
   return parsed
 }
 
@@ -281,6 +286,12 @@ export function summarizeOp(op, snapshotLookup) {
     const version = args.version != null ? args.version : (hit && hit.version != null ? hit.version : null)
     parts.push(version != null ? `${name} v${str(version)}` : name)
   }
+  // add-task ops carry a structured payload: show the title (and pool) so the
+  // row reads like a sentence instead of raw ids.
+  if (op.kind === 'add-task') {
+    if (args.title != null && str(args.title) !== 'none') parts.push(`"${str(args.title)}"`)
+    if (args.poolId != null && str(args.poolId) !== 'none') parts.push(`pool ${str(args.poolId)}`)
+  }
   const ticketId = args.ticketId ?? args.ticket ?? args.key ?? null
   if (ticketId != null && str(ticketId) !== 'none') {
     const hit = tasks.find(t => t && typeof t === 'object' && str(t.ticket_id ?? t.ticket ?? t.id ?? '') === str(ticketId))
@@ -297,27 +308,11 @@ export function summarizeOp(op, snapshotLookup) {
   return parts.join(' · ')
 }
 
-// retryLegality(op): which retry action (if any) a row may offer.
-//   {push, failed}                → 'deliver'  (grant is not consumed by deliver)
-//   any op failed 'composer unreachable' → 'resubmit' (re-submits op.text verbatim)
-//   refused / anything else       → null (a plugin refusal is not transient)
-export function retryLegality(op) {
-  if (!op || typeof op !== 'object') return null
-  if (op.status === 'refused') return null
-  if (op.status !== 'failed') return null
-  const err = str(op.error || '')
-  const sub = str((op.args && op.args.substatus) || '')
-  if (/composer unreachable/i.test(err)) return 'resubmit'
-  if (op.kind === 'push') return 'deliver'
-  if (/deliver/i.test(err) || /deliver/i.test(sub)) return 'deliver'
-  return null
-}
-
 // --- ctx.storage snapshot schema (defensive: malformed reads return []) -----
 // Every snapshot lives under a 'snapshot.*' key as { at: <ms>, items: [...] }.
-// Snapshots are a cache of what the agent last reported — never a source of
-// truth, never written by the pane except as a timestamped slot.
-export const SNAPSHOT_KEYS = ['snapshot.repos', 'snapshot.tasks', 'snapshot.claims', 'snapshot.discovered', 'snapshot.poolStatus', 'snapshot.gateways']
+// Snapshots are a cache of the plugin's local read of its own state — never a
+// source of truth, rewritten on every /pane-state refresh.
+export const SNAPSHOT_KEYS = ['snapshot.repos', 'snapshot.tasks', 'snapshot.claims', 'snapshot.poolStatus', 'snapshot.gateways']
 
 // readSnapshot(ctx, key): returns the snapshot's items array, or [] on
 // anything malformed (missing key, wrong shape, non-array items). Never throws.
@@ -392,42 +387,6 @@ function useSnapshotLoading(name) {
     return () => { loadingState.listeners.delete(listener) }
   }, [name])
   return name ? snapshotLoading(name) : false
-}
-
-// One literal prompt asking the agent to enumerate local git repositories.
-// This instructs the AGENT — the pane itself never touches the filesystem.
-// Discovery is outside the slash-command manifest parity set on purpose: it
-// names no plugin command.
-export function discoverReposPrompt() {
-  return 'Discover local git repositories for the pool console: run `git -C ~/Documents rev-parse --is-inside-work-tree` style discovery — list the git repositories under ~/Documents and ~/projects with their absolute paths (one per line, format: <path> — <first remote or directory name>). Do not open, read, or modify any files inside them; just enumerate the worktrees. Reply with the list.'
-}
-
-// One click, four data sources, still one literal prompt.
-export const FULL_REFRESH_PROMPT = 'Report pool status and lists now: run pool_status, run /fetch repo list, run /fetch task list, and call pool_pane_report with all the results (pool_status, repo list, task list).'
-
-// refreshSnapshot(ctx, sessionId, name, gateway): submit the refresh prompt
-// for one snapshot via the composer. 'discover' is tracked as an op of kind
-// 'discover'; other names ride the plain refresh path. Returns the submit
-// result (or null for unknown names / static snapshots like gateways).
-export function refreshSnapshot(ctx, sessionId, name, gateway) {
-  const gw = gateway || 'default'
-  const prompts = {
-    repos: fetchRepoListPrompt({ gateway: gw }),
-    tasks: fetchTaskListPrompt({ gateway: gw }),
-    poolStatus: BATCHED_STATUS_PROMPT,
-    full: FULL_REFRESH_PROMPT,
-    discovered: discoverReposPrompt()
-  }
-  const text = prompts[name]
-  if (!text) return Promise.resolve(null)
-  const flagNames = name === 'full' ? ['full', 'repos', 'tasks', 'poolStatus'] : [name]
-  for (const flag of flagNames) setSnapshotLoading(flag, true)
-  const clear = () => { for (const flag of flagNames) setSnapshotLoading(flag, false) }
-  if (name === 'discovered') {
-    return submitOp(ctx, sessionId, { kind: 'discover', gateway: gw, args: { snapshot: 'snapshot.discovered' }, text })
-      .then(result => { if (!result || result.status === 'failed') clear(); return result })
-  }
-  return Promise.resolve(host.composer.submit(sessionId, text)).then(ok => { if (!ok) clear(); return ok })
 }
 
 // --- SnapshotSelect support (pure option builders; testable without a renderer)
@@ -539,87 +498,111 @@ export function optionsFor(snapshot, kind, allowManual = true) {
   )
 }
 
-// The one batched UI→agent prompt used for the initial/fallback refresh.
-export const BATCHED_STATUS_PROMPT = 'Report pool status now: run pool_status and /fetch repo list, call pool_pane_report with the results.'
-
-// Audit view prompt (composed, submitted through the composer like any op).
-export function auditShowPrompt(gateway, ticketId) {
-  const t = (ticketId || '').trim()
-  return `Using the ${gateway} gateway profile: run /audit show${t ? ` ${t}` : ''} and report the result verbatim.`
-}
-
 // --- inlined from prompts.js (runtime import allowlist: no relative imports) ---
-// Agent Pool — prompt builders for the desktop pane.
-//
-// Pure functions, no SDK import: each builder turns form state into the exact
-// prompt text the pane submits to the bound agent session. Every prompt
-// names the gateway profile, carries the literal slash command or script
-// invocation with the form's fields as args, and asks the agent to return
-// the plugin's reply verbatim. The pane never free-hands an operation.
-
-function replySuffix() {
-  return 'Return the plugin\'s reply verbatim.'
-}
+// --- prompt companions (copied to the clipboard; never submitted by the pane) ---
+// The pane never sends anything through a chat composer. Each builder below
+// produces the exact text the operator pastes to their Desktop agent in chat;
+// the agent executes per the agent-pool skill and replies in chat. Every
+// prompt names the gateway profile (when a gateway command is involved),
+// carries the literal command, and ends by asking for a verbatim report.
+// <gateway> is the pane's Maintainer/Contributor selector value.
 
 export function addRepoOwnerPrompt({ gateway, repoId, path, version }) {
-  const versionFlag = version ? ` --version ${version}` : ''
-  return `On the ${gateway} gateway, register this repo in the pool and ingest it as a new version: run /add-repo ${repoId} --path ${path}${versionFlag}. If the user did not supply a version and the pool already has accepted versions, first ask the maintainer gateway /fetch repo ${repoId} for accepted_version and use the next one. ${replySuffix()}`
+  const v = version != null && version !== '' ? ` --version ${version}` : ''
+  return `Add the local checkout ${path} to the agent pool as repo ${repoId}: on the ${gateway} gateway run /add-repo ${repoId} --path ${path}${v}. If the pool already has accepted versions, first run /fetch repo ${repoId} to get accepted_version and pass --version <next>. Report the plugin's reply verbatim.`
 }
 
-export function addRepoLinkPrompt({ gateway, repoId, path, version, maintainerGateway }) {
-  const versionFlag = version ? ` --version ${version}` : ''
-  const target = maintainerGateway || 'the designated pool maintainer'
-  return `On the ${gateway} gateway, link this repo into a designated pool (two steps, one tracked operation): (1) run scripts/contributor-add.py ${path} --repo ${repoId}${versionFlag} and capture the printed manifest_json and transfer_ticket; (2) send /add-repo --deliver <transfer_ticket> --manifest '<manifest_json>' --repo ${repoId} to ${target}'s bot. Do not use remote URLs — local paths only. ${replySuffix()}`
+export function addRepoLinkPrompt({ gateway, repoId, path }) {
+  return `Contribute my local checkout ${path} to the maintainer's pool as repo ${repoId}: (1) run scripts/contributor-add.py ${path} --repo ${repoId} to mint a signed manifest and Tor transfer ticket; (2) post into the shared Discord channel, mention-first, manifest single-quoted: <@<maintainer_bot_id>> /add-repo --deliver <transfer_ticket> --manifest '<manifest_json>' --repo ${repoId}. Local paths only — never a remote URL. Report the replies verbatim.`
 }
 
 export function fetchRepoListPrompt({ gateway }) {
-  return `On the ${gateway} gateway, list the pools and repos: run /fetch repo list. ${replySuffix()}`
+  return `On the ${gateway} gateway run /fetch repo list. Report the table verbatim.`
 }
 
 export function fetchTaskListPrompt({ gateway, repoId }) {
   const filter = repoId ? ` --repo ${repoId}` : ''
-  return `On the ${gateway} gateway, bootstrap the catalog and list tasks: run /fetch repo list, then run /fetch task list${filter}. Reply with the task table. ${replySuffix()}`
+  return `On the ${gateway} gateway run /fetch repo list, then /fetch task list${filter}. Report both tables verbatim so I can paste them or so the pane's Refresh can pick up the sidecar.`
 }
 
-export function claimPrompt({ gateway, ticketId, maxTasks }) {
+// 'add-task' companion: the /task_add flat alias (never the spaced
+// task-add subcommand, whose add-branch handler drops --pool). The gateway
+// parses with shlex, so values are JSON.stringify'd.
+export function taskAddPrompt({ gateway, repoId, title, brief, poolId }) {
+  const q = s => JSON.stringify(String(s))
+  const r = repoId ? str(repoId).trim() : '<repo_id>'
+  const t = title ? String(title) : '<title>'
+  const parts = [`--repo ${r}`, `--title ${q(t)}`]
+  if (brief && String(brief).trim()) parts.push(`--brief ${q(brief)}`)
+  if (poolId && String(poolId).trim()) parts.push(`--pool ${String(poolId).trim()}`)
+  return `Open a pool ticket on repo ${r}: run /task_add ${parts.join(' ')} (use the flat alias task_add — the spaced \`task add\` drops --pool). Report the new ticket_id verbatim.`
+}
+
+// 'prune' companion: enumerate, classify, print the list, delete only stale.
+export function prunePrompt({ gateway }) {
+  return `Prune stale agent-pool worktrees under ~/.hermes/plugin-data/agent-pool/work/integrate/. Step 1: enumerate every directory and gate-t-*.json file there. Step 2: classify — KEEP: every bundle-v*.git whose version is accepted in the ledger, every worktree tied to an open/claimed ticket, and anything you cannot positively classify as stale. STALE (the only things you may delete): branch-t-* directories and gate-t-*.json files with no matching live ticket. Step 3: print the full keep/delete list with counts before deleting anything. Step 4: delete ONLY the stale candidates. Touch nothing else. Report the before/after listing and the exact commands you ran.`
+}
+
+export function claimPrompt({ gateway, ticketId, maxTasks, dest }) {
+  const destRef = dest && String(dest).trim() ? String(dest).trim() : '<work dir>'
   if (maxTasks && !ticketId) {
-    return `On the ${gateway} gateway, auto-assign work: run /claim --any-project --max-tasks ${maxTasks}. Save the reply's worktree_path, branch (pool/<ticket_id>), base_ref and budget into the reply text so the pane can record them. ${replySuffix()}`
+    return `Claim pool tickets (auto-assign): on the ${gateway} gateway run /claim --any-project --max-tasks ${maxTasks}. The reply carries worktree_path, branch (pool/<ticket_id>), base_ref and budget. Then run scripts/contributor-claim.py <ticket_id> --reply-file <saved reply.json> --dest <work dir> to fetch the accepted bytes and clone the worktree. Report the worktree path and branch verbatim.`
   }
-  return `On the ${gateway} gateway, claim this ticket: run /claim ${ticketId}. Save the reply's worktree_path, branch (pool/${ticketId}), base_ref and budget into the reply text so the pane can record them. ${replySuffix()}`
+  return `Claim pool ticket ${ticketId}: on the ${gateway} gateway run /claim ${ticketId}. The reply carries worktree_path, branch (pool/${ticketId}), base_ref and budget. Then run scripts/contributor-claim.py ${ticketId} --reply-file <saved reply.json> --dest ${destRef} to fetch the accepted bytes and clone the worktree. Report the worktree path and branch verbatim.`
 }
 
 export function pullPrompt({ gateway, repoId, ticketId, replyFile, dest }) {
   const ticket = ticketId || repoId
   const replyRef = replyFile ? ` --reply-file ${replyFile}` : ' --reply-file <saved claim reply json>'
   const destRef = dest || '<destination dir>'
-  return `On the ${gateway} gateway, fetch the accepted bytes for ticket ${ticket} into a worktree: run scripts/contributor-claim.py ${ticket}${replyRef} --dest ${destRef}. Show the resulting worktree_path and branch. ${replySuffix()}`
+  return `On the ${gateway} gateway, fetch the accepted bytes for ticket ${ticket} into a worktree: run scripts/contributor-claim.py ${ticket}${replyRef} --dest ${destRef}. Report the worktree path and branch verbatim.`
 }
 
-export function pushGrantPrompt({ gateway, repoId, ticketId }) {
-  return `On the ${gateway} gateway, request a push grant: run /push repo ${repoId} --ticket ${ticketId}. Return the grant token verbatim. ${replySuffix()}`
-}
-
-export function pushPackagePrompt({ gateway, worktreePath, repoId, poolId, version }) {
-  return `On the ${gateway} gateway, package the completed work: run scripts/contributor-push.py ${worktreePath} --repo ${repoId} --pool ${poolId} --version ${version}. Take next_version from the grant reply or re-ask /fetch repo ${repoId} for accepted_version; never trust enroll-time chain_tips. ${replySuffix()}`
-}
-
-export function pushDeliverPrompt({ gateway, repoId, version, ticketJson, transferTicket, grantToken }) {
-  const tokenFlag = grantToken ? ` --token ${grantToken}` : ' --token <grant_token>'
-  return `On the ${gateway} gateway, deliver the packaged repo ${repoId} version ${version}: run /push repo --deliver ${transferTicket}${tokenFlag} --manifest '${ticketJson}'. Note: a redelivery is legal — the grant is not consumed by deliver — so offer "Retry deliver" on transport failure. ${replySuffix()}`
+export function pushPrompt({ gateway, repoId, ticketId, worktreePath, poolId, version }) {
+  const v = version != null && version !== '' ? version : '<N>'
+  return `Push the completed work for ticket ${ticketId || '<ticket_id>'} on repo ${repoId || '<repo_id>'}, pool ${poolId || '<pool_id>'}: (1) request a grant: /push repo ${repoId || '<repo_id>'} --ticket ${ticketId || '<ticket_id>'}; (2) package the worktree ${worktreePath || '<worktree_path>'}: scripts/contributor-push.py ${worktreePath || '<worktree_path>'} --repo ${repoId || '<repo_id>'} --pool ${poolId || '<pool_id>'} --version ${v} — take next_version from the grant reply or re-ask /fetch repo ${repoId || '<repo_id>'} for accepted_version; never trust enroll-time chain_tips; (3) deliver: /push repo --deliver <transfer_ticket> --token <grant_token> --manifest '<manifest_json>'. A redelivery is legal — the grant is not consumed by deliver. Report each step's reply verbatim.`
 }
 
 export function approvePrompt({ gateway, repoId, version, ticketId, deny }) {
   const denyFlag = deny ? ' --deny' : ''
-  const target = ticketId
-    ? `--ticket ${ticketId}`
-    : `--repo ${repoId}${version ? ` --version ${version}` : ''}`
-  return `On the ${gateway} gateway, OWNER ONLY: run scripts/pool-approve.py ${target}${denyFlag}. If the plugin refuses because this profile is not the pool owner, report the refusal verbatim and do not retry. ${replySuffix()}`
+  if (ticketId) {
+    return `OWNER ONLY: accept the pushed claim for ticket ${ticketId}: run scripts/pool-approve.py --ticket ${ticketId}${denyFlag}. If the plugin refuses because this profile is not the pool owner, report the refusal verbatim and do not retry. Report the plugin's reply verbatim.`
+  }
+  const r = repoId || '<repo_id>'
+  const vFlag = version != null && version !== '' ? ` --version ${version}` : ''
+  const vText = version != null && version !== '' ? ` (version ${version})` : ''
+  return `OWNER ONLY: accept the submitted version for repo ${r}${vText}: run scripts/pool-approve.py --repo ${r}${vFlag}${denyFlag}. If the plugin refuses because this profile is not the pool owner, report the refusal verbatim and do not retry. Report the plugin's reply verbatim.`
 }
 
-export function mergePrompt({ gateway, repoId, ticketId, checkoutPath }) {
-  const target = ticketId ? `ticket ${ticketId}` : `repo ${repoId}`
-  const dest = checkoutPath || `work/integrate/${repoId}/`
-  return `On the ${gateway} gateway, OWNER ONLY: merge the approved bundle for ${target}: the plugin never merges — run the merge yourself. git fetch <approved bundle> and git merge it into the canonical checkout at ${dest}. Where the maintainer flow calls the merge_approved service path (tickets.py:2249), do it through the plugin's documented flow, never a side import. If the audit is not clean, there is no accepted bundle for the version, or the plugin refuses because this profile is not the pool owner, report the refusal/failure verbatim and do not retry. ${replySuffix()}`
+export function mergePrompt({ gateway, repoId, ticketId, checkoutPath, version }) {
+  const repo = repoId || '<repo_id>'
+  const dest = checkoutPath || `work/integrate/${repo}/`
+  const n = version != null && version !== '' ? version : '<N>'
+  const target = ticketId ? `pushed claim ${ticketId}` : `repo ${repo}`
+  return `OWNER ONLY: merge the approved bundle for ${target} into the canonical checkout at ${dest} — the plugin never merges, so do it as your own git work: git -C ${dest} fetch <bundle> 'refs/heads/master:refs/accepted/${repo}-v${n}' then git -C ${dest} merge --no-ff --allow-unrelated-histories refs/accepted/${repo}-v${n}. (Unrelated histories are normal for a fresh pool root; identical content is a correct no-op.) If the audit is not clean or no accepted bundle exists, report verbatim and stop.`
+}
+
+// Read-only audit companion.
+export function auditShowPrompt(gateway, ticketId) {
+  const t = (ticketId || '').trim()
+  return `Read-only: on the ${gateway} gateway run /audit show${t ? ` ${t}` : ''} and report the result verbatim. No approval implied.`
+}
+
+// PROMPT_ACTIONS: the surface manifest — one entry per removed op. Tests pin
+// this so skill and UI cannot diverge silently.
+export const PROMPT_ACTIONS = {
+  'add-repo-owner': { label: 'Add repo', builder: addRepoOwnerPrompt, where: 'repo-row / repos-empty-state' },
+  'add-repo-link': { label: 'Contribute repo', builder: addRepoLinkPrompt, where: 'page-header / repos' },
+  'fetch-tasks': { label: 'Fetch the catalog', builder: fetchTaskListPrompt, where: 'tasks-empty-state' },
+  'claim': { label: 'Claim ticket', builder: claimPrompt, where: 'task-row' },
+  'claim-auto': { label: 'Auto-assign tickets', builder: claimPrompt, where: 'claims' },
+  'push': { label: 'Push work', builder: pushPrompt, where: 'claims-tab / worktree' },
+  'approve': { label: 'Copy approve prompt', builder: approvePrompt, where: 'awaiting-tab' },
+  'deny': { label: 'Copy deny prompt', builder: approvePrompt, where: 'awaiting-tab' },
+  'merge': { label: 'Copy merge prompt', builder: mergePrompt, where: 'awaiting-tab' },
+  'prune': { label: 'Prune stale worktrees', builder: prunePrompt, where: 'worktrees-card' },
+  'audit-show': { label: 'Copy audit prompt', builder: auditShowPrompt, where: 'audit-tab' },
+  'add-task': { label: 'Ask your agent to open a ticket', builder: taskAddPrompt, where: 'tasks-header' }
 }
 
 // Contribution ids are namespaced by the host as '<plugin id>:<local id>'.
@@ -650,7 +633,6 @@ const DISPLAY_COMPACT_KEY = 'display.compact'
 const STORAGE_KEYS = {
   gateway: 'gateways.active',
   polling: 'display.polling',
-  tor: 'status.tor',
   highlighted: 'ops.highlighted',
   collapsed: id => `display.collapsed.${id}`
 }
@@ -659,17 +641,15 @@ const STORAGE_KEYS = {
 // register time so it survives close/reopen of the pane.
 export const poolPaneStore = {
   gateway: 'default',
-  polling: false,
-  tor: null,
+  polling: true,
   highlight: null,
   collapsed: {}
 }
 
 function hydratePaneStore(storage) {
   poolPaneStore.gateway = storage.get(STORAGE_KEYS.gateway, 'default')
-  // Default OFF; respect whatever the user last persisted.
-  poolPaneStore.polling = Boolean(storage.get(STORAGE_KEYS.polling, false))
-  poolPaneStore.tor = storage.get(STORAGE_KEYS.tor, null)
+  // Polling defaults ON; respect whatever the user last persisted.
+  poolPaneStore.polling = Boolean(storage.get(STORAGE_KEYS.polling, true))
   poolPaneStore.highlight = storage.get(STORAGE_KEYS.highlighted, null)
   // Migrate any pre-Task-8 op records (e.g. kind 'add-repo') in place.
   const { ops, changed } = migrateOps(storage.get(OPS_KEY, []))
@@ -684,49 +664,113 @@ function hydratePaneStore(storage) {
 
 // Notify the user of an op result and persist which op is highlighted.
 function notifyOp(ctx, kind, message, detail) {
+  // The host SDK types notification detail as string; an object detail is put
+  // straight into a React child by the toast renderer and crashes the whole
+  // renderer (React #31, toasts live outside the pane's error boundary).
+  // Coerce defensively so a future call site can never re-crash the app.
+  const detailText = typeof detail === 'string' ? detail : detail != null ? str(detail) : undefined
   host.notify({
     title: kind,
     message,
-    detail,
+    detail: detailText,
     kind: kind === 'failed' || kind === 'refused' ? 'error' : 'info'
   })
-  if (detail != null && typeof detail === 'object' && detail.id != null) {
-    poolPaneStore.highlight = detail.id
-    ctx.storage.set(STORAGE_KEYS.highlighted, detail.id)
+  // Keep the row-highlight behaviour: object details carry {id}; string
+  // details that are op ids highlight that op directly.
+  const highlightId = detail != null && typeof detail === 'object' && detail.id != null
+    ? detail.id
+    : typeof detail === 'string' && /^op-/.test(detail) ? detail : null
+  if (highlightId != null) {
+    poolPaneStore.highlight = highlightId
+    ctx.storage.set(STORAGE_KEYS.highlighted, highlightId)
   }
 }
 
-// Build, submit and track one operation. On a falsy composer result the op is
-// marked failed and nothing is recorded as sent; on success it is appended to
-// ctx.storage['ops'] (last 200, newest first) as 'awaiting agent'. Status
-// transitions beyond that arrive with the Task 8 refresh loop.
-export async function submitOp(ctx, sessionId, op) {
-  const record = {
-    id: op.id || `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: normalizeKind(op.kind),
-    gateway: op.gateway,
-    args: op.args || {},
-    status: 'submitted',
-    at: Date.now(),
-    replyRef: null,
-    text: op.text != null ? str(op.text) : ''
+// copyText(ctx, text): write to the system clipboard via the host-curated OS
+// door (ctx.os.writeClipboard — desktop-plugin-sdk.md: ctx.os.writeClipboard).
+// Resolves false (never throws) on hosts without the capability; the toast
+// says so instead of dying silently.
+export async function copyText(ctx, text) {
+  let ok = false
+  try {
+    ok = Boolean(await ctx.os.writeClipboard(text))
+  } catch {
+    ok = false
   }
+  notifyOp(ctx, 'info', ok
+    ? 'Prompt copied — paste it to your Hermes agent'
+    : 'Clipboard unavailable on this host — open the details fold and copy the prompt manually')
+  return ok
+}
 
-  const ok = await host.composer.submit(sessionId, op.text)
+// Action ids whose copied prompt leads to an agent reply with a home in the
+// history panel. EVERY companion copy appends a read-only status:'copied'
+// record — never 'submitted' or 'awaiting agent'; the pane never submits.
+const COPIED_RECORD_ACTIONS = { 'add-repo-owner': 'add-repo-owner', 'add-repo-link': 'add-repo-link', 'add-task': 'add-task', 'fetch-tasks': 'fetch-tasks', 'claim': 'claim', 'claim-auto': 'claim', 'pull': 'pull', 'push': 'push', 'approve': 'approve', 'deny': 'approve', 'merge': 'merge', 'prune': 'prune', 'audit-show': 'audit-show' }
 
-  if (!ok) {
-    record.status = 'failed'
-    record.error = 'composer unreachable'
-    notifyOp(ctx, 'failed', 'composer unreachable', { id: record.id })
+// copyPrompt(ctx, actionId, args): build the companion prompt via PROMPT_ACTIONS,
+// copy it, toast, and (for approve/deny/push/prune) append a 'copied' op record.
+export async function copyPrompt(ctx, actionId, args) {
+  const action = PROMPT_ACTIONS[actionId]
+  if (!action) return null
+  const a = args || {}
+  const gateway = a.gateway || poolPaneStore.gateway
+  let text = ''
+  try {
+    if (actionId === 'audit-show') text = auditShowPrompt(gateway, a.ticketId)
+    else if (actionId === 'deny') text = approvePrompt({ ...a, gateway, deny: true })
+    else text = action.builder({ gateway, ...a })
+  } catch {
+    text = ''
+  }
+  if (!text) {
+    notifyOp(ctx, 'failed', 'Could not compose the prompt')
+    return null
+  }
+  await copyText(ctx, text)
+  const kind = COPIED_RECORD_ACTIONS[actionId]
+  if (kind) {
+    const record = {
+      id: `op-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind,
+      gateway,
+      args: { ...a, actionId },
+      status: 'copied',
+      at: Date.now(),
+      replyRef: null,
+      text
+    }
+    const ops = ctx.storage.get(OPS_KEY, [])
+    const next = [record, ...(Array.isArray(ops) ? ops : [])].slice(0, OPS_KEEP)
+    ctx.storage.set(OPS_KEY, next)
     return record
   }
+  return null
+}
 
-  record.status = 'awaiting agent'
-  const ops = ctx.storage.get(OPS_KEY, [])
-  const next = [record, ...(Array.isArray(ops) ? ops : [])].slice(0, OPS_KEEP)
-  ctx.storage.set(OPS_KEY, next)
-  notifyOp(ctx, 'info', `${record.kind} submitted — awaiting agent`, { id: record.id })
-  return record
+// promptForOp(op, gateway): rebuild a companion prompt from a stored op's args
+// (used by "Copy prompt again"); falls back to the stored op.text.
+export function promptForOp(op, gateway) {
+  const a = (op && op.args) || {}
+  const gw = gateway || (op && op.gateway) || poolPaneStore.gateway
+  const fallback = op && op.text ? str(op.text) : ''
+  try {
+    switch (op && op.kind) {
+      case 'add-repo-owner': return addRepoOwnerPrompt({ gateway: gw, repoId: str(a.repoId || '<repo_id>'), path: str(a.path || '<abs_path>'), version: a.version })
+      case 'add-repo-link': return addRepoLinkPrompt({ gateway: gw, repoId: str(a.repoId || '<repo_id>'), path: str(a.path || '<abs_path>') })
+      case 'add-task': return taskAddPrompt({ gateway: gw, repoId: str(a.repoId || '<repo_id>'), title: str(a.title || '<title>'), brief: a.brief, poolId: a.poolId })
+      case 'fetch-tasks': return fetchTaskListPrompt({ gateway: gw, repoId: a.repo || undefined })
+      case 'claim': return a.autoAssign ? claimPrompt({ gateway: gw, maxTasks: a.maxTasks || 1 }) : claimPrompt({ gateway: gw, ticketId: str(a.ticket || a.ticketId || '<ticket_id>') })
+      case 'pull': return pullPrompt({ gateway: gw, ticketId: str(a.ticket || '<ticket_id>'), replyFile: a.replyFile, dest: a.dest })
+      case 'push': return pushPrompt({ gateway: gw, repoId: a.repoId, ticketId: a.ticketId || a.ticket, worktreePath: a.worktreePath, poolId: a.poolId, version: a.version })
+      case 'approve': return approvePrompt({ gateway: gw, repoId: a.repoId, version: a.version, ticketId: a.ticketId || a.ticket, deny: Boolean(a.deny) })
+      case 'merge': return mergePrompt({ gateway: gw, repoId: a.repoId, ticketId: a.ticketId || a.ticket, checkoutPath: a.checkoutPath, version: a.version })
+      case 'prune': return prunePrompt({ gateway: gw })
+      default: return fallback
+    }
+  } catch {
+    return fallback
+  }
 }
 
 const OP_STATUS_PILL = {
@@ -735,7 +779,8 @@ const OP_STATUS_PILL = {
   'done (awaiting approval)': 'done (awaiting approval)',
   done: 'done',
   refused: 'refused',
-  failed: 'failed'
+  failed: 'failed',
+  copied: 'copied'
 }
 
 function opPillClass(status) {
@@ -805,60 +850,24 @@ export function resolveAddRepoSelection({ discoveredId, manualPath, discovered }
   return { path: hit.path, repoId: hit.name || repoNameFromPath(hit.path) }
 }
 
-// --- Task 4: one primary button per flow + confirm gates -------------------
-// The seven primary flows. Exactly one primary button per flow carries one of
-// these labels; everything else is a sub-step or a secondary action.
-export const PRIMARY_BUTTONS = {
-  addRepo: 'Add repo',
-  addRepoLink: 'Contribute repo',
-  discover: 'Discover repos',
-  fetchTasks: 'Fetch tasks',
-  claim: 'Claim',
-  pull: 'Pull repo',
-  push: 'Submit work (push)',
-  approve: 'Approve',
-  deny: 'Deny',
-  merge: 'Merge'
-}
-
-// buildConfirmCard(target, gateway, commandText): pure. The confirm card that
-// stands between the primary button and the submit. `text` names the target in
-// plain words and carries the literal command the prompt will run.
-export function buildConfirmCard(target, gateway, commandText) {
-  const t = str(target)
-  const gw = str(gateway)
-  const cmd = str(commandText)
-  const text = `${t} on gateway \`${gw}\`? This asks the agent to run \`${cmd}\`.`
-  return { target: t, gateway: gw, commandText: cmd, banner: 'OWNER ONLY', text }
-}
-
-// The literal command strings the confirm card shows and the golden tests pin.
-export function approveCommandText({ repoId, version, ticketId, deny } = {}) {
-  const target = ticketId
-    ? `--ticket ${ticketId}`
-    : `--repo ${repoId}${version != null && version !== '' ? ` --version ${version}` : ''}`
-  return `scripts/pool-approve.py ${target}${deny ? ' --deny' : ''}`
-}
-
-export function mergeCommandText({ repoId, ticketId, checkoutPath } = {}) {
-  const target = ticketId ? `ticket ${ticketId}` : `repo ${repoId}`
-  return `git fetch <approved bundle> && git merge into ${checkoutPath || `work/integrate/${repoId}/`} (${target})`
-}
-
-// finalizeOp(draft, confirmState): pure. Returns null unless the operator
-// pressed Confirm — the op can never compose without confirmed === true.
-export function finalizeOp(draft, confirmState) {
-  if (!confirmState || confirmState.confirmed !== true) return null
-  return draft
-}
-
 const inputClass = 'rounded-md px-2 py-1 text-(--ui-text-primary)'
 const labelClass = 'text-(--ui-text-secondary)'
+
+// Shared button classes (theme vars only — no literal colours). Every clickable
+// element gets a border/background so it LOOKS clickable:
+// - Primary: filled — the one main action per form (mirrors TaskTable's Assign).
+// - Secondary: outlined — everything else.
+// - Ghost: bordered pill for small expander/aux controls (chevron carriers).
+// Buttons there hover to --ui-bg-quaternary and focus to a 2px --ui-accent
+// outline, matching the host app's own button contract.
+const btnPrimary = 'inline-flex cursor-pointer items-center gap-1 rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-tertiary) px-3 py-1.5 text-(--ui-text-primary) hover:bg-(--ui-bg-quaternary) focus-visible:outline focus-visible:outline-2 focus-visible:outline-(--ui-accent) disabled:cursor-not-allowed disabled:opacity-50'
+const btnSecondary = 'inline-flex cursor-pointer items-center gap-1 rounded-md border border-(--ui-stroke-tertiary) px-2 py-1 text-(--ui-text-secondary) hover:border-(--ui-stroke-secondary) hover:text-(--ui-text-primary) focus-visible:outline focus-visible:outline-2 focus-visible:outline-(--ui-accent) disabled:cursor-not-allowed disabled:opacity-50'
+const btnGhost = 'inline-flex cursor-pointer items-center gap-1 rounded-md border border-(--ui-stroke-tertiary) bg-transparent px-2 py-0.5 text-(--ui-text-secondary) hover:border-(--ui-stroke-secondary) hover:text-(--ui-text-primary) focus-visible:outline focus-visible:outline-2 focus-visible:outline-(--ui-accent)'
 
 // Reusable snapshot-fed dropdown. Opt-in manual fallback per field per
 // session (never persisted); refresh button disabled while an op of the
 // refresh kind is 'awaiting agent'.
-function SnapshotSelect({ label, items, value, onChange, emptyHint, refreshAction, refreshKind, ops, allowManual, manualPlaceholder, manualValue, onManualChange, selectLabel, resetKey, loadingKey }) {
+function SnapshotSelect({ label, items, value, onChange, emptyHint, allowManual, manualPlaceholder, manualValue, onManualChange, selectLabel, resetKey, loadingKey }) {
   const [manual, setManual] = useState(false)
   const loading = useSnapshotLoading(loadingKey)
   // Flow reset: the manual disclosure is closed by default and un-checks
@@ -866,24 +875,12 @@ function SnapshotSelect({ label, items, value, onChange, emptyHint, refreshActio
   useEffect(() => { setManual(false) }, [resetKey])
   const list = asArray(items)
   const options = buildOptions(list, emptyHint || 'Nothing loaded yet', selectLabel, Boolean(allowManual))
-  const refreshAwaiting = refreshKind
-    ? asArray(ops).some(op => op && op.kind === refreshKind && op.status === 'awaiting agent')
-    : false
   const childNodes = [
     jsxs('div', {
       key: 'row',
       className: 'flex items-center justify-between gap-2',
       children: [
         jsx('span', { className: labelClass, children: label }),
-        refreshAction
-          ? jsx('button', {
-              className: 'rounded-md px-1.5 py-0.5 text-(--ui-text-secondary)',
-              disabled: refreshAwaiting,
-              title: refreshAwaiting ? 'Refresh already awaiting agent' : 'Refresh',
-              onClick: refreshAction,
-              children: '↻'
-            })
-          : null
       ]
     })
   ]
@@ -893,7 +890,7 @@ function SnapshotSelect({ label, items, value, onChange, emptyHint, refreshActio
       className: 'flex items-center gap-1',
       children: [
         jsx('input', { className: inputClass, value: manualValue || '', onChange: e => onManualChange && onManualChange(e.target.value), placeholder: manualPlaceholder || '', autoFocus: true }),
-        jsx('button', { className: 'rounded-md px-2 py-1 text-(--ui-text-secondary)', title: 'Back to the list', onClick: () => setManual(false), children: 'list' })
+        jsx('button', { className: btnGhost, title: 'Back to the list', onClick: () => setManual(false), children: 'list' })
       ]
     }))
   } else if (loading) {
@@ -941,9 +938,7 @@ function snapshotSources(ctx) {
   const claimsRaw = ctx.storage.get('snapshot.claims', null)
   const claims = Array.isArray(claimsRaw) ? claimsRaw : (claimsRaw && Array.isArray(claimsRaw.items) ? claimsRaw.items : [])
   const gateways = readSnapshot(ctx, 'snapshot.gateways')
-  const discRaw = readSnapshot(ctx, 'snapshot.discovered')
-  const discovered = filterDiscovered(discRaw)
-  return { repos, tasks, claims, poolStatus: ps, awaitingApproval: awaiting, gateways, discovered, discoveredRaw: discRaw.length }
+  return { repos, tasks, claims, poolStatus: ps, awaitingApproval: awaiting, gateways }
 }
 
 function snapshotRepos(ctx) {
@@ -957,957 +952,10 @@ function field(label, input) {
   })
 }
 
-function failureHints(items) {
-  return jsxs('div', {
-    className: 'flex flex-col gap-0.5 text-(--ui-text-tertiary)',
-    children: items.map(item => jsx('div', { key: item, children: `• ${item}` }))
-  })
-}
-
-// The two-step confirm gate for owner actions (Approve / Deny / Merge).
-// Shows the plain-words target, the literal command the prompt will carry and
-// the OWNER ONLY banner. The op fires only on Confirm.
-function ConfirmCard({ card, onConfirm, onCancel }) {
-  return jsxs('div', {
-    className: 'flex flex-col gap-2 rounded-md p-2',
-    children: [
-      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: card.banner }),
-      jsx('div', { className: 'text-(--ui-text-primary)', children: str(card.text) }),
-      jsxs('div', {
-        className: 'text-(--ui-text-secondary)',
-        children: [jsx('span', { children: 'command: ' }), jsx('code', { children: str(card.commandText) })]
-      }),
-      jsxs('div', {
-        className: 'flex items-center gap-2',
-        children: [
-          submitButton({ disabled: false, title: undefined, onClick: onConfirm, children: 'Confirm' }),
-          jsx('button', { className: 'rounded-md px-3 py-1.5 text-(--ui-text-secondary)', title: 'Back to the form', onClick: onCancel, children: 'Cancel' })
-        ]
-      })
-    ]
-  })
-}
-
-function submitButton({ disabled, title, children, onClick }) {
-  return jsx('button', {
-    className: 'rounded-md px-3 py-1.5 text-left text-(--ui-text-primary)',
-    disabled,
-    title: disabled ? title : undefined,
-    onClick,
-    children
-  })
-}
-
-// --- form: add repo ---------------------------------------------------------
-
-const ADD_REPO_FAILURES = [
-  'add-repo: --link is not supported (the pane forbids remote URLs — local absolute paths only)',
-  'not authorized for pool <id> (whitelist refusal)',
-  'manifest signature / transport failure',
-  'version too low — pass an explicit --version greater than the tip'
-]
-
-function AddRepoForm({ ctx, sessionId, gateway, noSession, submitTitle, recordOp, ops }) {
-  const snapSrc = snapshotSources(ctx)
-  const discovered = snapSrc.discovered
-  const skipped = Math.max(0, snapSrc.discoveredRaw - discovered.length)
-  const pools = itemsFor({ repos: snapSrc.repos, poolStatus: snapSrc.poolStatus }, 'pools')
-  const gatewayItems = snapSrc.gateways.map(g => ({ id: str(g && g.id), repo: str((g && g.role) || '') }))
-  const discoveredItems = discovered.map(d => ({ id: d.path, title: d.path }))
-  const [mode, setMode] = useState('owner')
-  const [discoveredId, setDiscoveredId] = useState('')
-  const [manualPath, setManualPath] = useState('')
-  const [poolId, setPoolId] = useState('')
-  const [version, setVersion] = useState('')
-  const [maintainerGateway, setMaintainerGateway] = useState('default')
-
-  const selection = resolveAddRepoSelection({ discoveredId, manualPath, discovered })
-  const pathOk = selection !== null
-  const manualPathActive = Boolean(manualPath.trim())
-  const versionOk = !version.trim() || /^\d+$/.test(version.trim())
-  const ready = !noSession && pathOk && versionOk
-  const disabledTitle = noSession
-    ? submitTitle
-    : !pathOk
-      ? (manualPathActive
-          ? 'path must be an absolute local path (no URLs)'
-          : 'pick a discovered repo first')
-    : !versionOk ? '--version must be a positive integer'
-    : undefined
-
-  const onSubmit = async () => {
-    if (!ready || !selection) return
-    const v = version.trim() ? Number(version.trim()) : undefined
-    const text = mode === 'owner'
-      ? addRepoOwnerPrompt({ gateway, repoId: selection.repoId, path: selection.path, version: v })
-      : addRepoLinkPrompt({ gateway, repoId: selection.repoId, path: selection.path, version: v, maintainerGateway })
-    await recordOp({
-      kind: mode === 'owner' ? 'add-repo-owner' : 'add-repo-link',
-      gateway,
-      args: mode === 'owner'
-        ? { mode, repoId: selection.repoId, path: selection.path, poolId: poolId || null, version: v ?? null }
-        : { mode, repoId: selection.repoId, path: selection.path, version: v ?? null, maintainerGateway, substeps: ['build bundle', 'deliver'], substepsDone: [] },
-      text
-    })
-  }
-
-  return jsxs('div', {
-    className: 'flex flex-col gap-2 rounded-md p-2',
-    children: [
-      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Add repo' }),
-      jsx(SegmentedControl, {
-        options: [
-          { id: 'owner', label: 'My pool (owner)' },
-          { id: 'link', label: 'Contribute (link flow)' }
-        ],
-        value: mode,
-        onChange: setMode
-      }),
-      jsx(SnapshotSelect, {
-        label: 'repo (discovered) — or enter manually…',
-        items: discoveredItems,
-        value: manualPathActive ? '' : discoveredId,
-        onChange: setDiscoveredId,
-        emptyHint: 'No discovered repos yet — click Discover repos',
-        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'discovered', gateway) : undefined,
-        loadingKey: 'discovered',
-        refreshKind: 'discover',
-        ops,
-        allowManual: true,
-        manualPlaceholder: '/home/you/src/my-repo',
-        manualValue: manualPath,
-        onManualChange: setManualPath,
-        selectLabel: '(select a discovered repo)',
-        resetKey: mode
-      }),
-      skipped > 0 ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `${skipped} entries skipped (non-local paths)` }) : null,
-      manualPathActive && !isAbsoluteLocalPath(manualPath)
-        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Path must be absolute (starts with /) and must not look like a URL.' })
-        : null,
-      mode === 'owner'
-        ? jsx(SnapshotSelect, {
-            label: 'target pool',
-            items: pools,
-            value: poolId,
-            onChange: setPoolId,
-            emptyHint: SNAPSHOT_KIND_EMPTY.pools,
-            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
-        loadingKey: 'poolStatus',
-            ops,
-            allowManual: false,
-            selectLabel: '(select a pool)',
-            resetKey: mode
-          })
-        : null,
-      jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'version auto-resolves (agent asks /fetch repo for accepted_version)' }),
-      version.trim() && !/^\d+$/.test(version.trim())
-        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: '--version must be a positive integer.' })
-        : null,
-      jsx(SnapshotSelect, {
-        label: '--version (optional)',
-        items: [],
-        value: version,
-        onChange: setVersion,
-        emptyHint: SNAPSHOT_KIND_EMPTY.version,
-        allowManual: true,
-        manualPlaceholder: 'N',
-        manualValue: version,
-        onManualChange: setVersion,
-        resetKey: mode
-      }),
-      mode === 'link'
-        ? jsx(SnapshotSelect, {
-            label: 'maintainer gateway (profile)',
-            items: gatewayItems,
-            value: maintainerGateway,
-            onChange: setMaintainerGateway,
-            emptyHint: SNAPSHOT_KIND_EMPTY.gateways,
-            allowManual: false,
-            selectLabel: '(select a gateway)',
-            resetKey: mode
-          })
-        : null,
-      jsx('div', { className: 'flex items-center gap-2', children: [
-        submitButton({
-          disabled: noSession,
-          title: noSession ? submitTitle : 'Ask the agent to enumerate local git repositories (read-only)',
-          onClick: async () => {
-            if (noSession) return
-            await recordOp({ kind: 'discover', gateway, args: { snapshot: 'snapshot.discovered' }, text: discoverReposPrompt() })
-          },
-          children: 'Discover repos'
-        })
-      ] }),
-      failureHints(ADD_REPO_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: mode === 'owner' ? PRIMARY_BUTTONS.addRepo : PRIMARY_BUTTONS.addRepoLink })
-    ]
-  })
-}
-
-// --- form: fetch task list --------------------------------------------------
-
-function FetchTasksForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }) {
-  const repos = snapshotSources(ctx).repos
-  const [repoFilter, setRepoFilter] = useState('')
-  const ready = !noSession
-
-  const onSubmit = async () => {
-    if (!ready) return
-    const filter = repoFilter.trim() || undefined
-    const text = fetchTaskListPrompt({ gateway, repoId: filter })
-    const record = await recordOp({
-      kind: 'fetch-tasks',
-      gateway,
-      args: { repo: filter || null, sequence: ['/fetch repo list', `/fetch task list${filter ? ` --repo ${filter}` : ''}`] },
-      text
-    })
-    // Agent reply snapshot is stored by the refresh loop (Task 8); seed the
-    // key with a timestamp so offline display has a slot to read.
-    ctx.storage.set('snapshot.tasks', { at: Date.now(), opId: record?.id || null, table: null })
-  }
-
-  return jsxs('div', {
-    className: 'flex flex-col gap-2 rounded-md p-2',
-    children: [
-      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Fetch task list' }),
-      jsx(SnapshotSelect, {
-        label: 'repo filter (optional)',
-        items: repos,
-        value: repoFilter,
-        onChange: setRepoFilter,
-        emptyHint: SNAPSHOT_KIND_EMPTY.repos,
-        selectLabel: '(all repos)',
-        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
-        loadingKey: 'repos',
-        ops,
-        allowManual: true,
-        manualPlaceholder: 'repo_id',
-        manualValue: repoFilter,
-        onManualChange: setRepoFilter,
-        resetKey: 'fetch'
-      }),
-      submitButton({ disabled: !ready, title: noSession ? submitTitle : undefined, onClick: onSubmit, children: PRIMARY_BUTTONS.fetchTasks })
-    ]
-  })
-}
-
-// --- form: claim / assign ---------------------------------------------------
-
-const CLAIM_FAILURES = [
-  'claim refused: user <id> already bound to key <key> (immutable key binding)',
-  'agent budget exhausted: <n> of <allocation> tasks completed',
-  'not whitelisted for this pool'
-]
-
-function ClaimForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }) {
-  const tasks = snapshotSources(ctx).tasks
-  const [ticket, setTicket] = useState('')
-  const [note, setNote] = useState('')
-  const [autoAssign, setAutoAssign] = useState(false)
-  const [maxTasks, setMaxTasks] = useState('1')
-
-  const ticketReady = autoAssign ? (/^\d+$/.test(maxTasks.trim()) && Number(maxTasks.trim()) > 0) : Boolean(ticket.trim())
-  const ready = !noSession && ticketReady
-  const disabledTitle = noSession
-    ? submitTitle
-    : autoAssign ? (ticketReady ? undefined : 'max-tasks must be a positive integer')
-    : 'pick a ticket first'
-
-  const onSubmit = async () => {
-    if (!ready) return
-    const noteSuffix = note.trim() ? ` Claimant identity note: ${note.trim()}.` : ''
-    const text = autoAssign
-      ? claimPrompt({ gateway, maxTasks: Number(maxTasks.trim()) }) + noteSuffix
-      : claimPrompt({ gateway, ticketId: ticket.trim() }) + noteSuffix
-    const key = autoAssign ? `auto-${maxTasks.trim()}` : ticket.trim()
-    const record = await recordOp({
-      kind: 'claim',
-      gateway,
-      args: { ticket: autoAssign ? null : key, autoAssign, maxTasks: autoAssign ? Number(maxTasks.trim()) : null, note: note.trim() || null },
-      text
-    })
-    const claims = ctx.storage.get('snapshot.claims', {})
-    ctx.storage.set('snapshot.claims', { ...(claims && typeof claims === 'object' ? claims : {}), [key]: { at: Date.now(), opId: record?.id || null, reply: null } })
-  }
-
-  return jsxs('div', {
-    className: 'flex flex-col gap-2 rounded-md p-2',
-    children: [
-      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Claim / assign' }),
-      jsx(ToggleRow, {
-        checked: autoAssign,
-        description: 'Use /claim --any-project --max-tasks N instead of claiming one ticket.',
-        label: 'Auto-assign',
-        onChange: setAutoAssign
-      }),
-      autoAssign
-        ? jsxs('div', { className: 'flex flex-col gap-1', children: [
-            field('--max-tasks N', jsx('input', { className: inputClass, value: maxTasks, onChange: e => setMaxTasks(e.target.value), inputMode: 'numeric' })),
-            !/^\d+$/.test(maxTasks.trim()) || Number(maxTasks.trim()) <= 0
-              ? jsx('div', { className: 'text-(--ui-text-secondary)', children: 'max-tasks must be a positive integer.' })
-              : null
-          ] })
-        : jsxs('div', {
-            className: 'flex flex-col gap-2',
-            children: [
-              jsx(SnapshotSelect, {
-                label: 'ticket (from fetched task snapshot)',
-                items: tasks,
-                value: ticket,
-                onChange: setTicket,
-                emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
-                refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
-        loadingKey: 'tasks',
-                refreshKind: 'fetch-tasks',
-                ops,
-                allowManual: true,
-                manualPlaceholder: 'ticket_id',
-                manualValue: ticket,
-                onManualChange: setTicket,
-                resetKey: String(autoAssign)
-              })
-            ]
-          }),
-      field('claimant identity note (optional)', jsx('input', { className: inputClass, value: note, onChange: e => setNote(e.target.value), placeholder: 'who is claiming, for the record' })),
-      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `target profile: ${str(gateway)} (plugin binds claim to key + Discord id automatically)` }),
-      failureHints(CLAIM_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: PRIMARY_BUTTONS.claim })
-    ]
-  })
-}
-
-// Update a tracked op in ctx.storage (merge args, patch status). Used by the
-// push card to keep ONE op of kind 'push' across its three sub-steps.
-function updateOp(ctx, id, patch) {
-  const ops = ctx.storage.get(OPS_KEY, [])
-  if (!Array.isArray(ops)) return null
-  let updated = null
-  const next = ops.map(op => {
-    if (op.id !== id) return op
-    updated = { ...op, ...patch, args: { ...(op.args || {}), ...((patch && patch.args) || {}) } }
-    return updated
-  })
-  ctx.storage.set(OPS_KEY, next)
-  return updated
-}
-
-function claimOps(ops) {
-  return (Array.isArray(ops) ? ops : []).filter(op => op && op.kind === 'claim')
-}
-
-const PULL_FAILURES = [
-  'manifest signature does not verify — do not use the bytes; re-read or re-issue the ticket',
-  'transport errors: "Tor is not ready, the ticket expired" — re-read the ticket or ask the maintainer to re-issue it',
-  'destination not writable — pick another --dest directory'
-]
-
-// --- form: pull repo --------------------------------------------------------
-
-function PullRepoForm({ ctx, gateway, noSession, submitTitle, recordOp, ops }) {
-  const claims = claimOps(ops)
-  const claimItems = claims.map(op => ({
-    id: str(op && op.id),
-    title: `${str((op && op.args && (op.args.ticket || op.args.key)) || (op && op.id) || '')}${op && op.at ? ` · ${new Date(op.at).toLocaleString()}` : ''}`
-  }))
-  const [claimId, setClaimId] = useState('')
-  const [ticketId, setTicketId] = useState('')
-  const [replyFile, setReplyFile] = useState('')
-  const [dest, setDest] = useState('')
-
-  const selected = claims.find(op => op.id === claimId) || null
-  const effectiveTicket = (selected && selected.args && (selected.args.ticket || selected.args.key)) || ticketId.trim()
-  const effectiveReplyFile = replyFile.trim() || (selected && selected.args && selected.args.replyFile) || ''
-  const ready = !noSession && Boolean(effectiveTicket) && Boolean(dest.trim()) && isAbsoluteLocalPath(dest)
-  const disabledTitle = noSession
-    ? submitTitle
-    : !effectiveTicket ? 'pick a ticket first'
-    : !dest.trim() ? 'enter an absolute destination directory'
-    : !isAbsoluteLocalPath(dest) ? 'destination must be an absolute local path'
-    : undefined
-
-  const onPickClaim = id => {
-    setClaimId(id)
-    const op = claims.find(o => o.id === id)
-    if (op && op.args) {
-      setTicketId(op.args.ticket || op.args.key || '')
-      setReplyFile(op.args.replyFile || '')
-    }
-  }
-
-  const onSubmit = async () => {
-    if (!ready) return
-    const text = pullPrompt({ gateway, ticketId: effectiveTicket, replyFile: effectiveReplyFile || undefined, dest: dest.trim() })
-    await recordOp({
-      kind: 'pull',
-      gateway,
-      args: { ticket: effectiveTicket, replyFile: effectiveReplyFile || null, dest: dest.trim(), substatus: 'pull' },
-      text
-    })
-  }
-
-  return jsxs('div', {
-    className: 'flex flex-col gap-2 rounded-md p-2',
-    children: [
-      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Pull repo (contributor-claim.py)' }),
-      jsx(SnapshotSelect, {
-        label: 'prefill from claim op',
-        items: claimItems,
-        value: claimId,
-        onChange: onPickClaim,
-        emptyHint: SNAPSHOT_KIND_EMPTY.claims,
-        allowManual: false,
-        selectLabel: '(pick a claim op)'
-      }),
-      field('ticket id', jsx('input', { className: inputClass, value: effectiveTicket, onChange: e => { setClaimId(''); setTicketId(e.target.value) }, placeholder: 'ticket_id' })),
-      field('saved claim reply json (--reply-file)', jsx('input', { className: inputClass, value: effectiveReplyFile, onChange: e => setReplyFile(e.target.value), placeholder: '/path/to/claim-reply.json' })),
-      field('destination directory (--dest, absolute)', jsx('input', { className: inputClass, value: dest, onChange: e => setDest(e.target.value), placeholder: '/home/you/work/ticket' })),
-      dest.trim() && !isAbsoluteLocalPath(dest)
-        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Destination must be absolute (starts with /) and must not look like a URL.' })
-        : null,
-      failureHints(PULL_FAILURES),
-      submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: PRIMARY_BUTTONS.pull })
-    ]
-  })
-}
-
-const PUSH_FAILURES = [
-  'unknown tip — the plugin refuses; re-ask /fetch repo <repo_id> for accepted_version and retry with the right --version',
-  'agent budget exhausted — the push is refused until the budget resets',
-  'transport not ready — "Tor is not ready, the ticket expired"; wait for Tor or re-issue the ticket',
-  'manifest signature does not verify — repackage and redeliver'
-]
-
-// --- form: push / submit (one op, three guided sub-steps) -------------------
-
-function PushSubmitCard({ ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }) {
-  const snapSrc = snapshotSources(ctx)
-  const repos = snapSrc.repos
-  const tasks = snapSrc.tasks
-  const pools = itemsFor({ repos, poolStatus: snapSrc.poolStatus }, 'pools')
-  const existing = (Array.isArray(ops) ? ops : []).find(op => op && op.kind === 'push' && op.status !== 'done' && op.status !== 'done (awaiting approval)' && op.status !== 'failed') || null
-  const claims = claimOps(ops)
-  const claimItems = claims.map(op => ({
-    id: str(op && op.id),
-    title: `${str((op && op.args && (op.args.ticket || op.args.key)) || (op && op.id) || '')}${op && op.at ? ` · ${new Date(op.at).toLocaleString()}` : ''}`
-  }))
-  const [pushOpId, setPushOpId] = useState(() => existing && existing.id != null ? str(existing.id) : undefined)
-  const [repoId, setRepoId] = useState(() => str((existing && existing.args && existing.args.repoId) || ''))
-  const [ticketId, setTicketId] = useState(() => str((existing && existing.args && existing.args.ticketId) || ''))
-  const [worktreePath, setWorktreePath] = useState(() => str((existing && existing.args && existing.args.worktreePath) || ''))
-  const [poolId, setPoolId] = useState(() => str((existing && existing.args && existing.args.poolId) || ''))
-  const [version, setVersion] = useState(() => (existing && existing.args && existing.args.version != null ? String(existing.args.version) : ''))
-  const [grantToken, setGrantToken] = useState(() => str((existing && existing.args && existing.args.grantToken) || ''))
-  const [transferTicket, setTransferTicket] = useState(() => str((existing && existing.args && existing.args.transferTicket) || ''))
-  const [manifest, setManifest] = useState(() => str((existing && existing.args && existing.args.manifest) || ''))
-  const [grantDone, setGrantDone] = useState(() => Boolean(existing && existing.args && existing.args.grantDone))
-  const [packageDone, setPackageDone] = useState(() => Boolean(existing && existing.args && existing.args.packageDone))
-  const [manualTransfer, setManualTransfer] = useState(false)
-  const [manualManifest, setManualManifest] = useState(false)
-
-  const livePushOp = (Array.isArray(ops) ? ops : []).find(op => op && op.id != null && str(op.id) === str(pushOpId || (existing && existing.id) || '')) || existing
-  const liveArgs = (livePushOp && livePushOp.args) || {}
-  const autoGrantToken = liveArgs.grantToken != null ? str(liveArgs.grantToken) : ''
-  const autoTransferTicket = liveArgs.transferTicket != null ? str(liveArgs.transferTicket) : ''
-  const autoManifest = liveArgs.manifest != null ? str(liveArgs.manifest) : ''
-  const effectiveGrantToken = grantToken.trim() || autoGrantToken
-  const effectiveTransferTicket = transferTicket.trim() || autoTransferTicket
-  const effectiveManifest = manifest.trim() || autoManifest
-
-  const onPickClaim = id => {
-    const op = claims.find(o => str(o && o.id) === str(id))
-    if (!op || !op.args) return
-    const t = op.args.ticket || op.args.key || ''
-    if (t) setTicketId(str(t))
-    if (op.args.worktreePath) setWorktreePath(str(op.args.worktreePath))
-  }
-
-  const substatus = grantDone && packageDone ? 'deliver' : grantDone ? 'package' : 'grant'
-
-  const ensureOp = async (argsPatch, text) => {
-    if (pushOpId) {
-      const ok = await host.composer.submit(sessionId, text)
-      const updated = updateOp(ctx, pushOpId, { args: argsPatch, status: ok ? 'awaiting agent' : 'failed', ...(ok ? {} : { error: 'composer unreachable' }) })
-      refreshOps?.()
-      return updated
-    }
-    const record = await recordOp({ kind: 'push', gateway, args: { ...argsPatch }, text })
-    if (record && record.id) setPushOpId(record.id)
-    return record
-  }
-
-  // Step 3 gating: deliver cannot fire before steps 1-2 are done (grant+package)
-  // AND the transfer ticket, grant token and manifest are present — via dropdown/
-  // op-linked auto-fill or the manual disclosure.
-  const deliverReady = !noSession && grantDone && packageDone && Boolean(effectiveTransferTicket) && Boolean(effectiveGrantToken) && Boolean(effectiveManifest)
-  const deliverTitle = noSession ? submitTitle
-    : !grantDone ? 'step 1 (grant) must complete first — the grant token comes from the /push repo reply'
-    : !packageDone ? 'step 2 (package) must complete first — the manifest comes from scripts/contributor-push.py'
-    : !effectiveTransferTicket ? 'transfer ticket is required (from the package reply)'
-    : !effectiveGrantToken ? 'grant token is required (from the /push repo reply)'
-    : !effectiveManifest ? 'manifest json (or path) is required'
-    : undefined
-
-  const submitGrant = async () => {
-    if (noSession || !repoId.trim() || !ticketId.trim()) return
-    const text = pushGrantPrompt({ gateway, repoId: repoId.trim(), ticketId: ticketId.trim() })
-    await ensureOp({ repoId: repoId.trim(), ticketId: ticketId.trim(), grantDone: true, substatus: 'grant' }, text)
-    setGrantDone(true)
-  }
-
-  const submitPackage = async () => {
-    if (noSession || !grantDone || !worktreePath.trim() || !repoId.trim() || !poolId.trim() || !/^\d+$/.test(version.trim())) return
-    const text = pushPackagePrompt({ gateway, worktreePath: worktreePath.trim(), repoId: repoId.trim(), poolId: poolId.trim(), version: Number(version.trim()) })
-    await ensureOp({ worktreePath: worktreePath.trim(), poolId: poolId.trim(), version: Number(version.trim()), packageDone: true, substatus: 'package' }, text)
-    setPackageDone(true)
-  }
-
-  const submitDeliver = async () => {
-    if (!deliverReady) return
-    const text = pushDeliverPrompt({ gateway, repoId: repoId.trim(), version: version.trim(), ticketJson: effectiveManifest, transferTicket: effectiveTransferTicket, grantToken: effectiveGrantToken })
-    await ensureOp({ transferTicket: effectiveTransferTicket, grantToken: effectiveGrantToken, manifest: effectiveManifest, substatus: 'deliver' }, text)
-  }
-
-  // Retry deliver: re-submits ONLY the deliver prompt. The grant is not
-  // consumed by deliver, so redelivery is legal on transport failure.
-  const retryDeliver = async () => {
-    if (noSession || !(pushOpId || existing) || !effectiveGrantToken || !effectiveTransferTicket || !effectiveManifest) return
-    const text = pushDeliverPrompt({ gateway, repoId: repoId.trim(), version: version.trim(), ticketJson: effectiveManifest, transferTicket: effectiveTransferTicket, grantToken: effectiveGrantToken })
-    const id = pushOpId || (existing && existing.id)
-    const ok = await host.composer.submit(sessionId, text)
-    updateOp(ctx, id, { args: { substatus: 'deliver' }, status: ok ? 'awaiting agent' : 'failed', ...(ok ? {} : { error: 'composer unreachable' }) })
-    refreshOps?.()
-    notifyOp(ctx, ok ? 'info' : 'failed', ok ? 'push deliver re-submitted — awaiting agent' : 'composer unreachable', { id })
-  }
-
-  const grantReady = !noSession && repoId.trim() && ticketId.trim()
-  const packageReady = !noSession && grantDone && worktreePath.trim() && repoId.trim() && poolId.trim() && /^\d+$/.test(version.trim())
-
-  return jsxs('div', {
-    className: 'flex flex-col gap-2 rounded-md p-2',
-    children: [
-      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Push / submit work (grant → package → deliver)' }),
-      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `one tracked op of kind push · substatus: ${str(substatus)}` }),
-      jsx(SnapshotSelect, {
-        label: 'claim (prefills ticket + worktree)',
-        items: claimItems,
-        value: '',
-        onChange: onPickClaim,
-        emptyHint: SNAPSHOT_KIND_EMPTY.claims,
-        allowManual: false,
-        selectLabel: '(pick a claim)',
-        resetKey: substatus
-      }),
-      jsx(SnapshotSelect, {
-        label: 'repo_id',
-        items: repos,
-        value: repoId,
-        onChange: setRepoId,
-        emptyHint: SNAPSHOT_KIND_EMPTY.repos,
-        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
-        loadingKey: 'repos',
-        ops,
-        allowManual: true,
-        manualPlaceholder: 'my-repo',
-        manualValue: repoId,
-        onManualChange: setRepoId,
-        resetKey: substatus
-      }),
-      jsx(SnapshotSelect, {
-        label: 'ticket id',
-        items: tasks,
-        value: ticketId,
-        onChange: setTicketId,
-        emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
-        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
-        loadingKey: 'tasks',
-        refreshKind: 'fetch-tasks',
-        ops,
-        allowManual: true,
-        manualPlaceholder: 'ticket_id',
-        manualValue: ticketId,
-        onManualChange: setTicketId,
-        resetKey: substatus
-      }),
-      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 1 — grant (/push repo)' }),
-      submitButton({ disabled: !grantReady, title: noSession ? submitTitle : (!repoId.trim() || !ticketId.trim() ? 'repo_id and ticket id are required' : undefined), onClick: submitGrant, children: grantDone ? 'Step 1 — grant submitted ✓ (re-request)' : 'Step 1 — request grant (/push repo)' }),
-      jsx(SnapshotSelect, {
-        label: autoGrantToken && !grantToken.trim() ? 'grant token (auto-filled from the grant op reply)' : 'grant token (from the /push repo reply)',
-        items: effectiveGrantToken ? [{ id: effectiveGrantToken, title: 'grant token' }] : [],
-        value: effectiveGrantToken,
-        onChange: setGrantToken,
-        emptyHint: SNAPSHOT_KIND_EMPTY.grant,
-        allowManual: true,
-        manualPlaceholder: 'grant_token',
-        manualValue: grantToken,
-        onManualChange: setGrantToken,
-        resetKey: substatus
-      }),
-      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 2 — package (scripts/contributor-push.py). Caveat: take next_version from the grant reply or re-ask /fetch repo <repo_id> for accepted_version; never trust the enroll-time chain_tips.' }),
-      field('worktree path', jsx('input', { className: inputClass, value: worktreePath, onChange: e => setWorktreePath(e.target.value), placeholder: '/path/to/worktree' })),
-      jsx(SnapshotSelect, {
-        label: 'pool_id',
-        items: pools,
-        value: poolId,
-        onChange: setPoolId,
-        emptyHint: SNAPSHOT_KIND_EMPTY.pools,
-        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
-        loadingKey: 'poolStatus',
-        ops,
-        allowManual: true,
-        manualPlaceholder: 'pool_id',
-        manualValue: poolId,
-        onManualChange: setPoolId,
-        resetKey: substatus
-      }),
-      version.trim() && !/^\d+$/.test(version.trim())
-        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: '--version must be a positive integer.' })
-        : null,
-      jsx(SnapshotSelect, {
-        label: '--version N (auto-resolves; manual fallback)',
-        items: [],
-        value: version,
-        onChange: setVersion,
-        emptyHint: SNAPSHOT_KIND_EMPTY.version,
-        allowManual: true,
-        manualPlaceholder: 'N',
-        manualValue: version,
-        onManualChange: setVersion,
-        resetKey: substatus
-      }),
-      submitButton({ disabled: !packageReady, title: noSession ? submitTitle : !grantDone ? 'step 1 (grant) must complete first' : 'worktree, repo_id, pool_id and a numeric --version are required', onClick: submitPackage, children: packageDone ? 'Step 2 — package submitted ✓ (re-package)' : 'Step 2 — package (scripts/contributor-push.py)' }),
-      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Step 3 — deliver (/push repo --deliver). Redelivery is legal: the grant is not consumed by deliver.' }),
-      autoTransferTicket && !transferTicket.trim() && !manualTransfer
-        ? jsxs('div', { className: 'flex items-center gap-2', children: [
-            jsx('div', { className: 'text-(--ui-text-tertiary)', children: `transfer ticket auto-filled from the package op reply: ${str(autoTransferTicket)}` }),
-            jsx('button', { className: 'rounded-md px-2 py-0.5 text-(--ui-text-secondary)', title: 'Enter the transfer ticket manually', onClick: () => setManualTransfer(true), children: '(enter manually…)' })
-          ] })
-        : field('transfer ticket (from the package reply)', jsx('input', { className: inputClass, value: transferTicket, onChange: e => setTransferTicket(e.target.value), placeholder: autoTransferTicket ? `auto-filled: ${autoTransferTicket}` : 'transfer_ticket' })),
-      autoManifest && !manifest.trim() && !manualManifest
-        ? jsxs('div', { className: 'flex items-center gap-2', children: [
-            jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'manifest auto-filled from the package op reply' }),
-            jsx('button', { className: 'rounded-md px-2 py-0.5 text-(--ui-text-secondary)', title: 'Enter the manifest manually', onClick: () => setManualManifest(true), children: '(enter manually…)' })
-          ] })
-        : field('manifest json (or path)', jsx('input', { className: inputClass, value: manifest, onChange: e => setManifest(e.target.value), placeholder: autoManifest ? 'auto-filled from the package op reply' : '{"manifest": …} or /path/to/manifest.json' })),
-      submitButton({ disabled: !deliverReady, title: deliverTitle, onClick: submitDeliver, children: PRIMARY_BUTTONS.push }),
-      submitButton({ disabled: noSession || !(pushOpId || existing) || !effectiveGrantToken || !effectiveTransferTicket || !effectiveManifest, title: 'Re-submits only the deliver prompt (grant not consumed by deliver)', onClick: retryDeliver, children: 'Retry deliver (grant not consumed)' }),
-      failureHints(PUSH_FAILURES)
-    ]
-  })
-}
-
-const APPROVE_FAILURES = [
-  'non-owner refusal — the plugin refuses; the pane records the plugin\'s message verbatim as op status refused (authorization lives only in the plugin)',
-  'audit not clean — fix the audit findings before approving',
-  'no accepted bundle for the version — push/deliver a version first, then approve'
-]
-
-// --- form: approve (OWNER ONLY) --------------------------------------------
-
-function ApproveForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops, prefill, onPrefillConsumed }) {
-  const snapSrc = snapshotSources(ctx)
-  const repos = snapSrc.repos
-  const tasks = snapSrc.tasks
-  const awaiting = snapSrc.awaitingApproval
-  const [targetKind, setTargetKind] = useState('repo')
-  const [repoId, setRepoId] = useState('')
-  const [version, setVersion] = useState('')
-  const [ticketId, setTicketId] = useState('')
-  const [deny, setDeny] = useState(false)
-  const [pendingConfirm, setPendingConfirm] = useState(null)
-
-  // Deep-link from the tracker's Awaiting-approval tab: pre-fill the form
-  // (still confirm-gated — nothing submits until the operator confirms).
-  useEffect(() => {
-    if (!prefill) return
-    if (prefill.ticket) {
-      setTargetKind('ticket')
-      setTicketId(str(prefill.ticket))
-    } else {
-      setTargetKind('repo')
-      setRepoId(str(prefill.repo || prefill.id || ''))
-      if (prefill.version != null) setVersion(str(prefill.version))
-    }
-    setDeny(Boolean(prefill.deny))
-    if (onPrefillConsumed) onPrefillConsumed()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prefill])
-
-  const onPickAwaiting = id => {
-    const entry = awaiting.find(e => str(e && e.id) === str(id))
-    if (!entry) return
-    if (entry.ticket) {
-      setTargetKind('ticket')
-      setTicketId(str(entry.ticket))
-    } else if (entry.repo) {
-      setTargetKind('repo')
-      setRepoId(str(entry.repo))
-      if (entry.version != null) setVersion(str(entry.version))
-    } else {
-      setTargetKind('repo')
-      setRepoId(str(entry.id))
-      if (entry.version != null) setVersion(str(entry.version))
-    }
-  }
-
-  const versionOk = !version.trim() || /^\d+$/.test(version.trim())
-  const ready = !noSession && versionOk && (targetKind === 'repo' ? Boolean(repoId.trim()) : Boolean(ticketId.trim()))
-  const disabledTitle = noSession
-    ? submitTitle
-    : !versionOk ? '--version must be a number'
-    : targetKind === 'repo' ? (!repoId.trim() ? 'pick a repo first' : undefined)
-    : (!ticketId.trim() ? 'pick a ticket first' : undefined)
-
-  // The primary button only OPENS the confirm card; the op composes and
-  // submits strictly on Confirm (finalizeOp returns null without confirmed).
-  const onSubmit = () => {
-    if (!ready) return
-    const v = targetKind === 'repo' && version.trim() ? Number(version.trim()) : undefined
-    const args = targetKind === 'repo'
-      ? { repoId: repoId.trim(), ...(v != null ? { version: v } : {}), deny }
-      : { ticketId: ticketId.trim(), deny }
-    const text = approvePrompt({
-      gateway,
-      repoId: targetKind === 'repo' ? repoId.trim() : undefined,
-      version: v,
-      ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
-      deny
-    })
-    const commandText = approveCommandText({
-      repoId: targetKind === 'repo' ? repoId.trim() : undefined,
-      version: v,
-      ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
-      deny
-    })
-    const target = targetKind === 'repo'
-      ? `${deny ? 'Deny' : 'Approve'} \`${repoId.trim()}${v != null ? ` v${v}` : ''}\``
-      : `${deny ? 'Deny' : 'Approve'} pushed claim \`${ticketId.trim()}\``
-    const card = buildConfirmCard(target, gateway, commandText)
-    setPendingConfirm({ draft: { kind: 'approve', gateway, args: { ...args, target: targetKind }, text }, card })
-  }
-
-  const onConfirmOp = async () => {
-    const op = finalizeOp(pendingConfirm && pendingConfirm.draft, { confirmed: true })
-    setPendingConfirm(null)
-    if (!op) return
-    await recordOp(op)
-  }
-
-  return jsxs('div', {
-    className: 'flex flex-col gap-2 rounded-md p-2',
-    children: [
-      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'OWNER ONLY — Approve / deny (pool-approve.py)' }),
-      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'OWNER ONLY. The pane has no owner check of its own — authorization lives only in the plugin. A non-owner profile still submits; the plugin refuses and the pane records the refusal verbatim as op status refused.' }),
-      jsx(SegmentedControl, {
-        options: [
-          { id: 'repo', label: 'Repo version' },
-          { id: 'ticket', label: 'Pushed claim' }
-        ],
-        value: targetKind,
-        onChange: id => setTargetKind(id)
-      }),
-      jsx(SnapshotSelect, {
-        label: 'awaiting approval (from pool_status)',
-        items: awaiting,
-        value: '',
-        onChange: onPickAwaiting,
-        emptyHint: SNAPSHOT_KIND_EMPTY.awaiting,
-        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
-        loadingKey: 'poolStatus',
-        ops,
-        allowManual: false,
-        selectLabel: '(pick an awaiting-approval target)',
-        resetKey: targetKind
-      }),
-      targetKind === 'repo'
-        ? jsx(SnapshotSelect, {
-            label: 'repo_id',
-            items: repos,
-            value: repoId,
-            onChange: setRepoId,
-            emptyHint: SNAPSHOT_KIND_EMPTY.repos,
-            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
-        loadingKey: 'repos',
-            ops,
-            allowManual: true,
-            manualPlaceholder: 'my-repo',
-            manualValue: repoId,
-            onManualChange: setRepoId,
-            resetKey: targetKind
-          })
-        : jsx(SnapshotSelect, {
-            label: 'ticket_id',
-            items: tasks,
-            value: ticketId,
-            onChange: setTicketId,
-            emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
-            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
-        loadingKey: 'tasks',
-            refreshKind: 'fetch-tasks',
-            ops,
-            allowManual: true,
-            manualPlaceholder: 'ticket_id',
-            manualValue: ticketId,
-            onManualChange: setTicketId,
-            resetKey: targetKind
-          }),
-      targetKind === 'repo'
-        ? jsx('div', { className: 'flex flex-col gap-1', children: [
-            field('--version N (optional)', jsx('input', { className: inputClass, value: version, onChange: e => setVersion(e.target.value), inputMode: 'numeric', placeholder: 'N' })),
-            version.trim() && !/^\d+$/.test(version.trim())
-              ? jsx('div', { className: 'text-(--ui-text-secondary)', children: '--version must be a positive integer.' })
-              : null
-          ] })
-        : null,
-      jsx(ToggleRow, {
-        checked: deny,
-        description: 'Pass --deny instead of approving.',
-        label: 'Deny',
-        onChange: value => setDeny(value)
-      }),
-      failureHints(APPROVE_FAILURES),
-      pendingConfirm
-        ? jsx(ConfirmCard, { card: pendingConfirm.card, onConfirm: onConfirmOp, onCancel: () => setPendingConfirm(null) })
-        : submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: deny ? PRIMARY_BUTTONS.deny : PRIMARY_BUTTONS.approve })
-    ]
-  })
-}
-
-const MERGE_FAILURES = [
-  'non-owner refusal — the plugin refuses; the pane records the plugin\'s message verbatim as op status refused (authorization lives only in the plugin)',
-  'audit not clean — the merge must not proceed until the audit is clean',
-  'no accepted bundle for the version — approve an accepted bundle first'
-]
-
-// --- form: merge (OWNER ONLY) ----------------------------------------------
-
-function MergeForm({ ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }) {
-  const snapSrc = snapshotSources(ctx)
-  const repos = snapSrc.repos
-  const tasks = snapSrc.tasks
-  const awaiting = snapSrc.awaitingApproval
-  const [targetKind, setTargetKind] = useState('repo')
-  const [repoId, setRepoId] = useState('')
-  const [ticketId, setTicketId] = useState('')
-  const [checkoutPath, setCheckoutPath] = useState('')
-  const [pendingConfirm, setPendingConfirm] = useState(null)
-
-  const onPickAwaiting = id => {
-    const entry = awaiting.find(e => str(e && e.id) === str(id))
-    if (!entry) return
-    if (entry.ticket) {
-      setTargetKind('ticket')
-      setTicketId(str(entry.ticket))
-    } else {
-      setTargetKind('repo')
-      setRepoId(str(entry.repo || entry.id))
-    }
-  }
-
-  // Default canonical checkout: the pool's work/integrate/<repo_id>/ convention.
-  const effectiveCheckout = checkoutPath.trim() || (repoId.trim() ? `work/integrate/${repoId.trim()}/` : '')
-  const ready = !noSession && (targetKind === 'repo' ? Boolean(repoId.trim()) : Boolean(ticketId.trim())) && Boolean(effectiveCheckout)
-  const disabledTitle = noSession
-    ? submitTitle
-    : targetKind === 'repo' ? (!repoId.trim() ? 'pick a repo first' : undefined)
-    : (!ticketId.trim() ? 'pick a ticket first' : undefined)
-
-  // Primary button opens the confirm card; the op composes strictly on Confirm.
-  const onSubmit = () => {
-    if (!ready) return
-    const args = targetKind === 'repo'
-      ? { repoId: repoId.trim(), checkoutPath: effectiveCheckout }
-      : { ticketId: ticketId.trim(), checkoutPath: effectiveCheckout }
-    const text = mergePrompt({
-      gateway,
-      repoId: targetKind === 'repo' ? repoId.trim() : undefined,
-      ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
-      checkoutPath: effectiveCheckout
-    })
-    const commandText = mergeCommandText({
-      repoId: targetKind === 'repo' ? repoId.trim() : undefined,
-      ticketId: targetKind === 'ticket' ? ticketId.trim() : undefined,
-      checkoutPath: effectiveCheckout
-    })
-    const target = targetKind === 'repo'
-      ? `Merge approved bundle for \`${repoId.trim()}\``
-      : `Merge approved bundle for pushed claim \`${ticketId.trim()}\``
-    const card = buildConfirmCard(target, gateway, commandText)
-    setPendingConfirm({ draft: { kind: 'merge', gateway, args: { ...args, target: targetKind }, text }, card })
-  }
-
-  const onConfirmOp = async () => {
-    const op = finalizeOp(pendingConfirm && pendingConfirm.draft, { confirmed: true })
-    setPendingConfirm(null)
-    if (!op) return
-    await recordOp(op)
-  }
-
-  return jsxs('div', {
-    className: 'flex flex-col gap-2 rounded-md p-2',
-    children: [
-      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'OWNER ONLY — Merge approved bundle' }),
-      jsx('div', { className: 'text-(--ui-text-secondary)', children: 'OWNER ONLY. The plugin never merges — the agent performs git fetch <approved bundle> + git merge into the canonical checkout itself. Where the maintainer flow uses the merge_approved service path (tickets.py:2249), it goes through the agent executing the plugin\'s documented flow, never a pane-side import. A non-owner profile still submits; the plugin refuses and the pane records the refusal verbatim as op status refused.' }),
-      jsx(SegmentedControl, {
-        options: [
-          { id: 'repo', label: 'Repo' },
-          { id: 'ticket', label: 'Ticket' }
-        ],
-        value: targetKind,
-        onChange: id => setTargetKind(id)
-      }),
-      jsx(SnapshotSelect, {
-        label: 'awaiting approval (from pool_status)',
-        items: awaiting,
-        value: '',
-        onChange: onPickAwaiting,
-        emptyHint: SNAPSHOT_KIND_EMPTY.awaiting,
-        refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'full', gateway) : undefined,
-        loadingKey: 'poolStatus',
-        ops,
-        allowManual: false,
-        selectLabel: '(pick an awaiting-approval target)',
-        resetKey: targetKind
-      }),
-      targetKind === 'repo'
-        ? jsx(SnapshotSelect, {
-            label: 'repo_id',
-            items: repos,
-            value: repoId,
-            onChange: setRepoId,
-            emptyHint: SNAPSHOT_KIND_EMPTY.repos,
-            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'repos', gateway) : undefined,
-        loadingKey: 'repos',
-            ops,
-            allowManual: true,
-            manualPlaceholder: 'my-repo',
-            manualValue: repoId,
-            onManualChange: setRepoId,
-            resetKey: targetKind
-          })
-        : jsx(SnapshotSelect, {
-            label: 'ticket_id',
-            items: tasks,
-            value: ticketId,
-            onChange: setTicketId,
-            emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
-            refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
-        loadingKey: 'tasks',
-            refreshKind: 'fetch-tasks',
-            ops,
-            allowManual: true,
-            manualPlaceholder: 'ticket_id',
-            manualValue: ticketId,
-            onManualChange: setTicketId,
-            resetKey: targetKind
-          }),
-      field('canonical checkout path (default: work/integrate/<repo_id>/)', jsx('input', { className: inputClass, value: checkoutPath, onChange: e => setCheckoutPath(e.target.value), placeholder: repoId.trim() ? `work/integrate/${repoId.trim()}/` : 'work/integrate/<repo_id>/' })),
-      jsx('div', { className: 'text-(--ui-text-tertiary)', children: `effective checkout: ${str(effectiveCheckout) || '(enter a repo_id to prefill the work/integrate/ convention)'}` }),
-      failureHints(MERGE_FAILURES),
-      pendingConfirm
-        ? jsx(ConfirmCard, { card: pendingConfirm.card, onConfirm: onConfirmOp, onCancel: () => setPendingConfirm(null) })
-        : submitButton({ disabled: !ready, title: disabledTitle, onClick: onSubmit, children: PRIMARY_BUTTONS.merge })
-    ]
-  })
+// One muted caption line under each form header: plain-language guidance for
+// what the operation does and what to expect back.
+function formCaption(text) {
+  return jsx('div', { className: 'text-(--ui-text-tertiary)', children: text })
 }
 
 const TRACKER_TABS = [
@@ -1927,11 +975,13 @@ function OpDetailsFold({ op }) {
     className: 'flex flex-col gap-1',
     children: [
       jsxs('button', {
-        className: 'rounded-md px-2 py-0.5 text-left text-(--ui-text-tertiary)',
+        className: btnGhost,
+        'aria-expanded': open,
         onClick: () => setOpen(v => !v),
         children: [
-          jsx('span', { children: open ? '▾ details' : '▸ details' }),
-          unparsed ? jsx('span', { className: 'text-(--ui-text-secondary)', children: ' · review manually' }) : null
+          jsx('span', { 'aria-hidden': 'true', children: open ? '▾' : '▸' }),
+          jsx('span', { children: 'details' }),
+          unparsed ? jsx('span', { className: 'text-(--ui-text-secondary)', children: '· review manually' }) : null
         ]
       }),
       open
@@ -1950,7 +1000,6 @@ function OpDetailsFold({ op }) {
 }
 
 function opRow(op, lookup, handlers) {
-  const retry = retryLegality(op)
   const hs = handlers || {}
   const substepsLine = op && op.args && Array.isArray(op.args.substeps)
     ? op.args.substeps.map(s => {
@@ -1971,7 +1020,7 @@ function opRow(op, lookup, handlers) {
               jsx('div', { className: 'text-(--ui-text-primary)', children: summarizeOp(op, lookup) }),
               jsx('div', {
                 className: 'text-(--ui-text-tertiary)',
-                children: `${str(op.gateway) === 'none' ? '' : str(op.gateway)}${op.at ? ` · ${new Date(op.at).toLocaleString()}` : ''}`
+                children: `${str(op.gateway) === 'none' ? '' : str(op.gateway)}${op.at ? ` · ${new Date(op.at).toLocaleString()}` : ''}${op.status === 'copied' ? ' · prompt copied' : ''}`
               }),
               op.error ? jsx('div', { className: 'text-(--ui-text-secondary)', children: `error: ${str(op.error)}` }) : null,
               substepsLine
@@ -1982,24 +1031,15 @@ function opRow(op, lookup, handlers) {
           jsxs('div', {
             className: 'flex items-center gap-2',
             children: [
-              retry === 'deliver'
-                ? jsx('button', {
-                    className: 'rounded-md px-2 py-0.5 text-xs text-(--ui-text-primary)',
-                    title: 'grant not consumed',
-                    onClick: () => hs.onRetryDeliver && hs.onRetryDeliver(op),
-                    children: 'Retry deliver'
-                  })
-                : null,
-              retry === 'resubmit'
-                ? jsx('button', {
-                    className: 'rounded-md px-2 py-0.5 text-xs text-(--ui-text-primary)',
-                    title: 're-submits the exact same op text',
-                    onClick: () => hs.onResubmit && hs.onResubmit(op),
-                    children: 'Retry'
-                  })
-                : null,
+              hs.extra || null,
+              jsx('button', {
+                className: btnGhost,
+                title: 'Rebuilds the companion prompt and copies it to the clipboard',
+                onClick: () => hs.onCopyPrompt && hs.onCopyPrompt(op),
+                children: 'Copy prompt again'
+              }),
               op.status === 'refused'
-                ? jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'read the refusal; fix the cause, then re-run the flow.' })
+                ? jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'read the refusal; fix the cause, then copy the prompt again.' })
                 : null,
               jsx('span', { className: opPillClass(op.status), children: str(OP_STATUS_PILL[op.status] || op.status) })
             ]
@@ -2015,7 +1055,11 @@ function opRow(op, lookup, handlers) {
 // pool_status snapshot. The Awaiting-approval tab renders ONLY entries from
 // snapshot.poolStatus.awaitingApproval (i.e. real pool_status output), never
 // inferred from ops.
-function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing, onApproveRequest }) {
+// The tracker, demoted to a read-only history panel ("Activity & replies").
+// Stored op rows render with status pills and OpDetailsFold (verbatim reply +
+// composed prompt); statuses still update from the sidecar. No submit/retry
+// actions remain — only copy-prompt companions.
+function TrackerSection({ ctx, ops, poolStatus, gateway, onRefresh, refreshing, copyAndLog, copyText }) {
   const [tab, setTab] = useState('active')
   const [auditTicket, setAuditTicket] = useState('')
   const list = Array.isArray(ops) ? ops : []
@@ -2026,56 +1070,53 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
     const s = snapshotSources(ctx)
     return { repos: s.repos, tasks: s.tasks }
   })()
-  const onRetryDeliver = async op => {
-    if (noSession) return
-    const a = (op && op.args) || {}
-    if (a.repoId == null || a.manifest == null || a.transferTicket == null || a.grantToken == null) return
-    const text = pushDeliverPrompt({ gateway, repoId: str(a.repoId), version: a.version != null ? str(a.version) : '', ticketJson: str(a.manifest), transferTicket: str(a.transferTicket), grantToken: str(a.grantToken) })
-    const ok = await host.composer.submit(sessionId, text)
-    updateOp(ctx, op.id, { args: { substatus: 'deliver' }, status: ok ? 'awaiting agent' : 'failed', ...(ok ? {} : { error: 'composer unreachable' }) })
-    onRefresh()
-    notifyOp(ctx, ok ? 'info' : 'failed', ok ? 'push deliver re-submitted — awaiting agent' : 'composer unreachable', { id: op.id })
-  }
-  const onResubmit = async op => {
-    if (noSession || !op || !op.text) return
-    const ok = await host.composer.submit(sessionId, op.text)
-    updateOp(ctx, op.id, { status: ok ? 'awaiting agent' : 'failed', ...(ok ? {} : { error: 'composer unreachable' }) })
-    onRefresh()
-    notifyOp(ctx, ok ? 'info' : 'failed', ok ? `${str(op.kind)} re-submitted — awaiting agent` : 'composer unreachable', { id: op.id })
-  }
-  const rowHandlers = { onRetryDeliver, onResubmit }
-  const renderRow = op => opRow(op, lookup, rowHandlers)
+  const onCopyPrompt = op => copyText(promptForOp(op, gateway))
+  const renderRow = (op, extra) => opRow(op, lookup, { onCopyPrompt, extra })
 
   let body = null
   if (tab === 'active') {
     const active = list.filter(op => op && isActiveStatus(op.status))
     body = active.length
-      ? jsx('div', { className: 'flex flex-col gap-1', children: active.slice(0, 20).map(renderRow) })
-      : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No active operations.' })
+      ? jsx('div', { className: 'flex flex-col gap-1', children: active.slice(0, 20).map(op => renderRow(op)) })
+      : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No recorded activity yet. Copy any prompt and paste it to your agent in chat — replies appear here.' })
   } else if (tab === 'awaiting') {
     body = awaiting.length
-      ? jsx('div', { className: 'flex flex-col gap-1', children: awaiting.map((entry, i) => jsxs('div', { key: str(entry && entry.id) !== 'none' ? str(entry.id) : i, className: 'flex items-center justify-between gap-2 rounded-md px-2 py-1 text-(--ui-text-primary)', children: [
-          jsx('span', { children: `${str(entry && entry.id)}${entry && entry.version != null ? ` · v${str(entry.version)}` : ''} (from pool_status)` }),
-          jsxs('div', {
-            className: 'flex items-center gap-2',
-            children: [
-              jsx('button', { className: 'rounded-md px-2 py-0.5 text-xs text-(--ui-text-primary)', disabled: noSession, title: noSession ? submitTitle : 'Pre-fill the Approve confirm card', onClick: () => onApproveRequest && onApproveRequest(entry, false), children: 'Approve' }),
-              jsx('button', { className: 'rounded-md px-2 py-0.5 text-xs text-(--ui-text-secondary)', disabled: noSession, title: noSession ? submitTitle : 'Pre-fill the Deny confirm card', onClick: () => onApproveRequest && onApproveRequest(entry, true), children: 'Deny' })
-            ]
-          })
-        ] })) })
+      ? jsx('div', { className: 'flex flex-col gap-1', children: awaiting.map((entry, i) => {
+          const repoId = entry && entry.repo != null ? str(entry.repo) : undefined
+          const ticketId = entry && entry.ticket != null ? str(entry.ticket) : undefined
+          const version = entry && entry.version != null ? entry.version : undefined
+          const target = ticketId ? { ticketId, gateway } : { repoId: repoId || str(entry && entry.id), version, gateway }
+          return jsxs('div', { key: str(entry && entry.id) !== 'none' ? str(entry.id) : i, className: 'flex items-center justify-between gap-2 rounded-md px-2 py-1 text-(--ui-text-primary)', children: [
+            jsx('span', { children: `${str(entry && entry.id)}${entry && entry.version != null ? ` · v${str(entry.version)}` : ''} (from pool_status)` }),
+            jsxs('div', {
+              className: 'flex items-center gap-2',
+              children: [
+                jsx('button', { className: btnPrimary, title: 'Copies the approve prompt — paste it to your agent in chat', onClick: () => copyAndLog('approve', target), children: 'Copy approve prompt' }),
+                jsx('button', { className: btnSecondary, title: 'Copies the deny prompt (--deny) — paste it to your agent in chat', onClick: () => copyAndLog('deny', target), children: 'Copy deny prompt' }),
+                jsx('button', { className: btnGhost, title: 'Copies the merge prompt — paste it to your agent in chat', onClick: () => copyAndLog('merge', { ...target, checkoutPath: repoId ? `work/integrate/${repoId}/` : undefined }), children: 'Copy merge prompt' })
+              ]
+            })
+          ] })
+        }) })
       : jsx('div', { className: 'text-(--ui-text-tertiary)', children: poolStatus ? 'Nothing awaiting approval in the last pool_status snapshot.' : 'No pool_status snapshot yet — hit Refresh or request a status report.' })
   } else if (tab === 'claims') {
     body = jsxs('div', {
       className: 'flex flex-col gap-1',
       children: [
+        jsx('button', { className: btnGhost, onClick: () => copyAndLog('claim-auto', { gateway, maxTasks: 1 }), children: 'Copy auto-assign prompt (/claim --any-project --max-tasks 1)' }),
         jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Budgets (from pool_status)' }),
         budgets.length
           ? budgets.map((b, i) => jsx('div', { key: i, className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', children: `${str(b && b.line)}${b && b.exhausted ? ' — EXHAUSTED' : ''}` }))
           : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No budget lines in the last pool_status snapshot.' }),
         jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Claim ops' }),
         claimList.length
-          ? claimList.slice(0, 20).map(renderRow)
+          ? claimList.slice(0, 20).map(op => renderRow(op, jsx('button', {
+              key: 'push',
+              className: btnGhost,
+              title: 'Copies the push (grant → package → deliver) prompt — paste it to your agent in chat',
+              onClick: () => copyAndLog('push', { gateway, ticketId: op && op.args && (op.args.ticket || op.args.key), repoId: op && op.args && op.args.repoId, worktreePath: op && op.args && op.args.worktreePath, poolId: op && op.args && op.args.poolId }),
+              children: 'Copy push prompt'
+            })))
           : jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No claim ops recorded.' })
       ]
     })
@@ -2090,23 +1131,17 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
           onChange: setAuditTicket,
           emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
           selectLabel: '(all tickets)',
-          refreshAction: sessionId ? () => refreshSnapshot(ctx, sessionId, 'tasks', gateway) : undefined,
-        loadingKey: 'tasks',
-          refreshKind: 'fetch-tasks',
-          ops: list,
           allowManual: true,
           manualPlaceholder: 'ticket_id',
           manualValue: auditTicket,
           onManualChange: setAuditTicket
         }),
-        submitButton({
-          disabled: noSession,
-          title: noSession ? submitTitle : undefined,
-          onClick: async () => {
-            if (noSession) return
-            await host.composer.submit(sessionId, auditShowPrompt(gateway, auditTicket))
-          },
-          children: 'Run /audit show'
+        formCaption('Read-only audit report for a ticket or repo. Copy the prompt and paste it to your agent in chat — no approval implied.'),
+        jsx('button', {
+          className: btnPrimary,
+          title: 'Copies the audit prompt — paste it to your agent in chat',
+          onClick: () => copyAndLog('audit-show', { gateway, ticketId: auditTicket }),
+          children: 'Copy audit prompt'
         })
       ]
     })
@@ -2118,27 +1153,16 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
       jsxs('div', {
         className: 'flex items-center justify-between gap-2',
         children: [
-          jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Operations' }),
+          jsx('div', { className: 'text-(--ui-text-secondary)', children: 'Activity & replies' }),
           jsxs('div', {
             className: 'flex items-center gap-2',
             children: [
-              jsx('button', { className: 'rounded-md px-2 py-1 text-(--ui-text-primary)', onClick: onRefresh, disabled: refreshing, children: refreshing ? 'Refreshing…' : 'Refresh' }),
-              jsx('button', {
-                className: 'rounded-md px-2 py-1 text-(--ui-text-primary)',
-                disabled: noSession,
-                title: noSession ? submitTitle : 'Ask the agent to run pool_status and report it via pool_pane_report',
-                onClick: async () => {
-                  if (noSession) return
-                  await host.composer.submit(sessionId, BATCHED_STATUS_PROMPT)
-                  onRefresh()
-                },
-                children: 'Report status'
-              })
+              jsx('button', { className: btnSecondary, onClick: onRefresh, disabled: refreshing, children: refreshing ? 'Refreshing…' : 'Refresh' })
             ]
           })
         ]
       }),
-      poolStatus && poolStatus.at ? jsx('div', { className: 'text-(--ui-text-tertiary)', children: `pool_status snapshot: ${new Date(poolStatus.at).toLocaleString()}` }) : null,
+      jsx('div', { className: 'text-(--ui-text-tertiary)', role: 'status', children: `pool_status snapshot: ${poolStatus && poolStatus.at ? new Date(poolStatus.at).toLocaleString() : 'no snapshot yet'}` }),
       jsx(SegmentedControl, {
         options: TRACKER_TABS,
         value: tab,
@@ -2149,16 +1173,351 @@ function TrackerSection({ ctx, ops, poolStatus, gateway, sessionId, noSession, s
   })
 }
 
-function isCollapsed(storage, id) {
-  if (id in poolPaneStore.collapsed) {
-    return Boolean(poolPaneStore.collapsed[id])
-  }
-  return Boolean(storage.get(STORAGE_KEYS.collapsed(id), false))
+// variant: 'primary' (filled) for the single most-likely action per section,
+// 'secondary' (outlined) for everything else.
+function submitButton({ disabled, title, children, onClick, variant = 'secondary' }) {
+  return jsx('button', {
+    className: variant === 'primary' ? btnPrimary : btnSecondary,
+    disabled,
+    title: disabled ? title : undefined,
+    onClick,
+    children
+  })
 }
 
-function setCollapsed(storage, id, value) {
-  poolPaneStore.collapsed[id] = value
-  storage.set(STORAGE_KEYS.collapsed(id), value)
+// --- prompt companions: input widgets that compose clipboard prompts --------
+// Every field below feeds a copy-to-clipboard prompt built from the CURRENT
+// values. Nothing submits; nothing records 'submitted'. Pasting the prompt
+// into a Hermes chat is the operator's act, not the pane's.
+const PASTE_HINT = 'Paste this in your Hermes chat — the agent runs it against the maintainer gateway/ledger.'
+
+function PromptGroup({ title, children }) {
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 rounded-md p-2',
+    children: [
+      jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: str(title) }),
+      children
+    ]
+  })
+}
+
+function PromptCompanionSection({ ctx, ops, poolStatus, gateway, copyAndLog }) {
+  const sources = snapshotSources(ctx)
+  const poolsRaw = itemsFor({ poolStatus: sources.poolStatus, repos: sources.repos }, 'pools')
+  const pools = poolsRaw.length ? poolsRaw : [{ id: 'demo-pool' }]
+  const openTickets = sources.tasks.filter(t => t && t.state === 'open')
+  const latestClaim = asArray(ops).find(o => o && o.kind === 'claim' && o.args && (o.args.worktreePath || o.args.ticket || o.args.ticketId))
+  const granted = poolStatus && poolStatus.grantToken ? str(poolStatus.grantToken) : null
+
+  // add-repo (target is a NEW repo: id/path entry, not a pool pick)
+  const [repoPath, setRepoPath] = useState('')
+  const [repoId, setRepoId] = useState('')
+  const [repoPool, setRepoPool] = useState('demo-pool')
+  // add-task
+  const [taskRepo, setTaskRepo] = useState('')
+  const [taskTitle, setTaskTitle] = useState('')
+  const [taskBrief, setTaskBrief] = useState('')
+  const [taskPool, setTaskPool] = useState('demo-pool')
+  // claim
+  const [claimTicket, setClaimTicket] = useState('')
+  const [claimDest, setClaimDest] = useState('')
+  // push
+  const [pushRepo, setPushRepo] = useState('')
+  const [pushTicket, setPushTicket] = useState('')
+  const [pushVersion, setPushVersion] = useState('')
+  const [pushPool, setPushPool] = useState('demo-pool')
+  const [pushWorktree, setPushWorktree] = useState(() => (latestClaim && latestClaim.args && latestClaim.args.worktreePath) ? str(latestClaim.args.worktreePath) : '')
+  // fetch
+  const [fetchRepo, setFetchRepo] = useState('')
+  // pull
+  const [pullTicket, setPullTicket] = useState('')
+  const [pullDest, setPullDest] = useState('')
+  // approve / deny (shared fields; maintainer-only)
+  const [approveRepo, setApproveRepo] = useState('')
+  const [approveVersion, setApproveVersion] = useState('')
+  // merge (maintainer-only)
+  const [mergeRepo, setMergeRepo] = useState('')
+  const [mergeVersion, setMergeVersion] = useState('')
+  const [mergeCheckout, setMergeCheckout] = useState('')
+
+  const repoPathOk = isAbsoluteLocalPath(repoPath)
+  const addRepoId = repoId.trim() || repoNameFromPath(repoPath)
+  const poolSelect = (value, onChange, label) => jsx(SnapshotSelect, {
+    label: label || 'pool',
+    items: pools,
+    value,
+    onChange,
+    emptyHint: SNAPSHOT_KIND_EMPTY.pools,
+    selectLabel: '(select a pool)',
+    allowManual: true,
+    manualPlaceholder: 'pool_id',
+    manualValue: value,
+    onManualChange: onChange
+  })
+
+  return jsxs('div', {
+    className: 'flex flex-col gap-3',
+    children: [
+      jsx(PromptGroup, {
+        title: 'Add a repo to the pool',
+        children: [
+          field('path (absolute, local checkout)', jsx('input', { className: inputClass, value: repoPath, onChange: e => setRepoPath(e.target.value), placeholder: '/home/you/src/repo' })),
+          poolSelect(repoPool, setRepoPool, 'pool'),
+          field('repo id (optional — defaults to the directory name)', jsx('input', { className: inputClass, value: repoId, onChange: e => setRepoId(e.target.value), placeholder: repoNameFromPath(repoPath) || 'my-repo' })),
+          formCaption('New repo: enter its id (or leave blank to use the directory name). If the pool already has accepted versions, the agent should run /fetch repo <id> first and pass --version <next>. ' + PASTE_HINT),
+          jsx('button', {
+            className: btnPrimary,
+            disabled: !repoPathOk,
+            title: repoPathOk ? 'Copy the /add-repo prompt' : 'absolute local path only',
+            onClick: () => copyAndLog('add-repo-owner', { gateway, repoId: addRepoId, path: repoPath.trim(), poolId: repoPool.trim() }),
+            children: 'Copy /add-repo prompt'
+          })
+        ]
+      }),
+      jsx(PromptGroup, {
+        title: 'Open a task (ticket)',
+        children: [
+          jsx(SnapshotSelect, {
+            label: 'repo',
+            items: sources.repos,
+            value: taskRepo,
+            onChange: setTaskRepo,
+            emptyHint: SNAPSHOT_KIND_EMPTY.repos,
+            selectLabel: '(select a repo)',
+            allowManual: true,
+            manualPlaceholder: 'repo_id',
+            manualValue: taskRepo,
+            onManualChange: setTaskRepo
+          }),
+          field('title', jsx('input', { className: inputClass, value: taskTitle, onChange: e => setTaskTitle(e.target.value), placeholder: 'Fix the thing' })),
+          field('brief', jsx('textarea', { className: inputClass, value: taskBrief, onChange: e => setTaskBrief(e.target.value), placeholder: 'What the ticket should say…', rows: 2 })),
+          poolSelect(taskPool, setTaskPool, 'pool'),
+          formCaption('Composes /task_add (flat alias — the spaced `task add` drops --pool). ' + PASTE_HINT),
+          jsx('button', {
+            className: btnPrimary,
+            disabled: !(taskRepo.trim() && taskTitle.trim()),
+            title: 'Copy the /task_add prompt',
+            onClick: () => copyAndLog('add-task', { gateway, repoId: taskRepo.trim(), title: taskTitle.trim(), brief: taskBrief.trim(), poolId: taskPool.trim() }),
+            children: 'Copy /task_add prompt'
+          })
+        ]
+      }),
+      jsx(PromptGroup, {
+        title: 'Claim a task',
+        children: [
+          jsx(SnapshotSelect, {
+            label: 'open ticket',
+            items: openTickets,
+            value: claimTicket,
+            onChange: setClaimTicket,
+            emptyHint: 'No open tickets in the snapshot — Refresh or fetch the catalog',
+            selectLabel: '(select an open ticket)',
+            allowManual: true,
+            manualPlaceholder: 'ticket_id',
+            manualValue: claimTicket,
+            onManualChange: setClaimTicket
+          }),
+          field('work dir (optional)', jsx('input', { className: inputClass, value: claimDest, onChange: e => setClaimDest(e.target.value), placeholder: '<work dir>' })),
+          formCaption('Composes /claim <ticket>. ' + PASTE_HINT),
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx('button', {
+                className: btnPrimary,
+                disabled: !claimTicket.trim(),
+                title: 'Copy the /claim prompt',
+                onClick: () => copyAndLog('claim', { gateway, ticketId: claimTicket.trim(), dest: claimDest.trim() || undefined }),
+                children: 'Copy /claim prompt'
+              }),
+              jsx('button', {
+                className: btnGhost,
+                title: 'Copy the auto-assign prompt',
+                onClick: () => copyAndLog('claim-auto', { gateway, maxTasks: 1 }),
+                children: 'Copy auto-assign prompt'
+              })
+            ]
+          })
+        ]
+      }),
+      jsx(PromptGroup, {
+        title: 'Push work (grant → package → deliver)',
+        children: [
+          jsx(SnapshotSelect, {
+            label: 'repo',
+            items: sources.repos,
+            value: pushRepo,
+            onChange: setPushRepo,
+            emptyHint: SNAPSHOT_KIND_EMPTY.repos,
+            selectLabel: '(select a repo)',
+            allowManual: true,
+            manualPlaceholder: 'repo_id',
+            manualValue: pushRepo,
+            onManualChange: setPushRepo
+          }),
+          jsx(SnapshotSelect, {
+            label: 'ticket',
+            items: sources.tasks,
+            value: pushTicket,
+            onChange: setPushTicket,
+            emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
+            selectLabel: '(select a ticket)',
+            allowManual: true,
+            manualPlaceholder: 'ticket_id',
+            manualValue: pushTicket,
+            onManualChange: setPushTicket
+          }),
+          field('version (optional — defaults to accepted_version + 1)', jsx('input', { className: inputClass, value: pushVersion, onChange: e => setPushVersion(e.target.value), placeholder: 'auto' })),
+          poolSelect(pushPool, setPushPool, 'pool'),
+          field('worktree path (auto-filled from your latest claim)', jsx('input', { className: inputClass, value: pushWorktree, onChange: e => setPushWorktree(e.target.value), placeholder: '/path/to/worktree' })),
+          granted ? formCaption(`grant token detected in pool_status (${granted.slice(0, 8)}…) — the deliver step will use it. ` + PASTE_HINT) : formCaption('No grant token in the last pool_status snapshot — the agent requests the grant first. ' + PASTE_HINT),
+          jsx('button', {
+            className: btnPrimary,
+            disabled: !(pushRepo.trim() && pushTicket.trim()),
+            title: 'Copy the combined grant/package/deliver prompt',
+            onClick: () => copyAndLog('push', {
+              gateway,
+              repoId: pushRepo.trim(),
+              ticketId: pushTicket.trim(),
+              worktreePath: pushWorktree.trim() || undefined,
+              poolId: pushPool.trim(),
+              version: pushVersion.trim() || undefined,
+              grantToken: poolStatus && poolStatus.grantToken || undefined,
+              transferTicket: poolStatus && poolStatus.transferTicket || undefined,
+              manifest: poolStatus && poolStatus.manifest || undefined
+            }),
+            children: 'Copy push prompt'
+          })
+        ]
+      }),
+      jsx(PromptGroup, {
+        title: 'Fetch the catalog',
+        children: [
+          jsx(SnapshotSelect, {
+            label: 'repo (optional)',
+            items: sources.repos,
+            value: fetchRepo,
+            onChange: setFetchRepo,
+            emptyHint: SNAPSHOT_KIND_EMPTY.repos,
+            selectLabel: '(all repos)',
+            allowManual: true,
+            manualPlaceholder: 'repo_id',
+            manualValue: fetchRepo,
+            onManualChange: setFetchRepo
+          }),
+          formCaption('Read-only fetch of repo/task lists. ' + PASTE_HINT),
+          jsx('button', {
+            className: btnSecondary,
+            title: 'Copy the /fetch prompt',
+            onClick: () => copyAndLog('fetch-tasks', { gateway, repoId: fetchRepo.trim() || undefined }),
+            children: 'Copy /fetch prompt'
+          })
+        ]
+      }),
+      jsx(PromptGroup, {
+        title: 'Pull accepted bytes',
+        children: [
+          jsx(SnapshotSelect, {
+            label: 'ticket',
+            items: sources.tasks,
+            value: pullTicket,
+            onChange: setPullTicket,
+            emptyHint: SNAPSHOT_KIND_EMPTY.tasks,
+            selectLabel: '(select a ticket)',
+            allowManual: true,
+            manualPlaceholder: 'ticket_id',
+            manualValue: pullTicket,
+            onManualChange: setPullTicket
+          }),
+          field('destination (optional)', jsx('input', { className: inputClass, value: pullDest, onChange: e => setPullDest(e.target.value), placeholder: '<destination dir>' })),
+          formCaption('Runs scripts/contributor-claim.py to fetch the accepted bytes. ' + PASTE_HINT),
+          jsx('button', {
+            className: btnSecondary,
+            disabled: !pullTicket.trim(),
+            title: 'Copy the pull prompt',
+            onClick: () => copyAndLog('pull', { gateway, ticketId: pullTicket.trim(), dest: pullDest.trim() || undefined }),
+            children: 'Copy pull prompt'
+          })
+        ]
+      }),
+      jsx(PromptGroup, {
+        title: 'Approve or deny a version (maintainer-only)',
+        children: [
+          jsx(SnapshotSelect, {
+            label: 'repo',
+            items: sources.repos,
+            value: approveRepo,
+            onChange: setApproveRepo,
+            emptyHint: SNAPSHOT_KIND_EMPTY.repos,
+            selectLabel: '(select a repo)',
+            allowManual: true,
+            manualPlaceholder: 'repo_id',
+            manualValue: approveRepo,
+            onManualChange: setApproveRepo
+          }),
+          field('version (optional)', jsx('input', { className: inputClass, value: approveVersion, onChange: e => setApproveVersion(e.target.value), placeholder: 'auto' })),
+          formCaption('Maintainer-only (OWNER): the maintainer gateway accepts or refuses the version; the plugin refuses for non-owners. ' + PASTE_HINT),
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx('button', {
+                className: btnPrimary,
+                disabled: !approveRepo.trim(),
+                title: 'Copy the approve prompt',
+                onClick: () => copyAndLog('approve', { gateway, repoId: approveRepo.trim(), version: approveVersion.trim() || undefined }),
+                children: 'Copy approve prompt'
+              }),
+              jsx('button', {
+                className: btnSecondary,
+                disabled: !approveRepo.trim(),
+                title: 'Copy the deny prompt (--deny)',
+                onClick: () => copyAndLog('deny', { gateway, repoId: approveRepo.trim(), version: approveVersion.trim() || undefined }),
+                children: 'Copy deny prompt'
+              })
+            ]
+          })
+        ]
+      }),
+      jsx(PromptGroup, {
+        title: 'Merge an approved bundle (maintainer-only)',
+        children: [
+          jsx(SnapshotSelect, {
+            label: 'repo',
+            items: sources.repos,
+            value: mergeRepo,
+            onChange: setMergeRepo,
+            emptyHint: SNAPSHOT_KIND_EMPTY.repos,
+            selectLabel: '(select a repo)',
+            allowManual: true,
+            manualPlaceholder: 'repo_id',
+            manualValue: mergeRepo,
+            onManualChange: setMergeRepo
+          }),
+          field('version (optional)', jsx('input', { className: inputClass, value: mergeVersion, onChange: e => setMergeVersion(e.target.value), placeholder: '<N>' })),
+          field('checkout path (optional)', jsx('input', { className: inputClass, value: mergeCheckout, onChange: e => setMergeCheckout(e.target.value), placeholder: mergeRepo.trim() ? `work/integrate/${mergeRepo.trim()}/` : 'work/integrate/<repo>/' })),
+          formCaption('Maintainer-only (OWNER): the plugin never merges — the agent does it as its own git work. ' + PASTE_HINT),
+          jsx('button', {
+            className: btnSecondary,
+            disabled: !mergeRepo.trim(),
+            title: 'Copy the merge prompt',
+            onClick: () => copyAndLog('merge', { gateway, repoId: mergeRepo.trim(), version: mergeVersion.trim() || undefined, checkoutPath: mergeCheckout.trim() || undefined }),
+            children: 'Copy merge prompt'
+          })
+        ]
+      }),
+      jsx(PromptGroup, {
+        title: 'Prune stale worktrees',
+        children: [
+          formCaption('Read-only audit first: the agent prints the keep/delete list before deleting anything. ' + PASTE_HINT),
+          jsx('button', {
+            className: btnSecondary,
+            title: 'Copy the prune prompt',
+            onClick: () => copyAndLog('prune', { gateway }),
+            children: 'Copy prune prompt'
+          })
+        ]
+      })
+    ]
+  })
 }
 
 // --- console body -------------------------------------------------------------
@@ -2168,72 +1527,370 @@ function setCollapsed(storage, id, value) {
 // are read in PoolConsole and passed in.
 // First-run onboarding card: replaces the flow-card wall when no snapshot
 // has ever landed. Both actions live inside the card.
-function OnboardingCard({ ctx, sessionId, gateway, recordOp, noSession }) {
-  const onRefresh = () => { if (sessionId) refreshSnapshot(ctx, sessionId, 'full', gateway) }
-  const onDiscover = async () => {
-    if (noSession) return
-    await recordOp({ kind: 'discover', gateway, args: { snapshot: 'snapshot.discovered' }, text: discoverReposPrompt() })
-  }
+function OnboardingCard({ onRefresh }) {
   return jsxs('div', {
     className: 'flex flex-col gap-2 rounded-md p-2',
     children: [
       jsx('div', { className: 'font-medium text-(--ui-text-primary)', children: 'Welcome to your Pool Console' }),
       jsx('div', {
         className: 'text-(--ui-text-secondary)',
-        children: '① Click Refresh pools to load your pools, repos and approval queue ② (optional) Discover repos to index local git worktrees. Everything after that is dropdowns and buttons.'
+        children: [
+          jsx('div', { children: 'Pick any action in this console — add a repo, claim a ticket, approve a version — and the pane copies a ready-made prompt to your clipboard.' }),
+          jsx('div', { children: 'Paste it to your agent in a Desktop chat (open any chat and paste). The agent runs the command on the gateway and replies; the reply appears here under Activity & replies.' }),
+          jsx('div', { children: 'The tables at the top (Repos, Tasks, Worktrees) are live local reads — Refresh updates them without any agent round-trip. You can also just tell the agent in chat — e.g. "add the injection expansion task to demo-repo on demo-pool".' })
+        ]
       }),
       jsxs('div', {
         className: 'flex items-center gap-2',
         children: [
-          submitButton({ disabled: noSession, title: noSession ? 'no focused chat session — focus a chat to submit' : 'Load pools, repos and the approval queue', onClick: onRefresh, children: 'Refresh pools' }),
-          submitButton({ disabled: noSession, title: noSession ? 'no focused chat session — focus a chat to submit' : 'Ask the agent to enumerate local git repositories (read-only)', onClick: onDiscover, children: PRIMARY_BUTTONS.discover })
+          submitButton({ disabled: false, title: 'Re-read the plugin’s local state (no agent round-trip)', onClick: onRefresh, children: 'Refresh state' })
         ]
       })
     ]
   })
 }
 
-function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh, refreshing, approvePrefill, onApproveRequest, onApprovePrefillConsumed, sidecarDownAt }) {
-  const noSession = !sessionId
-  const submitTitle = noSession ? 'no focused chat session — focus a chat to submit' : undefined
+// --- pane sections (state, not commands) ------------------------------------
+// Every element below reads the plugin's local computed state (via ctx.storage
+// slots filled from /pane-state). No agent round-trip, no prompts.
+
+function SectionCard({ title, action, children }) {
+  return jsxs('section', {
+    className: 'flex flex-col gap-2 rounded-md p-3',
+    role: 'region',
+    'aria-label': str(title),
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-2',
+        children: [
+          jsx('h2', { className: 'text-sm font-semibold text-(--ui-text-primary)', children: title }),
+          action || null
+        ]
+      }),
+      children
+    ]
+  })
+}
+
+function Badge({ tone, children }) {
+  const toneClass = tone === 'ok' ? 'text-(--ui-text-primary)' : tone === 'warn' ? 'text-(--ui-text-secondary)' : 'text-(--ui-text-tertiary)'
+  return jsx('span', { className: `rounded-full px-2 py-0.5 text-xs ${toneClass}`, children })
+}
+
+function StatChip({ label, value, tone }) {
+  const valueClass = tone === 'ok' ? 'text-(--ui-text-primary)' : tone === 'bad' ? 'text-(--ui-text-secondary)' : 'text-(--ui-text-tertiary)'
+  return jsxs('div', {
+    className: 'flex min-w-0 flex-col gap-0.5 rounded-md p-2',
+    children: [
+      jsx('span', { className: 'uppercase tracking-wide text-(--ui-text-tertiary)', style: { fontSize: '11px' }, children: label }),
+      jsx('span', { className: `truncate ${valueClass}`, children: str(value) })
+    ]
+  })
+}
+
+function StatusStrip({ poolStatus }) {
+  const ps = poolStatus && typeof poolStatus === 'object' ? poolStatus.poolStatus : null
+  const tor = ps && ps.tor && typeof ps.tor === 'object' ? ps.tor : null
+  const torLabel = !tor
+    ? 'not reported'
+    : (tor.ready && typeof tor.ready === 'object' && tor.ready.error) ? 'not ready' : tor.ready ? 'ready' : 'unknown'
+  const torTone = tor ? (torLabel === 'ready' ? 'ok' : 'bad') : undefined
+  const awaiting = poolStatus && Array.isArray(poolStatus.awaitingApproval) ? poolStatus.awaitingApproval.length : 0
+  return jsxs('div', {
+    className: 'grid grid-cols-2 gap-2 sm:grid-cols-4',
+    role: 'status',
+    'aria-live': 'polite',
+    children: [
+      jsx(StatChip, { label: 'ledger', value: ps ? str(ps.ledger || 'unknown') : 'unknown', tone: ps && ps.ledger === 'ready' ? 'ok' : undefined }),
+      jsx(StatChip, { label: 'identity', value: ps ? str(ps.identity || 'unknown') : 'unknown', tone: ps && ps.identity === 'ready' ? 'ok' : undefined }),
+      jsx(StatChip, { label: 'tor ready', value: torLabel + (tor && tor.socks_port ? ` (${str(tor.socks_port)}/${str(tor.control_port)})` : ''), tone: torTone }),
+      jsx(StatChip, { label: 'awaiting approval', value: String(awaiting), tone: awaiting > 0 ? 'bad' : 'ok' })
+    ]
+  })
+}
+
+function RunBanner({ ops, refreshing }) {
+  if (refreshing) {
+    return jsx('div', { role: 'status', 'aria-live': 'polite', className: 'rounded-md px-2 py-1 text-xs text-(--ui-text-secondary)', children: 'Refreshing local state…' })
+  }
+  const active = asArray(ops).filter(o => o && (o.status === 'awaiting agent' || o.status === 'submitted'))
+  if (!active.length) return null
+  return jsx('div', {
+    role: 'status',
+    'aria-live': 'polite',
+    className: 'rounded-md px-2 py-1 text-xs text-(--ui-text-secondary)',
+    children: `${active.length} operation${active.length === 1 ? '' : 's'} awaiting the agent — this pane reads local state; no round-trip is pending for display.`
+  })
+}
+
+function ListsBanner({ meta, sidecarDownAt, lastUpdate, hasSnapshot }) {
+  if (sidecarDownAt && !hasSnapshot) {
+    return jsx('div', { role: 'status', className: 'rounded-md border border-(--ui-stroke-secondary) px-2 py-1 text-xs text-(--ui-text-secondary)', children: staleStripText(lastUpdate ?? sidecarDownAt) })
+  }
+  const m = meta && typeof meta === 'object' ? meta : null
+  if (m && m.error) {
+    return jsx('div', { role: 'alert', className: 'rounded-md border border-(--ui-stroke-secondary) px-2 py-1 text-xs text-(--ui-text-primary)', children: `lists error: ${str(m.error)}` })
+  }
+  if (m && m.warning) {
+    return jsx('div', { role: 'status', className: 'rounded-md border border-(--ui-stroke-tertiary) px-2 py-1 text-xs text-(--ui-text-secondary)', children: `lists: ${str(m.warning)}` })
+  }
+  return null
+}
+
+// Per-row companion: one small button that reveals a single path field and a
+// copy button. Copies prompt 1 (add repo owner) with repo_id prefilled.
+function RepoAddCompanion({ gateway, repoId, copyAndLog }) {
+  const [open, setOpen] = useState(false)
+  const [path, setPath] = useState('')
+  if (!open) {
+    return jsx('button', { className: btnGhost, title: 'Copy a prompt to add this repo via your agent', onClick: () => setOpen(true), children: 'Add repo' })
+  }
+  const pathOk = isAbsoluteLocalPath(path)
+  return jsxs('div', {
+    className: 'flex items-center gap-1',
+    children: [
+      jsx('input', { className: inputClass, value: path, onChange: e => setPath(e.target.value), placeholder: '/home/you/src/repo', autoFocus: true }),
+      jsx('button', {
+        className: btnGhost,
+        disabled: !pathOk,
+        title: pathOk ? 'Copy the add-repo prompt' : 'absolute local path only',
+        onClick: () => copyAndLog('add-repo-owner', { gateway, repoId, path }),
+        children: 'Copy prompt'
+      })
+    ]
+  })
+}
+
+function RepoTable({ repos, worktrees, loading, gateway, copyAndLog }) {
+  const list = asArray(repos)
+  const wt = asArray(worktrees)
+  const bundleCount = id => {
+    const hit = wt.find(w => w && str(w.repo_id) === str(id))
+    return hit && Array.isArray(hit.bundles) ? hit.bundles.length : 0
+  }
+  if (loading) return jsx('div', { role: 'status', className: 'text-(--ui-text-tertiary)', children: 'Loading repos…' })
+  if (!list.length) {
+    return jsxs('div', {
+      className: 'flex flex-col items-start gap-2',
+      children: [
+        jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No repos in the pool yet.' }),
+        jsx('button', { className: btnPrimary, onClick: () => copyAndLog('add-repo-owner', { gateway, repoId: '<repo_id>', path: '<abs_path>' }), children: 'Ask your agent to add a repo to the pool' })
+      ]
+    })
+  }
+  const cols = ['Repo', 'Name', 'Accepted', 'Open', 'Claimed', 'Total', 'Bundles', 'Ask your agent']
+  return jsx('div', {
+    className: 'max-h-64 overflow-auto overscroll-contain',
+    children: jsxs('table', {
+      className: 'w-full text-left text-xs text-(--ui-text-primary)',
+      children: [
+        jsx('thead', {
+          children: jsx('tr', {
+            children: cols.map(h => jsx('th', { key: h, className: 'sticky top-0 bg-(--ui-bg-primary) px-2 py-1 font-medium text-(--ui-text-tertiary)', children: h }))
+          })
+        }),
+        jsx('tbody', {
+          children: list.map((r, i) => jsx('tr', {
+            key: `${str(r && r.repo_id)}:${i}`,
+            className: 'border-t border-(--ui-stroke-tertiary)',
+            children: [
+              jsx('td', { key: 'id', className: 'px-2 py-1', children: str(r && r.repo_id) }),
+              jsx('td', { key: 'name', className: 'px-2 py-1', children: str(r && (r.display_name || r.name)) }),
+              jsx('td', { key: 'acc', className: 'px-2 py-1', children: r && r.accepted_version != null ? `v${str(r.accepted_version)}` : '—' }),
+              jsx('td', { key: 'open', className: 'px-2 py-1', children: str(r && r.open_tickets) }),
+              jsx('td', { key: 'claimed', className: 'px-2 py-1', children: str(r && r.claimed_tickets) }),
+              jsx('td', { key: 'total', className: 'px-2 py-1', children: str(r && r.total_tickets) }),
+              jsx('td', { key: 'bundles', className: 'px-2 py-1', children: str(bundleCount(r && r.repo_id)) }),
+              jsx('td', { key: 'action', className: 'px-2 py-1', children: jsx(RepoAddCompanion, { gateway, repoId: str(r && r.repo_id), copyAndLog }) })
+            ]
+          }))
+        })
+      ]
+    })
+  })
+}
+
+function stateTone(state) {
+  if (state === 'completed') return 'ok'
+  if (state === 'claimed') return 'warn'
+  return undefined
+}
+
+function TaskTable({ tasks, loading, gateway, copyAndLog }) {
+  const [openId, setOpenId] = useState(null)
+  const list = asArray(tasks)
+  if (loading) return jsx('div', { role: 'status', className: 'text-(--ui-text-tertiary)', children: 'Loading tasks…' })
+  if (!list.length) {
+    return jsxs('div', {
+      className: 'flex flex-col items-start gap-2',
+      children: [
+        jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No tasks fetched yet.' }),
+        jsx('button', { className: btnPrimary, onClick: () => copyAndLog('fetch-tasks', { gateway }), children: 'Ask your agent to fetch the catalog' })
+      ]
+    })
+  }
+  const cols = ['', 'Ticket', 'Title', 'Repo', 'State']
+  return jsx('div', {
+    className: 'max-h-64 overflow-auto overscroll-contain',
+    children: jsxs('table', {
+      className: 'w-full text-left text-xs text-(--ui-text-primary)',
+      children: [
+        jsx('thead', {
+          children: jsx('tr', {
+            children: cols.map(h => jsx('th', { key: h, className: 'sticky top-0 bg-(--ui-bg-primary) px-2 py-1 font-medium text-(--ui-text-tertiary)', children: h }))
+          })
+        }),
+        jsx('tbody', {
+          children: list.flatMap((t, i) => {
+            const id = str(t && t.ticket_id)
+            const open = openId === id
+            const rows = [jsx('tr', {
+              key: `${id}:${i}`,
+              className: 'cursor-pointer border-t border-(--ui-stroke-tertiary) hover:bg-(--ui-bg-quaternary)',
+              onClick: () => setOpenId(open ? null : id),
+              'aria-expanded': open,
+              children: [
+                jsx('td', { key: 'chev', className: 'px-2 py-1 text-(--ui-text-tertiary)', 'aria-hidden': 'true', children: open ? '▾' : '▸' }),
+                jsx('td', { key: 'id', className: 'px-2 py-1', children: id }),
+                jsx('td', { key: 'title', className: 'px-2 py-1', children: str(t && t.title) }),
+                jsx('td', { key: 'repo', className: 'px-2 py-1', children: str(t && t.repo_id) }),
+                jsx('td', { key: 'state', className: 'px-2 py-1', children: jsx(Badge, { tone: stateTone(t && t.state), children: str(t && t.state) }) })
+              ]
+            })]
+            if (open) {
+              const claimedCopy = t && t.state === 'completed'
+                ? 'n/a — completed'
+                : (t && t.state === 'claimed' ? 'true' : str(t && t.claimed))
+              const detailChildren = [`pool: ${str(t && t.pool_id)} · claimant: ${str(t && t.claimant_key_id)} · claimed: ${claimedCopy}`]
+              if (t && t.state === 'open') {
+                detailChildren.push(jsx('div', {
+                  key: 'assign',
+                  className: 'mt-1',
+                  children: jsx('button', {
+                    className: btnGhost,
+                    title: 'Copies the claim prompt — paste it to your agent in chat',
+                    onClick: () => copyAndLog('claim', { gateway, ticketId: id }),
+                    children: `Claim ticket ${id}`
+                  })
+                }))
+              }
+              rows.push(jsx('tr', {
+                key: `${id}:${i}:detail`,
+                className: 'border-t border-(--ui-stroke-tertiary) text-(--ui-text-tertiary)',
+                children: jsx('td', {
+                  colSpan: 5,
+                  className: 'px-2 py-1',
+                  children: detailChildren
+                })
+              }))
+            }
+            return rows
+          })
+        })
+      ]
+    })
+  })
+}
+
+function WorktreeCard({ worktrees, gateway, copyAndLog }) {
+  const list = asArray(worktrees)
+  const pruneButton = jsx('div', {
+    className: 'mt-2',
+    children: jsx('button', {
+      className: btnPrimary,
+      title: 'Copies the prune prompt — paste it to your agent in chat',
+      onClick: () => copyAndLog('prune', { gateway }),
+      children: 'Prune stale worktrees'
+    })
+  })
+  if (!list.length) {
+    return jsxs('div', {
+      className: 'flex flex-col',
+      children: [
+        jsx('div', { className: 'text-(--ui-text-tertiary)', children: 'No bundles or worktrees on file yet (work/integrate is empty).' }),
+        pruneButton
+      ]
+    })
+  }
+  return jsxs('div', {
+    className: 'flex flex-col',
+    children: [
+      jsx('ul', {
+        className: 'flex flex-col gap-1 text-xs text-(--ui-text-secondary)',
+        children: list.map(w => jsxs('li', {
+          key: str(w && w.repo_id),
+          className: 'flex items-center justify-between gap-2',
+          children: [
+            jsx('span', { children: `${str(w && w.repo_id)} — bundles: ${asArray(w && w.bundles).length ? asArray(w && w.bundles).map(str).join(', ') : 'none'} · worktrees: ${asArray(w && w.worktrees).length ? asArray(w && w.worktrees).map(str).join(', ') : 'none'}` }),
+            jsx('button', { className: btnGhost, title: 'Copies the push prompt — paste it to your agent in chat', onClick: () => copyAndLog('push', { gateway, repoId: str(w && w.repo_id) }), children: 'Copy push prompt' })
+          ]
+        }))
+      }),
+      pruneButton
+    ]
+  })
+}
+
+function buildPaneBody(ctx, { gatewayState, gateway, setGateway, polling, setPolling, ops, copyAndLog, copyText, poolStatus, onRefresh, refreshing, sidecarDownAt }) {
   const isFirstRun = firstRun(ctx)
-  const hasSnapshot = Boolean(poolStatus) || readSnapshot(ctx, 'snapshot.repos').length > 0 || readSnapshot(ctx, 'snapshot.tasks').length > 0
+  const repos = readSnapshot(ctx, 'snapshot.repos')
+  const tasks = readSnapshot(ctx, 'snapshot.tasks')
+  const worktreesSnap = ctx.storage.get('snapshot.worktrees', null)
+  const worktrees = worktreesSnap && Array.isArray(worktreesSnap.items) ? worktreesSnap.items : []
+  const listsMeta = ctx.storage.get('snapshot.listsMeta', null)
+  const hasSnapshot = Boolean(poolStatus) || repos.length > 0 || tasks.length > 0
   const lastUpdate = poolStatus && typeof poolStatus === 'object' && poolStatus.at != null ? poolStatus.at : null
-  const showStaleStrip = Boolean(sidecarDownAt) && !hasSnapshot
+  const loading = refreshing && !hasSnapshot
 
   return jsxs('div', {
-    className: 'flex h-full flex-col gap-3 p-3 text-sm text-(--ui-text-primary)',
+    className: 'flex h-full min-h-0 flex-col gap-3 overflow-y-auto overscroll-contain p-3 text-sm text-(--ui-text-primary)',
     children: [
-      jsx('div', { className: 'font-medium', children: 'Agent Pool' }),
-      jsx('div', {
-        className: 'text-(--ui-text-secondary)',
-        children: `bound session: ${str(sessionId)}`
-      }),
-      jsx(SegmentedControl, {
-        options: [
-          { id: 'default', label: 'Maintainer' },
-          { id: 'pool-contrib', label: 'Contributor' }
-        ],
-        value: str(gateway),
-        onChange: id => {
-          poolPaneStore.gateway = id
-          ctx.storage.set(STORAGE_KEYS.gateway, id)
-          setGateway(id)
-        }
-      }),
       jsxs('div', {
-        className: 'flex flex-col gap-1 text-(--ui-text-secondary)',
+        className: 'flex items-center justify-between gap-2',
         children: [
-          jsx('div', { children: `gateway: ${str(gatewayState)}` }),
-          jsx('div', {
-            className: 'text-(--ui-text-tertiary)',
-            children: `tor ready? ${poolPaneStore.tor == null ? 'unknown — awaiting agent' : str(poolPaneStore.tor)}`
+          jsx('div', { className: 'font-medium', children: 'Agent Pool' }),
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              jsx('button', {
+                className: btnGhost,
+                title: 'Copies the contribute (link flow) prompt — paste it to your agent in chat',
+                onClick: () => copyAndLog('add-repo-link', { gateway, repoId: '<repo_id>', path: '<abs_path>' }),
+                children: 'Contribute repo'
+              }),
+              jsx('button', {
+                className: btnPrimary,
+                onClick: onRefresh,
+                disabled: refreshing,
+                children: refreshing ? 'Refreshing…' : 'Refresh'
+              })
+            ]
           })
         ]
       }),
+      jsxs('div', {
+        className: 'flex flex-wrap items-center justify-between gap-2',
+        children: [
+          jsx('div', { className: 'text-(--ui-text-tertiary)', children: `gateway: ${str(gatewayState)} — prompts name this profile` }),
+          jsx(SegmentedControl, {
+            options: [
+              { id: 'default', label: 'Maintainer' },
+              { id: 'pool-contrib', label: 'Contributor' }
+            ],
+            value: str(gateway),
+            onChange: id => {
+              poolPaneStore.gateway = id
+              ctx.storage.set(STORAGE_KEYS.gateway, id)
+              setGateway(id)
+            }
+          })
+        ]
+      }),
+      jsx(StatusStrip, { poolStatus }),
+      jsx(RunBanner, { ops, refreshing }),
       jsx(ToggleRow, {
         checked: polling,
-        description: 'Poll the gateway for status updates. Saved in this profile’s plugin storage.',
+        description: 'Poll the plugin’s local state every 60s. Saved in this profile’s plugin storage.',
         label: 'Polling',
         onChange: value => {
           poolPaneStore.polling = value
@@ -2241,24 +1898,33 @@ function buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, poll
           setPolling(value)
         }
       }),
-      showStaleStrip
-        ? jsx('div', { className: 'text-(--ui-text-secondary)', children: staleStripText(lastUpdate ?? sidecarDownAt) })
-        : null,
-      jsx(TrackerSection, { ctx, ops, poolStatus, gateway, sessionId, noSession, submitTitle, onRefresh, refreshing, onApproveRequest }),
+      jsx(ListsBanner, { meta: listsMeta, sidecarDownAt, lastUpdate, hasSnapshot }),
+      jsx(SectionCard, {
+        title: 'Repos',
+        children: jsx(RepoTable, { repos, worktrees, loading, gateway, copyAndLog })
+      }),
+      jsx(SectionCard, {
+        title: 'Tasks',
+        action: jsx('button', {
+          className: btnGhost,
+          title: 'Copies the ticket prompt — paste it to your agent in chat',
+          onClick: () => copyAndLog('add-task', { gateway }),
+          children: 'Ask your agent to open a ticket'
+        }),
+        children: jsx(TaskTable, { tasks, loading, gateway, copyAndLog })
+      }),
+      jsx(SectionCard, {
+        title: 'Worktrees & bundles (local)',
+        children: jsx(WorktreeCard, { worktrees, gateway, copyAndLog })
+      }),
+      jsx(SectionCard, {
+        title: 'Ask your agent — compose a prompt',
+        children: jsx(PromptCompanionSection, { ctx, ops, poolStatus, gateway, copyAndLog })
+      }),
+      jsx(TrackerSection, { ctx, ops, poolStatus, gateway, onRefresh, refreshing, copyAndLog, copyText }),
       isFirstRun
-        ? jsx(OnboardingCard, { ctx, sessionId, gateway, recordOp, noSession })
-        : jsxs('div', {
-            className: 'flex flex-col gap-3',
-            children: [
-              jsx(AddRepoForm, { ctx, sessionId, gateway, noSession, submitTitle, recordOp, ops }),
-              jsx(FetchTasksForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
-              jsx(ClaimForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops }),
-              jsx(PullRepoForm, { ctx, gateway, noSession, submitTitle, recordOp, ops }),
-              jsx(PushSubmitCard, { ctx, gateway, noSession, submitTitle, recordOp, ops, sessionId, refreshOps }),
-              jsx(ApproveForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops, prefill: approvePrefill, onPrefillConsumed: onApprovePrefillConsumed }),
-              jsx(MergeForm, { ctx, gateway, noSession, submitTitle, recordOp, sessionId, ops })
-            ]
-          })
+        ? jsx(OnboardingCard, { onRefresh })
+        : null
     ]
   })
 }
@@ -2299,7 +1965,6 @@ class PoolErrorBoundary extends Component {
 }
 
 function PoolConsole({ ctx }) {
-  const sessionId = useValue(host.state.focusedSessionId)
   const gatewayState = useValue(host.state.gateway)
   const [gateway, setGateway] = useState(() => str(poolPaneStore.gateway))
   const [polling, setPolling] = useState(() => poolPaneStore.polling)
@@ -2310,18 +1975,6 @@ function PoolConsole({ ctx }) {
   const [poolStatus, setPoolStatus] = useState(() => ctx.storage.get('snapshot.poolStatus', null))
   const [refreshing, setRefreshing] = useState(false)
   const [sidecarDownAt, setSidecarDownAt] = useState(null)
-  const [approvePrefill, setApprovePrefill] = useState(null)
-  const onApproveRequest = (entry, deny) => {
-    if (!entry) return
-    setApprovePrefill({
-      id: entry.id != null ? str(entry.id) : '',
-      repo: entry.repo != null ? str(entry.repo) : null,
-      ticket: entry.ticket != null ? str(entry.ticket) : null,
-      version: entry.version != null ? entry.version : null,
-      deny: Boolean(deny),
-      nonce: Date.now()
-    })
-  }
   // Agent→UI refresh: poll the pane-state sidecar (written by pool_pane_report,
   // served by this profile's own /pane-state route). Parsed defensively — a
   // missing/empty sidecar never throws.
@@ -2342,54 +1995,63 @@ function PoolConsole({ ctx }) {
       ctx.storage.set(OPS_KEY, nextOps)
       setOps(nextOps)
       const snap = {
-        at: parsed.at || Date.now(),
+        at: parsed.at,
         awaitingApproval: parsed.awaitingApproval,
         budgets: parsed.budgets,
-        poolStatus: parsed.poolStatus || null
+        poolStatus: parsed.poolStatus || null,
+        grantToken: parsed.grantToken || null,
+        transferTicket: parsed.transferTicket || null,
+        manifest: parsed.manifest || null
       }
       ctx.storage.set('snapshot.poolStatus', snap)
       setPoolStatus(snap)
-      if (parsed.tasks) ctx.storage.set('snapshot.tasks', { at: snap.at, items: Array.isArray(parsed.tasks) ? parsed.tasks : (parsed.tasks.items || parsed.tasks.table || []) })
-      if (parsed.claims) ctx.storage.set('snapshot.claims', { at: snap.at, items: Array.isArray(parsed.claims) ? parsed.claims : Object.values(parsed.claims) })
-      if (parsed.discovered) {
-        const items = Array.isArray(parsed.discovered)
-          ? parsed.discovered
-          : String(parsed.discovered).split('\n').map(l => l.trim()).filter(Boolean)
-        ctx.storage.set('snapshot.discovered', { at: snap.at, items })
+      const listsMeta = { at: snap.at, error: parsed.listsError || parsed.error || null, warning: parsed.listsWarning || null }
+      ctx.storage.set('snapshot.listsMeta', listsMeta)
+      if (parsed.tasks != null || parsed.listsError) {
+        const items = Array.isArray(parsed.tasks) ? parsed.tasks : (parsed.tasks && (parsed.tasks.items || parsed.tasks.table)) || []
+        ctx.storage.set('snapshot.tasks', { at: snap.at, items })
       }
+      if (parsed.repos != null || parsed.listsError) {
+        const items = Array.isArray(parsed.repos) ? parsed.repos : (parsed.repos && (parsed.repos.items || parsed.repos.repos)) || []
+        ctx.storage.set('snapshot.repos', { at: snap.at, items })
+      }
+      if (parsed.claims) ctx.storage.set('snapshot.claims', { at: snap.at, items: Array.isArray(parsed.claims) ? parsed.claims : Object.values(parsed.claims) })
+      if (parsed.worktrees) ctx.storage.set('snapshot.worktrees', { at: snap.at, items: parsed.worktrees })
     } finally {
       setRefreshing(false)
     }
   }
+  // Mount refresh: the pane-state route is a live computed read, so one
+  // re-read on mount keeps the pane honest without any agent round-trip.
+  useEffect(() => { refreshFromSidecar() }, [])
   // 60s poll — only while the user left polling ON. Check storage before
   // every timer set so a user-disabled toggle is never re-enabled.
   useEffect(() => {
     if (!polling) return undefined
-    if (!poolPaneStore.polling || !ctx.storage.get(STORAGE_KEYS.polling, false)) return undefined
+    if (!poolPaneStore.polling || !ctx.storage.get(STORAGE_KEYS.polling, true)) return undefined
     const id = setInterval(() => { refreshFromSidecar() }, 60000)
     return () => clearInterval(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [polling])
-  const recordOp = async op => {
-    const record = await submitOp(ctx, sessionId, op)
-    setOps(prev => [record, ...prev].slice(0, OPS_KEEP))
-    return record
+  // Copy a companion prompt to the clipboard; approve/push/prune copies also
+  // append a status:'copied' history record (no submit, ever).
+  const copyAndLog = async (actionId, args) => {
+    const rec = await copyPrompt(ctx, actionId, { gateway, ...(args || {}) })
+    if (rec) setOps(prev => [rec, ...prev].slice(0, OPS_KEEP))
+    return rec
   }
+  const copyTextTo = text => copyText(ctx, text)
 
   try {
-    const refreshOps = () => {
-      const stored = ctx.storage.get(OPS_KEY, [])
-      setOps(Array.isArray(stored) ? stored : [])
-    }
-    return buildPaneBody(ctx, { sessionId, gatewayState, gateway, setGateway, polling, setPolling, ops, recordOp, refreshOps, poolStatus, onRefresh: refreshFromSidecar, refreshing, approvePrefill, onApproveRequest, onApprovePrefillConsumed: () => setApprovePrefill(null), sidecarDownAt })
+    return buildPaneBody(ctx, { gatewayState, gateway, setGateway, polling, setPolling, ops, copyAndLog, copyText: copyTextTo, poolStatus, onRefresh: refreshFromSidecar, refreshing, sidecarDownAt })
   } catch (error) {
     return jsx(PaneErrorCard, { contributionId: CONTRIBUTION_IDS.page, error })
   }
 }
 
 // --- full page -------------------------------------------------------------
-// The /agent-pool route renders the full console (bound-session line, gateway
-// selector, status strip, every form, the tracker) inside an error boundary.
+// The /agent-pool route renders the full console (gateway selector, status strip,
+// tables, prompt companions, the Activity & replies history) inside an error boundary.
 
 // --- settings --------------------------------------------------------------
 
@@ -2398,7 +2060,7 @@ function GeneralSettings() {
     className: 'flex flex-col gap-1',
     children: [
       jsx(ListRow, {
-        description: 'Open the full console from the sidebar (Agent Pool).',
+        description: 'Open the full console at /agent-pool (left sidebar nav row / deep link).',
         title: 'Where the console lives'
       }),
       jsx(ListRow, {
@@ -2446,7 +2108,8 @@ export default {
   register(ctx) {
     hydratePaneStore(ctx.storage)
 
-    // The full-page Pool Console, paired with its sidebar nav row.
+    // The full-page Pool Console: a /agent-pool route plus the left sidebar nav
+    // row that links to it. No right-dock pane — the console is a full page.
     ctx.registerMany([
       {
         id: 'page',

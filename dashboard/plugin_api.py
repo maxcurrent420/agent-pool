@@ -2,10 +2,11 @@
 
 READ-ONLY CONTRACT: every route in this module is GET and serves
 plugin-owned state only. No route writes the ledger, the plugin data
-dir, or any other state; there are no POST/PUT/PATCH/DELETE handlers
-and there is no Tor probe here. The pane is passive UI: all mutations
-go through the agent (slash commands / tools), never through this
-router.
+dir, or any other state; there are no POST/PUT/PATCH/DELETE handlers.
+The pane is passive UI: all mutations go through the agent (slash
+commands / tools), never through this router. ``/pane-state`` and
+``/status`` include a cached (~60s) localhost Tor readiness probe —
+a local socket check by the plugin itself, not a gateway round-trip.
 
 State shared with the agent side flows exclusively through the
 ``pane-state.json`` sidecar under ``plugin_data_dir("agent-pool")``
@@ -49,10 +50,19 @@ def status():
 
 @router.get("/pane-state")
 def pane_state():
-    """The agent-written sidecar JSON (with its updated_at)."""
+    """Live computed pane state (read-only): ops log from the sidecar,
+    everything else computed fresh — maintainer ledger (mode=ro),
+    repo_versions manifests, work/integrate bundles/worktrees, local Tor
+    probe. Falls back to the raw sidecar with an ``error`` key if the
+    computed path raises."""
     try:
         mod = _load_plugin_module()
-        return mod._pane_state_read()
+        try:
+            return mod._pane_state_computed()
+        except Exception as exc:
+            fallback = mod._pane_state_read()
+            fallback["error"] = str(exc)[:300]
+            return fallback
     except Exception as exc:
         return {"ops": [], "pool_status": {}, "updated_at": None,
                 "error": str(exc)[:300]}

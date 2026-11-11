@@ -75,10 +75,35 @@ AUDIT_KEYWORDS = (
     b"require('http')", b"require(\"http\")",
 )
 
+# Prompt-injection patterns for the static audit. These are *detection*
+# strings for text addressed to an agent inside submitted content —
+# they are reported as ``kind: "injection-pattern"`` hits, separate
+# from the malware keyword list, and never executed. Fragments only,
+# so the literals never appear in this file.
+INJECTION_PATTERNS = (
+    _kw(b"igno", b"re prev", b"ious"),
+    _kw(b"igno", b"re all prev", b"ious"),
+    _kw(b"disre", b"gard .* instructions"),
+    _kw(b"you are now",),
+    _kw(b"system pro", b"mpt:"),
+    _kw(b"assis", b"tant:"),
+    _kw(b"do not tell",),
+    _kw(b"act as",),
+    _kw(b"new instru", b"ctions"),
+)
+
 _AUDIT_SCRIPT = r'''
-import hashlib, json, os, sys
+import hashlib, json, os, re, sys
 root = sys.argv[1]
 hits = []
+injection_hits = []
+# Prompt-injection patterns (fragment-built so the literals never appear
+# in the plugin source; matched case-insensitively as regex).
+INJECTION = [p.decode() for p in
+    [b"igno"+b"re prev"+b"ious", b"igno"+b"re all prev"+b"ious",
+     b"disre"+b"gard .* instructions", b"you are now",
+     b"system pro"+b"mpt:", b"assis"+b"tant:",
+     b"do not tell", b"act as", b"new instru"+b"ctions"]]
 KEYWORDS = [k.decode() for k in
     [b"ev"+b"al(", b"ex"+b"ec(", b"os.system", b"subprocess.call", b"subprocess.Popen",
      b"cu"+b"rl ", b"cu"+b"rl|", b"wget ", b"| "+b"sh", b"|"+b"sh", b"| "+b"bash", b"base64.b64decode",
@@ -98,9 +123,19 @@ for dirpath, dirnames, filenames in os.walk(root):
         for kw in KEYWORDS:
             if kw in text:
                 hits.append({"path": os.path.relpath(full, root), "keyword": kw})
+        for pat in INJECTION:
+            for m in re.finditer(pat, text, re.IGNORECASE):
+                snippet = text[max(0, m.start() - 30):m.end() + 30]
+                hit = {"kind": "injection-pattern",
+                       "path": os.path.relpath(full, root),
+                       "pattern": pat,
+                       "span": " ".join(snippet.split())}
+                injection_hits.append(hit)
+                hits.append(hit)
         if len(data) > 5_000_000:
             hits.append({"path": os.path.relpath(full, root), "keyword": "oversize-file"})
-report = {"files_scanned": True, "hits": hits, "verdict": "clean" if not hits else "flagged"}
+report = {"files_scanned": True, "hits": hits, "injection_hits": injection_hits,
+          "verdict": "clean" if not hits else "flagged"}
 sys.stdout.write(json.dumps(report))
 '''
 
@@ -742,6 +777,7 @@ class RepoPropagator:
         verdict = "infected" if clamav["verdict"] == "infected" else static["verdict"]
         report = {"verdict": verdict, "static": static, "clamav": clamav,
                   "hits": static.get("hits", []),
+                  "injection_hits": static.get("injection_hits", []),
                   "clamav_infected": clamav.get("infected", [])}
         report_hash = blake3_hash(json.dumps(report, sort_keys=True).encode())
         audit_id = f"audit-{manifest['repo_id']}-v{manifest['version']}-{int(time.time())}"
@@ -883,6 +919,35 @@ class RepoPropagator:
         return {**self._transport_info(),
                 "manifest": signed, "manifest_hash": a_hash,
                 "transfer_id": sent["transfer_id"]}
+
+    def reissue_transfer(self, *, manifest: dict, maintainer: Member) -> dict:
+        """Re-send the persisted verified bundle for an already-accepted
+        manifest under a FRESH transport ticket (the /fetch re-issue
+        path). The signed manifest is never touched: the same plaintext
+        bundle is re-encrypted under the SAME DEK (unwrapped from the
+        maintainer's own wrapped_keys entry, cache-first via
+        :meth:`_decrypt_for_maintainer`), so ``wrapped_keys``,
+        ``content_hash`` and the signature all stay valid. Only the
+        ephemeral ticket changes.
+
+        Returns ``{"transfer_ticket", "transfer_id", "bundle_source"}``.
+        """
+        if maintainer.key_id != self._maintainer_key_id:
+            raise PermissionError("reissue is maintainer-only")
+        plaintext, dek, bundle_source = self._decrypt_for_maintainer(manifest, maintainer)
+        if blake3_hash(plaintext) != manifest["content_hash"]:
+            raise RuntimeError("BLAKE3 mismatch on transfer re-issue")
+        ciphertext = encrypt_bundle(plaintext, dek)
+        with tempfile.TemporaryDirectory(prefix="agentpool-reissue-") as tmp:
+            cipher_file = Path(tmp) / "bundle.enc"
+            cipher_file.write_bytes(ciphertext)
+            sent = self._transport.send(cipher_file)
+        record_event(self._conn, self._pool_id, "transfer_reissued",
+                     {"repo_id": manifest["repo_id"], "version": manifest["version"],
+                      "bundle_source": bundle_source})
+        return {"transfer_ticket": sent["ticket"],
+                "transfer_id": sent["transfer_id"],
+                "bundle_source": bundle_source}
 
     # -- fetch ---------------------------------------------------------------
 
