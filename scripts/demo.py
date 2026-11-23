@@ -27,7 +27,7 @@ Default transport is FakeTransport (in-memory) for a hermetic, fast run.
 Pass --real to use RealSendHermesTransport (send_hermes must be on PATH).
 
 Usage:
-  env -u PYTHONNOUSERSITE HOME=/home/maxcurrent PATH=/usr/bin:/bin \\
+  env -u PYTHONNOUSERSITE HOME="$HOME" PATH=/usr/bin:/bin \\
     /usr/bin/python3.10 scripts/demo.py [--real]
 Prints DEMO_OK ... and DEMO_SECONDS=<measured> at the end; exits
 non-zero on any failure.

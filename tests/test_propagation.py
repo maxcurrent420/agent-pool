@@ -180,7 +180,8 @@ def test_fetch_happy_path_maintainer_and_member(world):
     assert world["transport"].provider_alive(transfer_id) is True  # alive until fetch done
     out = world["prop"].fetch(manifest=res["manifest"],
                                fetcher=world["members"][world["member_id"]],
-                               dest=world["tmp"] / "fetch-b")
+                               dest=world["tmp"] / "fetch-b",
+                               allowed_roots=[world["tmp"]])
     assert Path(out["clone_dir"], "hello.txt").read_text() == "hello agent pool\n"
     world["transport"].stop(transfer_id)
     assert world["transport"].provider_alive(transfer_id) is False
@@ -215,7 +216,7 @@ def test_acl_fetch_without_wrapped_key_refused(world):
     world["prop"]._members[world["outsider_id"]] = outsider
     with pytest.raises(PermissionError, match="wrapped DEK"):
         world["prop"].fetch(manifest=res["manifest"], fetcher=outsider,
-                             dest=world["tmp"] / "evil")
+                             dest=world["tmp"] / "evil", allowed_roots=[world["tmp"]])
 
 
 def test_contributor_signature_not_accepted(world):
@@ -236,7 +237,7 @@ def test_contributor_signature_not_accepted(world):
     with pytest.raises(RuntimeError, match="non-maintainer"):
         world["prop"].fetch(manifest=signed,
                              fetcher=world["members"][world["member_id"]],
-                             dest=world["tmp"] / "forged")
+                             dest=world["tmp"] / "forged", allowed_roots=[world["tmp"]])
 
 
 def test_chain_tamper_detected(world):
@@ -271,4 +272,52 @@ def test_blake3_mismatch_on_fetch(world):
     with pytest.raises(Exception):
         world["prop"].fetch(manifest=res["manifest"],
                              fetcher=world["members"][world["member_id"]],
-                             dest=world["tmp"] / "corrupt")
+                             dest=world["tmp"] / "corrupt", allowed_roots=[world["tmp"]])
+
+
+def test_production_children_get_minimal_env(monkeypatch, tmp_path):
+    """git/clamscan/audit subprocesses never inherit provider keys."""
+    import propagation as P
+
+    seen = []
+
+    class _Result:
+        def __init__(self, stdout=""):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(cmd, **kw):
+        seen.append((cmd, kw))
+        for part in cmd:
+            if isinstance(part, str) and part.endswith(".bundle"):
+                Path(part).write_bytes(b"bundle bytes")  # pack_bundle reads it
+        stdout = ""
+        if any("scan.py" in str(c) for c in cmd):
+            stdout = json.dumps({"files_scanned": True, "hits": [],
+                                 "injection_hits": [], "verdict": "clean"})
+        return _Result(stdout)
+
+    monkeypatch.setattr(P.subprocess, "run", fake_run)
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    P.pack_bundle(repo)
+    monkeypatch.setattr(P.shutil, "which",
+                        lambda name: "/usr/bin/clamscan" if name == "clamscan" else None)
+    P._clamav_signature_version()
+    P._clamscan_fallback(repo)
+    monkeypatch.setattr(P.shutil, "which", lambda name: None)
+    P._sandbox_scan(repo)
+
+    assert len(seen) >= 4
+    for _cmd, kw in seen:
+        env = kw["env"]
+        assert "OPENAI_API_KEY" not in env
+        assert {"PATH", "HOME", "LANG"} <= set(env)
+
+    # Every production subprocess.run site is covered (no silent inheritance).
+    src = Path(P.__file__).read_text()
+    assert src.count("subprocess.run(") == 7
+    assert src.count("env=_minimal_child_env()") == 7

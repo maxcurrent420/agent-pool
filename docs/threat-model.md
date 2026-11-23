@@ -172,9 +172,9 @@ What Tor does NOT hide (stated honestly):
   neither peer learns the other's IP. The Tor network still sees
   Tor-client traffic (see items 1-6 above).
 
-**ControlPort cookie auth is local-only:** cookie authentication is
-disabled, but the ControlPort binds `127.0.0.1` only (`ops/torrc`), so
-no remote host can reach it.
+**ControlPort cookie auth is local-only and user-scoped:** the control port
+binds `127.0.0.1` only and requires the 0600 control cookie in the gateway
+user's plugin-data dir; other local users cannot authenticate.
 
 ## Residual auth risks (carried)
 

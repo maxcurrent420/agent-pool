@@ -244,8 +244,8 @@ Refusals are the contract, not bugs — read them literally:
 
 - Ledger (pools, members, versions, grants, claims): the profile's
   plugin-data dir (`plugin_db("agent-pool")`); there is no file fallback.
-- Worktrees: `<root>/<repo_id>/worktree-<ticket_id>` (`/tmp/agent-pool-worktrees`
-  by default), canonical checkouts under the pool's
+- Worktrees: `<root>/<repo_id>/worktree-<ticket_id>` (`<plugin-data-dir>/worktrees`
+  by default, override with env `AGENT_POOL_WORKTREE_ROOT`), canonical checkouts under the pool's
   `work/integrate/<repo_id>/`, accepted bundles as `bundle-v<N>.git`.
 - Gateway chat REPLIES: do not assume any local store holds them —
   VERIFY before you trust (locate a known recent message id; many

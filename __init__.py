@@ -98,8 +98,8 @@ def _transport_config(ctx):
 def _tor_config(ctx):
     """Resolve tor settings (control_port, socks_port, tor_binary).
 
-    Defaults match ops/torrc: ControlPort 9051, SocksPort 9055, both on
-    127.0.0.1. ``tor_binary`` empty = tor-enabled send_hermes on PATH
+    Defaults match ops/agent-pool.torrc: ControlPort 9051, SocksPort 9055,
+    both on 127.0.0.1. ``tor_binary`` empty = tor-enabled send_hermes on PATH
     (option (A)); non-empty = option (B) standalone sidecar binary.
     """
     control = _cfg(ctx, "tor_control_port", 9051) if ctx else 9051
@@ -114,6 +114,12 @@ def _tor_config(ctx):
     except (TypeError, ValueError):
         socks = 9055
     return control, socks, (str(binary).strip() or None)
+
+
+def _tor_cookie_file(ctx) -> str:
+    """Optional control-cookie override; empty = the plugin data dir default."""
+    value = _cfg(ctx, "tor_cookie_file", "") if ctx else ""
+    return str(value).strip() if value else ""
 
 
 _TOR_STATUS_CACHE = {"at": 0.0, "block": None}
@@ -139,7 +145,8 @@ def _tor_status_block(ctx):
         except ImportError:
             from transport import tor_ready as _tor_ready
         block["ready"] = _tor_ready(
-            control_port=control, socks_port=socks, binary=tor_binary)
+            control_port=control, socks_port=socks, binary=tor_binary,
+            cookie_path=_tor_cookie_file(ctx))
     except Exception as exc:
         block["ready"] = {"ok": False, "error": str(exc)[:300]}
     _TOR_STATUS_CACHE["at"] = now
@@ -389,11 +396,12 @@ def _service_for(ctx, source=None):
         except ImportError:
             from transport import tor_ready as _gate_tor_ready
         _gate_tor_ready(control_port=control, socks_port=socks,
-                        binary=tor_binary)
+                        binary=tor_binary, cookie_path=_tor_cookie_file(ctx))
         transport = RealSendHermesTransport(
             transport_mode=mode,
             tor_control_port=control, tor_socks_port=socks,
-            tor_binary=tor_binary)
+            tor_binary=tor_binary,
+            tor_cookie_file=_tor_cookie_file(ctx))
     overrides: dict = {}
     budgets = {k: _cfg(ctx, k, d) if ctx else d for k, d in (
         ("max_turns", 25), ("max_tasks_per_day", 5),
@@ -410,8 +418,7 @@ def _service_for(ctx, source=None):
                        agent_task_allocations=agent_task_allocations,
                        maintainer_discord_user_id=_maintainer_discord_user_id(ctx),
                        maintainer_bot_discord_user_id=_maintainer_bot_discord_user_id(ctx),
-                       clamd_socket=_cfg(ctx, "clamd_socket", "/run/clamav/clamd.ctl") if ctx else "/run/clamav/clamd.ctl",
-                       auto_provision=_cfg(ctx, "auto_provision", True) if ctx else True)
+                       clamd_socket=_cfg(ctx, "clamd_socket", "/run/clamav/clamd.ctl") if ctx else "/run/clamav/clamd.ctl")
 
 
 # ---------------------------------------------------------------------------
@@ -780,7 +787,7 @@ def _handle_fetch(ctx, raw: str, *, source=None, session_id="", session_key="", 
                     manifest = json.loads(opts["manifest"])
                 except Exception as exc:
                     return _result({"ok": False, "error": f"bad manifest JSON: {exc}"})
-                out = svc.fetch_repo_download(manifest, dest=opts.get("dest", "/tmp/fetch"),
+                out = svc.fetch_repo_download(manifest, dest=opts.get("dest", ""),
                                                transfer_ticket=opts.get("ticket") or None,
                                                source=source)
             elif len(pos) > 1 and pos[1] == "list":
@@ -887,23 +894,28 @@ def _pane_state_read():
         return {"ops": [], "pool_status": {}, "updated_at": None}
 
 
-def _pane_read_conn():
-    """PANE read path: ALWAYS the maintainer ledger (default profile's
-    plugin data dir), read-only. Override with AGENT_POOL_PANE_LEDGER.
+def _pane_ledger_default() -> Path:
+    """Profile-aware default ledger: AGENT_POOL_DATA_DIR or Hermes
+    plugin_data_dir("agent-pool") via _plugin_base_dir, which resolves
+    get_hermes_home() inside Hermes. No Path.home()/.hermes fallback."""
+    try:
+        from . import ledger as _L
+    except ImportError:
+        import ledger as _L
+    return _L._plugin_base_dir() / "data.db"
 
-    Never writable; a contributor-profile dashboard cannot mutate the
-    maintainer ledger. Never raises — callers handle None.
-    """
-    p = _env_get("AGENT_POOL_PANE_LEDGER") or \
-        str(Path.home() / ".hermes" / "plugin-data" / "agent-pool" / "data.db")
+
+def _pane_read_conn():
+    """PANE read path: this profile's ledger, read-only. Override with
+    AGENT_POOL_PANE_LEDGER. Never writable. Never raises — callers handle None."""
+    p = _env_get("AGENT_POOL_PANE_LEDGER") or str(_pane_ledger_default())
     conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def _pane_ledger_path():
-    return _env_get("AGENT_POOL_PANE_LEDGER") or \
-        str(Path.home() / ".hermes" / "plugin-data" / "agent-pool" / "data.db")
+    return _env_get("AGENT_POOL_PANE_LEDGER") or str(_pane_ledger_default())
 
 
 def _pane_worktrees():

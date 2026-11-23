@@ -22,8 +22,9 @@ tor ports, and emits NO relay flags — there is no relay in the
 connection path, and neither peer learns the other's IP. Both endpoints
 must run a tor-enabled sidecar (every gateway in a pool); a mixed pool
 fails closed. ``tor_ready()`` probes the Tor control port
-(``127.0.0.1:<tor_control_port>``, cookie auth off) and the sidecar
-binary before every transfer and at service construction.
+(``127.0.0.1:<tor_control_port>``, cookie auth via the 0600 control
+cookie) and the sidecar binary before every transfer and at service
+construction.
 
 Historical note: a ``relay`` mode existed in earlier releases and was
 removed entirely (see docs/fallback-transport.md, fork-only escape
@@ -33,6 +34,7 @@ no direct mode and no way to opt into one.
 """
 from __future__ import annotations
 
+import binascii
 import os
 import re
 import secrets
@@ -56,6 +58,16 @@ def _env_get(name, default=""):
         return os.environ.get(name, default)
 
 
+def _default_tor_cookie_path() -> Path:
+    """Default control cookie: the gateway user's plugin-data tor dir,
+    matching CookieAuthFile in the rendered ops/agent-pool.torrc."""
+    try:
+        from .ledger import _plugin_base_dir
+    except ImportError:
+        from ledger import _plugin_base_dir
+    return _plugin_base_dir() / "tor-data" / "control_auth_cookie"
+
+
 def _hermes_home_dir() -> Path:
     """Profile-aware Hermes home (never hard-codes ``~/.hermes``)."""
     try:
@@ -67,7 +79,13 @@ def _hermes_home_dir() -> Path:
     home = _env_get("HERMES_HOME")
     if home:
         return Path(home)
-    return Path.home() / ".hermes"
+    # Profile-aware fallback via Hermes plugin storage (fail-closed: the
+    # ledger helper raises when no install root is discoverable).
+    try:
+        from .ledger import _plugin_base_dir
+    except ImportError:
+        from ledger import _plugin_base_dir
+    return _plugin_base_dir().parent
 
 
 _TICKET_RE = re.compile(r"(?:sendme receive )([a-z0-9]{20,})|\b(blob[a-z0-9]{40,})\b",
@@ -91,6 +109,27 @@ _TOR_UNIT = "agent-pool-tor"
 _TOR_SENDHERMES_UNIT = "agent-pool-sendhermes"
 _TOR_CONTROL_PORT = 9051
 _TOR_SOCKS_PORT = 9055
+
+_CHILD_ENV_KEYS = (
+    "HERMES_IROH_STATE_DIR", "HERMES_IROH_SEND_TIMEOUT",
+    "HERMES_IROH_FETCH_TIMEOUT", "HERMES_IROH_TOR_COOKIE_FILE",
+)
+
+
+def _child_env(state_dir: Path | None = None) -> dict[str, str]:
+    """Minimal, explicit environment for sidecar children (no provider keys)."""
+    env: dict[str, str] = {}
+    for key in ("PATH", "HOME", "LANG"):
+        value = os.environ.get(key, "")
+        if value:
+            env[key] = value
+    for key in _CHILD_ENV_KEYS:
+        value = _env_get(key, "")
+        if value:
+            env[key] = str(value)
+    if state_dir is not None:
+        env["HERMES_IROH_STATE_DIR"] = str(state_dir)
+    return env
 
 
 class TorNotReady(RuntimeError):
@@ -130,6 +169,7 @@ def resolve_tor_binary(binary: str | None = None) -> str | None:
 def tor_ready(*, control_port: int = _TOR_CONTROL_PORT,
               socks_port: int = _TOR_SOCKS_PORT,
               binary: str | None = None,
+              cookie_path: str | Path | None = None,
               timeout: float = 2.0) -> dict:
     """Probe the Tor anonymity layer; raise TorNotReady with an actionable
     fix if it is not usable. There is no fallback transport.
@@ -139,8 +179,8 @@ def tor_ready(*, control_port: int = _TOR_CONTROL_PORT,
        (``tor_binary`` config, then a tor-enabled ``send_hermes-tor``
        build, then the stock ``send_hermes`` on PATH) and supports
        ``--transport tor`` (``send --help``).
-    2. The Tor control port answers on 127.0.0.1 with cookie auth off
-       (``AUTHENTICATE`` -> ``250 OK``).
+    2. The Tor control port answers on 127.0.0.1 with cookie auth
+       (``AUTHENTICATE <hex cookie>`` → ``250 OK``).
 
     The hidden service itself is created per transfer by the sidecar, so
     there is no long-lived onion identity to check here (Q5 per-transfer
@@ -160,7 +200,7 @@ def tor_ready(*, control_port: int = _TOR_CONTROL_PORT,
     try:
         help_out = subprocess.run(
             [resolved, "send", "--help"], capture_output=True, text=True,
-            timeout=max(5.0, float(timeout)))
+            timeout=max(5.0, float(timeout)), env=_child_env())
         help_text = (help_out.stdout or "") + "\n" + (help_out.stderr or "")
     except Exception as exc:
         raise TorNotReady(
@@ -179,22 +219,36 @@ def tor_ready(*, control_port: int = _TOR_CONTROL_PORT,
     try:
         with socket.create_connection(("127.0.0.1", int(control_port)),
                                       timeout=float(timeout)) as sock:
-            sock.sendall(b"AUTHENTICATE\r\n")
+            cookie = (Path(cookie_path).expanduser() if cookie_path
+                      else _default_tor_cookie_path())
+            try:
+                blob = cookie.read_bytes().strip()
+            except OSError as exc:
+                raise TorNotReady(
+                    f"tor transport unavailable: Tor control cookie {cookie} "
+                    f"is unreadable ({exc}); ensure the daemon and this "
+                    "gateway run as the same user, then restart "
+                    f"agent-pool-tor") from exc
+            if not blob:
+                raise TorNotReady(
+                    f"tor transport unavailable: Tor control cookie {cookie} is empty")
+            sock.sendall(b"AUTHENTICATE " + binascii.hexlify(blob) + b"\r\n")
             reply = sock.recv(1024).decode("utf-8", errors="replace")
     except OSError as exc:
         raise TorNotReady(
             f"tor transport unavailable: Tor control port "
             f"127.0.0.1:{control_port} is not reachable ({exc}). Start "
             f"the Tor daemon: systemctl start {_TOR_UNIT} (torrc: "
-            "ops/torrc, ControlPort 127.0.0.1:9051, CookieAuthentication "
-            "0). tor mode fails closed — there is no fallback transport.")
+            "/etc/tor/agent-pool.torrc, ControlPort 127.0.0.1:9051, "
+            "CookieAuthentication 1). tor mode fails closed — there is "
+            "no fallback transport.") from exc
     if "250" not in reply:
         raise TorNotReady(
             f"tor transport unavailable: Tor control port "
-            f"127.0.0.1:{control_port} refused AUTHENTICATE "
-            f"({reply.strip()[:120]!r}); torrc must set "
-            "'CookieAuthentication 0' and bind ControlPort to 127.0.0.1 "
-            f"only (ops/torrc). Restart: systemctl restart {_TOR_UNIT}.")
+            f"127.0.0.1:{control_port} refused cookie AUTHENTICATE "
+            f"({reply.strip()[:120]!r}); check {cookie} mode 0600 and "
+            "'CookieAuthentication 1' in /etc/tor/agent-pool.torrc. "
+            f"Restart: systemctl restart {_TOR_UNIT}.")
     return {"ok": True, "control_port": int(control_port),
             "socks_port": int(socks_port), "binary": resolved,
             "hidden_service": "per-transfer (created by the sidecar)"}
@@ -353,11 +407,14 @@ class RealSendHermesTransport(TransportBackend):
                  transport_mode: str = MODE_TOR,
                  tor_control_port: int = _TOR_CONTROL_PORT,
                  tor_socks_port: int = _TOR_SOCKS_PORT,
-                 tor_binary: str | None = None):
+                 tor_binary: str | None = None,
+                 tor_cookie_file: str | None = None):
         self.transport_mode = normalize_mode(transport_mode)
         self.tor_control_port = int(tor_control_port)
         self.tor_socks_port = int(tor_socks_port)
         self.tor_binary = (str(tor_binary).strip() if tor_binary else "") or None
+        self.tor_cookie_file = (str(tor_cookie_file).strip()
+                                if tor_cookie_file else "")
         env_dir = _env_get("HERMES_IROH_STATE_DIR")
         base = Path(state_dir or env_dir or _hermes_home_dir() / "iroh-interconnect")
         self._state_dir = base
@@ -399,7 +456,8 @@ class RealSendHermesTransport(TransportBackend):
         TorNotReady naming the unit to start; no fallback)."""
         tor_ready(control_port=self.tor_control_port,
                   socks_port=self.tor_socks_port,
-                  binary=self._resolve_binary())
+                  binary=self._resolve_binary(),
+                  cookie_path=self.tor_cookie_file or None)
 
     def send(self, path: Path) -> dict:
         self._require_tor_ready()
@@ -421,7 +479,7 @@ class RealSendHermesTransport(TransportBackend):
             ["script", "-qefc", script_cmd, str(log_path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
-        )
+            env=_child_env(self._state_dir))
         ticket = None
         content_hash = None
         timeout = max(20, int(_env_get("HERMES_IROH_SEND_TIMEOUT", "90")))
@@ -465,7 +523,7 @@ class RealSendHermesTransport(TransportBackend):
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True, cwd=str(dest),
-        )
+            env=_child_env(self._state_dir))
         timeout = int(_env_get("HERMES_IROH_FETCH_TIMEOUT", "600"))
         try:
             stdout, stderr = proc.communicate(timeout=timeout)

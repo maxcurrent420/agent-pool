@@ -75,5 +75,6 @@ def test_remote_fetch_requires_wrapped_dek(tmp_path):
     assert not prop._is_member("agent:out")
     # Chain failures still refuse (no chain yet) — assert that is not a success.
     with pytest.raises(Exception):
-        prop.fetch(manifest={"repo_id": "demo", "version": 1}, fetcher=outsider, dest=tmp_path / "x")
+        prop.fetch(manifest={"repo_id": "demo", "version": 1}, fetcher=outsider,
+                   dest=tmp_path / "x", allowed_roots=[tmp_path])
     # Direct membership/DEK refusal when a chain exists is covered by propagation tests.

@@ -156,6 +156,9 @@ def test_tor_ready_ok(tmp_path):
     import threading
 
     binary = _fake_sidecar(tmp_path, tor_capable=True)
+    cookie = tmp_path / "control_auth_cookie"
+    cookie.write_bytes(bytes(range(32)))
+    cookie.chmod(0o600)
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", 0))
@@ -170,9 +173,111 @@ def test_tor_ready_ok(tmp_path):
         server.close()
 
     threading.Thread(target=_serve, daemon=True).start()
-    ready = tor_ready(binary=binary, control_port=port, socks_port=9055)
+    ready = tor_ready(binary=binary, control_port=port, socks_port=9055,
+                      cookie_path=cookie)
     assert ready["ok"] is True and ready["control_port"] == port
     assert ready["binary"] == binary
+
+
+def test_tor_ready_uses_cookie(tmp_path):
+    import socket
+    import threading
+    import binascii
+
+    binary = _fake_sidecar(tmp_path, tor_capable=True)
+    cookie = tmp_path / "control_auth_cookie"
+    cookie.write_bytes(bytes(range(32)))
+    cookie.chmod(0o600)
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    seen = []
+
+    def _serve():
+        conn, _ = server.accept()
+        seen.append(conn.recv(4096))
+        conn.sendall(b"250 OK\r\n")
+        conn.close()
+        server.close()
+
+    threading.Thread(target=_serve, daemon=True).start()
+    ready = tor_ready(binary=binary, control_port=port, cookie_path=cookie)
+    assert ready["ok"] is True
+    assert seen[0].strip() == b"AUTHENTICATE " + binascii.hexlify(bytes(range(32)))
+
+
+def test_tor_ready_cookie_unreadable_fails_closed(tmp_path):
+    # A live control port is required: tor_ready() connects first, then
+    # reads the cookie, so a dead port would fail with a connection error
+    # (the separate control-port-down test covers that path).
+    import socket
+    import threading
+
+    binary = _fake_sidecar(tmp_path, tor_capable=True)
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def _serve():
+        try:
+            conn, _ = server.accept()
+            conn.close()
+        finally:
+            server.close()
+
+    threading.Thread(target=_serve, daemon=True).start()
+    with pytest.raises(TorNotReady, match="cookie"):
+        tor_ready(binary=binary, control_port=port, timeout=0.5,
+                  cookie_path=tmp_path / "missing-cookie")
+
+
+def test_send_and_fetch_children_get_minimal_env(monkeypatch, tmp_path):
+    import transport as T
+
+    seen = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            seen.append((cmd, kw))
+            self.pid = 4242
+            self.returncode = 0
+            if cmd[0] == "script":               # send wrapper: cmd[-1] is the log
+                Path(cmd[-1]).write_text(
+                    "sendme receive abcdefghijklmnopqrstuvwxyz\n")
+
+        def poll(self):
+            return 0
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+    monkeypatch.setattr(T.shutil, "which",
+                        lambda name: "/usr/bin/script" if name == "script" else None,
+                        raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    monkeypatch.setenv("HERMES_IROH_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(T.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(RealSendHermesTransport, "_require_tor_ready", lambda self: None)
+    t = RealSendHermesTransport(transport_mode="tor",
+                                tor_binary="/usr/bin/fake-send_hermes")
+    log = tmp_path / "x.enc"
+    log.write_bytes(b"x")
+    monkeypatch.setattr(T.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(T, "_TICKET_RE",
+                        T.re.compile(r"sendme receive ([a-z]{26})"), raising=False)
+    t.send(log)
+    with pytest.raises(RuntimeError):          # fake fetch produces no export
+        t.fetch("abcdefghijklmnopqrstuvwxyz", tmp_path)
+    assert len(seen) >= 2
+    for _cmd, kw in seen:
+        env = kw["env"]
+        assert "OPENAI_API_KEY" not in env
+        assert not (set(env) - {"PATH", "HOME", "LANG", "HERMES_IROH_STATE_DIR",
+                                "HERMES_IROH_TOR_COOKIE_FILE"})
+        assert env["HERMES_IROH_STATE_DIR"] == str(tmp_path / "state")
 
 
 def test_fake_transport_tor_passthrough(tmp_path):
@@ -347,7 +452,7 @@ def test_submit_result_carries_mode_and_roundtrip(tmp_path, monkeypatch):
     fetched = w["prop"].fetch(
         manifest=res["manifest"],
         fetcher=w["members"][w["member"].key_id],
-        dest=tmp_path / "fetch")
+        dest=tmp_path / "fetch", allowed_roots=[tmp_path])
     clone_dir = Path(fetched["clone_dir"])
     assert (clone_dir / "hello.txt").read_text() == "hello agent pool\n"
 

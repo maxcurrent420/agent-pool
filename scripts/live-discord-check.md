@@ -6,8 +6,8 @@ enable, or restart anything until the maintainer says go. The helper
 `scripts/live_discord_check.py` only prints state + these commands; it
 never acts.
 
-Plugin source: `/home/maxcurrent/Documents/AntiGravityProjects/agent-pool`
-Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
+Plugin source: `<plugin-path>` (this repository checkout)
+Hermes checkout (read-only reference): `<hermes-checkout>`
 
 ## Preflight (read-only — safe to run anytime)
 
@@ -23,7 +23,7 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
    relative imports (flat layout at repo root), so a **symlink** is
    the right approach:
    ```bash
-   ln -s /home/maxcurrent/Documents/AntiGravityProjects/agent-pool \
+   ln -s <plugin-path> \
          ~/.hermes/plugins/agent-pool
    ```
 2. Enable it (installs declared Python deps pynacl + blake3 at enable
@@ -43,7 +43,7 @@ Hermes checkout (read-only reference): `/home/maxcurrent/.hermes/hermes-agent`
    must enable Tor; mixed pools fail closed):
    ```bash
    apt install tor
-   scripts/install-tor.sh   # writes ops/torrc, builds sidecar, enables the tor service
+   scripts/install-tor.sh   # renders /etc/tor/agent-pool.torrc, builds sidecar, enables the tor service
    systemctl start agent-pool-tor
    ```
    Tor is mandatory: without it the plugin fails closed at service

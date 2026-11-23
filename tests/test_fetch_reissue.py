@@ -39,7 +39,8 @@ def test_fetch_repo_returns_fresh_ticket_not_stored(tmp_path):
     assert C.verify_manifest(vk, manifest)
 
 
-def test_fetch_repo_download_consumes_fresh_ticket(tmp_path):
+def test_fetch_repo_download_consumes_fresh_ticket(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_POOL_WORKTREE_ROOT", str(tmp_path))
     w = world(tmp_path)
     fetched = w["maint_svc"].fetch_repo(REPO, source=_owner_source())
     manifest = json.loads(fetched["manifest_json"])

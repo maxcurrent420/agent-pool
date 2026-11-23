@@ -100,7 +100,8 @@ def test_claim_provisions_member_row_without_manual_add_member(tmp_path):
     assert bound[0] == member.key_id
 
 
-def test_provisioned_member_gets_wrapped_dek_on_next_version(tmp_path):
+def test_provisioned_member_gets_wrapped_dek_on_next_version(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_POOL_WORKTREE_ROOT", str(tmp_path))
     conn, transport, maint_svc, member_svc, maint, member = world(tmp_path)
     src = _git_src(tmp_path / "src")
     # v1 submitted BEFORE the friend was whitelisted/claimed.

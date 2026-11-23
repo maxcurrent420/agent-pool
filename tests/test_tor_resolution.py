@@ -70,11 +70,18 @@ def test_tor_build_passes_probe(monkeypatch, tmp_path):
     tor_dir = _stub(tmp_path, "send_hermes-tor", TOR_HELP)
     _stub(tmp_path, "send_hermes", STOCK_HELP)
     _path_with(monkeypatch, tor_dir)
+    # tor_ready() authenticates with the 0600 control cookie; provide one
+    # so this probe exercises the control-port stage, not cookie discovery.
+    cookie = tmp_path / "agent-pool-data" / "tor-data" / "control_auth_cookie"
+    cookie.parent.mkdir(parents=True, exist_ok=True)
+    cookie.write_bytes(bytes(range(32)))
+    cookie.chmod(0o600)
     try:
-        ready = T.tor_ready(control_port=9051, socks_port=9055, timeout=2.0)
+        ready = T.tor_ready(control_port=9051, socks_port=9055, timeout=2.0,
+                            cookie_path=cookie)
     except T.TorNotReady as exc:
-        assert "control port" in str(exc.value)
-        assert "--transport" not in str(exc.value)
+        assert "control port" in str(exc)
+        assert "--transport" not in str(exc)
     else:
         assert ready["ok"] is True
         assert ready["binary"].endswith("send_hermes-tor")

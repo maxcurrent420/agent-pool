@@ -90,7 +90,6 @@ def test_audit_clamav_absent_fails_closed_exact_text(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(empty))
     prop = RepoPropagator.__new__(RepoPropagator)
     prop._clamd_socket = "/nonexistent/clamd.ctl"
-    prop._auto_provision = False
     tree = _tree(tmp_path, {"a.txt": b"hello\n"})
     with pytest.raises(RuntimeError) as exc:
         prop._clamav_or_fail_closed(tree)

@@ -189,8 +189,10 @@ interaction is recorded in the `pool_gateways` table.
 On claim, the plugin hands the agent:
 
 - `worktree_path`: `<dest_root>/<repo_id>/worktree-<ticket_id>`, where
-  dest_root defaults to `/tmp/agent-pool-worktrees` and is overridable
-  via env `AGENT_POOL_WORKTREE_ROOT`.
+  dest_root defaults to `<plugin-data-dir>/worktrees` and is overridable
+  via env `AGENT_POOL_WORKTREE_ROOT`. Fetch `--dest` is confined to the
+  profile's plugin data dir / configured worktree root; a shared `/tmp`
+  destination is refused.
 - `branch`: `pool/<ticket_id>`
 - `base_ref`: `v{accepted_version}`
 - `budget`: the normalized budget dict.
@@ -409,8 +411,8 @@ Residuals (stated honestly):
 7. (Removed) The former relay fallback mode no longer exists; there
    is no relay in the connection path to see endpoint IPs.
 
-ControlPort is cookie-auth-disabled and bound to `127.0.0.1` only
-(`ops/torrc`).
+ControlPort is localhost-only and requires the 0600 control cookie
+(`ops/agent-pool.torrc`); other local users cannot authenticate.
 
 ## Isolation + security
 
@@ -485,10 +487,10 @@ Dependency split (do not mix the two layers):
   closed naming exactly these Hermes commands.
 - **System services** (ClamAV + `clamav-daemon`, the Tor daemon, and the
   tor-enabled `send_hermes` sidecar) are provisioned by the documented
-  first-run bootstrap: `bash scripts/install-deps.sh` (system services
-  only; `--check` reports per-component status without changing anything,
-  `--system-only` skips the gateway-interpreter verify and is what the
-  plugin's one-shot self-provisioning hook invokes). Where privilege
+  operator-run bootstrap: `bash scripts/install-deps.sh` (`--check` reports
+  per-component status without changing anything). The plugin never installs
+  system services. If an audit reports ClamAV unavailable, the operator runs
+  `bash scripts/install-deps.sh` on that gateway and retries. Where privilege
   escalation is needed, escalate with your usual admin mechanism. The
   script verifies the gateway interpreter via `/proc/<gateway-pid>/exe`
   and never guesses a shell interpreter.
@@ -496,10 +498,25 @@ Dependency split (do not mix the two layers):
 Then:
 
 1. `send_hermes` binary on PATH (hermes-iroh-interconnect sendme fork).
+
+   > **Third-party sidecar disclosure.** The Tor-capable `send_hermes` is
+   > built from the third-party fork `github.com/rahlquist/sendme` at pinned
+   > commit `c700cbcaedb8f626716b8769dcbc5571ec64d088` (not authored by these
+   > plugin maintainers), patched with `iroh-tor-transport=0.1.0` from
+   > `n0-computer/iroh-tor`. Upstream `n0-computer/sendme` has no custom transport
+   > endpoint or `--transport tor` CLI, so it cannot provide Iroh-over-Tor
+   > on its own.
+   > `scripts/install-tor.sh` clones that pinned commit and installs the
+   > resulting binary as root to `/usr/local/bin/send_hermes`. Only the
+   > operator runs that script; the plugin itself never fetches or replaces
+   > its own code.
+
 2. Tor (mandatory — Iroh-over-Tor is the only byte transport):
-   `apt install tor` + `scripts/install-tor.sh` (writes `ops/torrc`,
-   builds the tor-enabled sidecar, enables the tor service). Both
-   endpoints in a pool must enable Tor; the plugin fails closed at
+   `apt install tor` + `scripts/install-tor.sh` (renders the dedicated
+   `/etc/tor/agent-pool.torrc` with `CookieAuthentication 1` and a 0600
+   control cookie for the installing gateway user — the host torrc is
+   never modified — builds the tor-enabled sidecar, enables the tor
+   service). Both endpoints in a pool must enable Tor; the plugin fails closed at
    service construction (lazy, first use) and pool registration
    until then — plugin registration itself is pure wiring and loads
    even with Tor down. No relay fallback exists.
@@ -539,7 +556,7 @@ so setup is per profile:
 
 ## Tests / Demo
 
-- `env -u PYTHONNOUSERSITE HOME=/home/maxcurrent PATH=/usr/bin:/bin /usr/bin/python3.10 -m pytest tests -q`
+- `env -u PYTHONNOUSERSITE HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/python3.10 -m pytest tests -q`
 - `scripts/demo.py` — end-to-end demo of the current model: add repo →
   add task → claim → push (grant + build + deliver) → task completed →
   verify chain. `--real` uses the real transport (send_hermes on PATH).

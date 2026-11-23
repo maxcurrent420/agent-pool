@@ -24,7 +24,9 @@ OWNER = "owner-1"
 POOL = "pool-1"
 REPO = "demo"
 SRC = {"user_id": OWNER}
-DEFAULT_ROOT = "/tmp/agent-pool-worktrees"
+def _default_root():
+    import ledger as L
+    return str(L._plugin_base_dir() / "worktrees")
 
 
 def _world(tmp_path, manifest_version=1):
@@ -55,7 +57,7 @@ def test_claim_returns_worktree_branch_budget_stop(tmp_path):
     ticket = svc.add_ticket(POOL, REPO, "Fix the thing", brief="b", source=SRC)
     tid = ticket["ticket_id"]
     claim = svc.claim(tid, declared_paths=["src/a.py"], source=SRC)
-    assert claim["worktree_path"] == f"{DEFAULT_ROOT}/{REPO}/worktree-{tid}"
+    assert claim["worktree_path"] == f"{_default_root()}/{REPO}/worktree-{tid}"
     assert claim["branch_name"] == f"pool/{tid}"
     assert claim["branch"] == f"pool/{tid}"
     assert claim["base_ref"] == "v1"
@@ -98,9 +100,9 @@ def test_claim_any_returns_worktree_branch(tmp_path):
     assert out["count"] == 2
     by_id = {c["ticket_id"]: c for c in out["claimed"]}
     assert by_id[t1["ticket_id"]]["worktree_path"] == (
-        f"{DEFAULT_ROOT}/{REPO}/worktree-{t1['ticket_id']}")
+        f"{_default_root()}/{REPO}/worktree-{t1['ticket_id']}")
     assert by_id[t2["ticket_id"]]["worktree_path"] == (
-        f"{DEFAULT_ROOT}/other/worktree-{t2['ticket_id']}")
+        f"{_default_root()}/other/worktree-{t2['ticket_id']}")
     for tid in (t1["ticket_id"], t2["ticket_id"]):
         entry = by_id[tid]
         assert entry["branch_name"] == f"pool/{tid}"
@@ -118,9 +120,9 @@ def test_release_and_complete_emit_cleanup_notice(tmp_path):
     svc.claim(t2["ticket_id"], declared_paths=["src/b.py"], source=SRC)
     released = svc.release(t1["ticket_id"], source=SRC)
     assert released["cleanup_notice"] == (
-        f"release worktree {DEFAULT_ROOT}/{REPO}/worktree-{t1['ticket_id']} "
+        f"release worktree {_default_root()}/{REPO}/worktree-{t1['ticket_id']} "
         f"and delete branch pool/{t1['ticket_id']}")
     completed = svc.complete(t2["ticket_id"], source=SRC)
     assert completed["cleanup_notice"] == (
-        f"release worktree {DEFAULT_ROOT}/{REPO}/worktree-{t2['ticket_id']} "
+        f"release worktree {_default_root()}/{REPO}/worktree-{t2['ticket_id']} "
         f"and delete branch pool/{t2['ticket_id']}")

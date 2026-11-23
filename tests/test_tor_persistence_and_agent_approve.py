@@ -192,6 +192,7 @@ def _load_pool_approve():
 
 
 def test_pool_approve_script_fetches_accepted_bundle(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_POOL_WORKTREE_ROOT", str(tmp_path))
     checkout = tmp_path / "checkout"
     w = world(tmp_path, checkout=checkout)
     manifest = _delivered(w)

@@ -190,7 +190,7 @@ def test_01_unsigned_manifest_rejected(world):
     forged = dict(world.v1, content_hash=blake3_hash(b"forged"))
     with pytest.raises(RuntimeError, match="BLAKE3"):
         prop.fetch(manifest=forged, fetcher=prop._members[world.member.key_id],
-                   dest=world.tmp / "forged")
+                   dest=world.tmp / "forged", allowed_roots=[world.tmp])
 
 
 # 02 -----------------------------------------------------------------------
@@ -204,7 +204,8 @@ def test_02_unapproved_member_fetch_refused(world):
                       box_sk=world.maint.box_sk)
     prop = world.member_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
     with pytest.raises(PermissionError):
-        prop.fetch(manifest=world.v1, fetcher=outsider, dest=world.tmp / "evil")
+        prop.fetch(manifest=world.v1, fetcher=outsider, dest=world.tmp / "evil",
+                   allowed_roots=[world.tmp])
 
 
 # 03 -----------------------------------------------------------------------
@@ -360,7 +361,7 @@ def test_12_large_repo_scaled_fixture(world):
     mprop = world.member_svc._propagator({"pool_id": "pool-1", "repo_id": "big"})
     out = mprop.fetch(manifest=res["manifest"],
                       fetcher=mprop._members[world.member.key_id],
-                      dest=world.tmp / "big-fetch")
+                      dest=world.tmp / "big-fetch", allowed_roots=[world.tmp])
     fetched = (Path(out["clone_dir"]) / "data.bin").read_bytes()
     assert len(fetched) == 30 * 1024 * 1024
     assert blake3_hash(fetched) == blake3_hash((big / "data.bin").read_bytes())
@@ -445,7 +446,7 @@ def test_21_legacy_accept_rotates_dek(world):
     mprop = world.member_svc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
     out = mprop.fetch(manifest=acc["manifest"],
                       fetcher=mprop._members[world.member.key_id],
-                      dest=world.tmp / "fetch-rotated")
+                      dest=world.tmp / "fetch-rotated", allowed_roots=[world.tmp])
     assert (Path(out["clone_dir"]) / "hello.txt").read_text() == "v1\n"
 
 
@@ -495,7 +496,7 @@ def test_23_propagator_fetch_retry_flaky_sender(world):
     mprop = msvc._propagator({"pool_id": "pool-1", "repo_id": "demo"})
     out = mprop.fetch(manifest=res["manifest"],
                       fetcher=mprop._members[world.member.key_id],
-                      dest=world.tmp / "flaky-fetch")
+                      dest=world.tmp / "flaky-fetch", allowed_roots=[world.tmp])
     assert (Path(out["clone_dir"]) / "hello.txt").read_text() == "v1\n"
     assert flaky.fetch_calls >= 3  # 2 failures + 1 success, all retried
 

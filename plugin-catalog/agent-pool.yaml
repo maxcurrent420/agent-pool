@@ -43,7 +43,15 @@ description: >-
   HERMES_IROH_RELAY is ignored — there is no relay or direct mode);
   reads profile plugin-data dir for ledger, identities, worktrees; stores
   ed25519/box keys under the plugin data dir; no telemetry, no stored
-  credentials beyond its own keypairs.
+  credentials beyond its own keypairs. Third-party sidecar disclosure:
+  the tor-enabled send_hermes is built from the third-party fork
+  github.com/rahlquist/sendme at pinned commit
+  c700cbcaedb8f626716b8769dcbc5571ec64d088 (patched with
+  iroh-tor-transport=0.1.0 from n0-computer/iroh-tor); upstream
+  n0-computer/sendme has no custom transport, so it cannot provide
+  Iroh-over-Tor on its own. The operator-run scripts/install-tor.sh clones
+  that pin and installs the binary as root to /usr/local/bin; the plugin
+  never fetches or replaces its own code.
 maintainer: maxcurrent420
 tier: community
 category: tools

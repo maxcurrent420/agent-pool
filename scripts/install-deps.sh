@@ -12,26 +12,18 @@
 #   bash scripts/install-deps.sh            # install/verify system services
 #   bash scripts/install-deps.sh --check    # report status only, exit 1 if
 #                                           # anything is missing (no changes)
-#   bash scripts/install-deps.sh --system-only
-#                                           # system services only; skip the
-#                                           # gateway-interpreter pip verify
-#                                           # (used by the plugin's one-shot
-#                                           # self-provisioning hook)
 #
-# Privilege note: package installation and system-unit management need
-# elevated privileges. Escalate with your usual admin mechanism (run as
-# root, or via the standard privilege-escalation binary); the binary name
-# is assembled at runtime below so this file contains no
-# privilege-escalation literal.
+# Privilege note: this script is operator-run. System package/unit changes
+# use the literal privilege-escalation command below; a warning from the
+# plugin install scanner is expected and is explained in the catalog PR.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO/scripts/lib/tor-config.sh"
 CHECK=0
-SYSTEM_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --check) CHECK=1 ;;
-    --system-only) SYSTEM_ONLY=1 ;;
     -h|--help)
       sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -40,11 +32,10 @@ for arg in "$@"; do
 done
 
 log() { printf '[install-deps] %s\n' "$*"; }
-# Escalation binary name assembled from fragments (no literal in file).
-PRIV_NAME='su'"do"
+# Escalation command written literally (no assembled fragments).
 PRIV=""
-if [ "$(id -u)" -ne 0 ] && command -v "$PRIV_NAME" >/dev/null 2>&1; then
-  PRIV="$PRIV_NAME"
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+  PRIV="sudo"
 fi
 FAILURES=0
 
@@ -133,12 +124,11 @@ ensure_tor() {
       return 1
     fi
   fi
-  # Install the unit + torrc when the unit is absent, then enable it.
-  if [ ! -f /etc/systemd/system/agent-pool-tor.service ] && [ "$CHECK" = 0 ]; then
-    log "installing ops/torrc + agent-pool-tor.service"
-    $PRIV install -m 644 "$REPO/ops/torrc" /etc/tor/torrc
-    $PRIV install -m 644 "$REPO/ops/systemd/agent-pool-tor.service" /etc/systemd/system/
-    $PRIV systemctl daemon-reload
+  # Refresh the rendered config + unit on every operator run (never writes
+  # the host torrc; plugin data is per-profile, not shared).
+  if [ "$CHECK" = 0 ]; then
+    log "rendering dedicated Tor config for $(tor_target_user) (data dir $(tor_data_dir))"
+    render_tor_config
   fi
   if tor_unit_active; then
     log "tor unit OK: agent-pool-tor is active"
@@ -186,9 +176,7 @@ ensure_sidecar() {
 
 # --- Run --------------------------------------------------------------------
 log "mode: $([ "$CHECK" = 1 ] && echo check || echo install) (system services only; python deps are Hermes-managed)"
-if [ "$SYSTEM_ONLY" = 0 ]; then
-  verify_pip_layer || true
-fi
+verify_pip_layer || true
 ensure_clamav || true
 ensure_tor || true
 ensure_sidecar || true

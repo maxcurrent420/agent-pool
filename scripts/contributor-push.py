@@ -43,7 +43,7 @@ from identity import ensure_identity  # noqa: E402
 from tickets import PoolService  # noqa: E402
 from transport import RealSendHermesTransport, TorNotReady, tor_ready  # noqa: E402
 
-# Defaults match plugin.yaml / ops/torrc and _service_for with no ctx
+# Defaults match plugin.yaml / ops/agent-pool.torrc and _service_for with no ctx
 # (config-less construction): control 9051, socks 9055, tor_binary empty
 # means the tor-enabled send_hermes on PATH.
 TOR_CONTROL_PORT = 9051

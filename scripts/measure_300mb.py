@@ -10,7 +10,7 @@ runs the 30MB scaled fixture over FakeTransport in pytest).
 Measured on the build host (~2 MB/s network ceiling): expect ~150-300s.
 Run in the FOREGROUND with a generous timeout:
 
-  env -u PYTHONNOUSERSITE HOME=/home/maxcurrent PATH=/usr/bin:/bin \
+  env -u PYTHONNOUSERSITE HOME="$HOME" PATH=/usr/bin:/bin \
     HERMES_IROH_RELAY=off /usr/bin/python3.10 scripts/measure_300mb.py
 """
 import hashlib

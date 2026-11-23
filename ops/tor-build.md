@@ -16,7 +16,8 @@ adds `--transport tor` to both argv forms and emits **no relay flags**.
 
 - `send_hermes` upstream: `github.com/rahlquist/sendme` at commit
   `c700cbcaedb8f626716b8769dcbc5571ec64d088` (sendme 0.36.0; hermes-iroh-
-  interconnect README pin).
+  interconnect README pin). This is a third-party fork; the pin is a
+  supply-chain trust decision, not an upstream claim.
 - `iroh-tor-transport`: **0.1.0** (crates.io; repo
   `github.com/n0-computer/iroh-tor`). Experimental ("expect breaking
   changes") — pin exact, upgrade deliberately.
@@ -62,7 +63,7 @@ bytes verified).
 transport_mode: tor
 tor_control_port: 9051
 tor_socks_port: 9055
-tor_binary: /home/maxcurrent/.local/bin/send_hermes-tor   # or install as send_hermes on PATH
+tor_binary: /usr/local/bin/send_hermes   # root install path (or empty = on PATH)
 ```
 
 (The `scripts/install-tor.sh` route installs the same binary as
@@ -76,11 +77,13 @@ Nothing in this phase installs anything — the operator runs these on
 pool fails closed with a clear error, never a silent downgrade).
 
 ```sh
-# 1. Tor daemon (ops/torrc + ops/systemd/agent-pool-tor.service)
-# Run as root (or with elevated privileges):
-apt install tor
-install -m 644 ops/torrc /etc/tor/torrc
-install -m 644 ops/systemd/agent-pool-tor.service /etc/systemd/system/
+# 1. Tor daemon (rendered /etc/tor/agent-pool.torrc + ops/systemd/agent-pool-tor.service)
+# Preferred: run the operator script, which renders the config for the
+# installing gateway user and never touches the host torrc:
+bash scripts/install-tor.sh
+# Or do it manually: render ops/agent-pool.torrc (@DATA_DIR@ -> the
+# gateway user's <plugin-data-dir>/tor-data) and the unit (@TOR_USER@ ->
+# that user), then install them with 0600/0644 under those exact names.
 systemctl daemon-reload
 systemctl enable --now agent-pool-tor
 
@@ -108,7 +111,9 @@ send_hermes send --help | grep -- --transport   # sidecar is tor-enabled
 systemctl status agent-pool-tor                 # daemon up
 # plugin side (tor_ready() does exactly these probes):
 #   - binary resolves and advertises --transport tor
-#   - 127.0.0.1:9051 answers AUTHENTICATE -> 250 OK
+#   - 127.0.0.1:9051 answers AUTHENTICATE <hex cookie> -> 250 OK
+#     (cookie read from the 0600 control_auth_cookie in the gateway
+#      user's plugin-data dir, per ops/agent-pool.torrc)
 ```
 
 Then set per-gateway plugin config:

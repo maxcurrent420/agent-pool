@@ -4,5 +4,5 @@
 #   ./scripts/demo.sh --real   # real send_hermes/Iroh transport
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec env -u PYTHONNOUSERSITE HOME=/home/maxcurrent PATH=/usr/bin:/bin \
+exec env -u PYTHONNOUSERSITE HOME="$HOME" PATH=/usr/bin:/bin \
   /usr/bin/python3.10 scripts/demo.py "$@"

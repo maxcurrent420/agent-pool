@@ -85,9 +85,10 @@ def world(tmp_path):
             "contrib": contrib, "ticket_id": ticket["ticket_id"]}
 
 
-def test_claim_reply_carries_tor_link_and_manifest(tmp_path):
+def test_claim_reply_carries_tor_link_and_manifest(tmp_path, monkeypatch):
     """Bot #1's claim reply carries transfer_ticket + manifest_hash +
     the accepted manifest (trimmed only when over the reply guard)."""
+    monkeypatch.setenv("AGENT_POOL_WORKTREE_ROOT", str(tmp_path))
     w = world(tmp_path)
     # Enroll the contributor's real gateway key (public material only).
     keys = w["contrib_svc"].my_keys()

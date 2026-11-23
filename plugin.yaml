@@ -15,7 +15,15 @@ description: >-
   child processes; network calls go to Iroh peers over Tor (no relay in the
   connection path; HERMES_IROH_RELAY is ignored); stores its own ed25519/box
   keypairs and ledger under the profile plugin-data dir; no telemetry, no
-  stored credentials beyond its own keypairs.
+  stored credentials beyond its own keypairs. Third-party sidecar
+  disclosure: the tor-enabled send_hermes is built from the third-party
+  fork github.com/rahlquist/sendme at pinned commit
+  c700cbcaedb8f626716b8769dcbc5571ec64d088 (patched with
+  iroh-tor-transport=0.1.0 from n0-computer/iroh-tor); upstream
+  n0-computer/sendme has no custom transport, so it cannot provide
+  Iroh-over-Tor on its own. Only the operator-run scripts/install-tor.sh
+  clones that pin and installs the binary as root to /usr/local/bin;
+  the plugin never fetches or replaces its own code.
 manifest_version: 2
 api_version: 1
 license: MIT
@@ -63,7 +71,11 @@ config_schema:
   tor_control_port:
     type: int
     default: 9051
-    description: "Tor control port (127.0.0.1 only, CookieAuthentication 0, ops/torrc). Probed by tor_ready() at service construction (lazy, first use) and before every transfer; failure names 'systemctl start agent-pool-tor' and fails closed. Never probed at plugin registration."
+    description: "Tor control port (127.0.0.1 only, CookieAuthentication 1 + 0600 cookie, ops/agent-pool.torrc). Probed by tor_ready() at service construction (lazy, first use) and before every transfer; failure names 'systemctl start agent-pool-tor' and fails closed. Never probed at plugin registration."
+  tor_cookie_file:
+    type: str
+    default: ""
+    description: "Optional override for the Tor control cookie path. Empty = <plugin data dir>/tor-data/control_auth_cookie, matching CookieAuthentication 1 in the rendered ops/agent-pool.torrc. The sidecar discovers the cookie from Tor's PROTOCOLINFO; both must run as the gateway user."
   tor_socks_port:
     type: int
     default: 9055
@@ -76,10 +88,6 @@ config_schema:
     type: str
     default: "/run/clamav/clamd.ctl"
     description: "Unix socket path of the ClamAV daemon (clamd) used by the mandatory ingestion scan (clamav_scan). When the daemon socket is unreachable the plugin falls back to the real clamscan binary; a missing engine fails the audit closed (never a keyword-only verdict)."
-  auto_provision:
-    type: bool
-    default: true
-    description: "When true, a missing ClamAV engine at audit time triggers one lockfile-guarded attempt at the system steps of scripts/install-deps.sh (--system-only) under the plugin data dir, then re-probes; still absent fails closed. When false, a missing engine fails the audit closed immediately."
   max_turns:
     type: int
     default: 25

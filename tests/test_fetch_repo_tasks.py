@@ -145,7 +145,8 @@ def test_fetch_task_list_single_ticket_detail(tmp_path):
     assert row["claimant_key_id"] is None
 
 
-def test_fetch_repo_download_roundtrip(tmp_path):
+def test_fetch_repo_download_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_POOL_WORKTREE_ROOT", str(tmp_path))
     w = world(tmp_path)
     fetched = w["maint_svc"].fetch_repo(REPO, source=_owner_source())
     manifest = json.loads(fetched["manifest_json"])
@@ -227,10 +228,11 @@ def test_download_verifies_manifest_signature(tmp_path):
         find.fetch_repo_download(manifest, dest=tmp_path / "dl", source=_member_source())
 
 
-def test_download_no_local_pool_branch(tmp_path):
+def test_download_no_local_pool_branch(tmp_path, monkeypatch):
     """A contributor gateway that also hosts an unrelated pool still
     downloads the foreign repo via the wrapped-key ACL path, not the
     local-chain path (D6)."""
+    monkeypatch.setenv("AGENT_POOL_WORKTREE_ROOT", str(tmp_path))
     w = world(tmp_path)
     fetched = w["maint_svc"].fetch_repo(REPO, source=_owner_source())
     manifest = json.loads(fetched["manifest_json"])

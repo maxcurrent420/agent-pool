@@ -170,6 +170,7 @@ def test_load_manifest_arg_path_and_inline(tmp_path):
 # ---- happy path (fake transport) ----
 
 def test_fetch_happy_path_via_reply_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_POOL_WORKTREE_ROOT", str(tmp_path))
     w = _world(tmp_path)
     mod = _load_wrapper()
     monkeypatch.setattr(mod, "build_service",

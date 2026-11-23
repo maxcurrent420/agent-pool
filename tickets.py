@@ -102,8 +102,7 @@ class PoolService:
                  gateway=None, transport_overrides=None,
                  agent_task_allocations=None, worktree_root=None,
                  maintainer_discord_user_id=None, maintainer_bot_discord_user_id=None,
-                 clamd_socket="",
-                 auto_provision=True):
+                 clamd_socket=""):
         # Backwards-compat: old call sites passed (conn, gateway, transport).
         # Duck-type: anything with post_notice is a legacy gateway (ignored).
         if args:
@@ -156,14 +155,14 @@ class PoolService:
             _maint_bot_kw
             or _env_get("AGENT_POOL_MAINTAINER_BOT_DISCORD_USER_ID", "").strip())
         # The agent's configured checkout root for per-ticket worktrees.
+        # Plugin data is per-profile, never shared /tmp.
         self._worktree_root = (
             worktree_root
             or _env_get("AGENT_POOL_WORKTREE_ROOT", "").strip()
-            or "/tmp/agent-pool-worktrees").rstrip("/")
+            or str(L._plugin_base_dir() / "worktrees")).rstrip("/")
         # ClamAV ingestion-scan config (plugin.yaml config_schema keys,
         # threaded by the plugin host; defaults match plugin.yaml).
         self._clamd_socket = clamd_socket or "/run/clamav/clamd.ctl"
-        self._auto_provision = bool(auto_provision)
 
     def _allocation_for(self, key_id) -> int:
         """Resolved task allocation for one agent on this pool."""
@@ -351,8 +350,7 @@ class PoolService:
             maintainer_key_id=maintainer_id,
             maintainer_signing_key=self._caller_sk,
             members=members,
-            clamd_socket=self._clamd_socket,
-            auto_provision=self._auto_provision)
+            clamd_socket=self._clamd_socket)
 
     def list_gateways(self) -> list:
         """Pools/gateways this agent interacts with (not the hosted pool)."""
@@ -545,9 +543,11 @@ class PoolService:
         try:  # package import (Hermes loads plugins as a package)
             from .propagation import Member as _M
             from .propagation import RepoPropagator as _RP
+            from .propagation import _resolve_fetch_dest as _resolve_dest
         except ImportError:  # flat import (pytest from repo root)
             from propagation import Member as _M
             from propagation import RepoPropagator as _RP
+            from propagation import _resolve_fetch_dest as _resolve_dest
         members = {self._caller_key_id: _M(key_id=self._caller_key_id, role="member",
                                            box_pubkey_hex="", box_sk=self._caller_box_sk)}
         if signer and signer not in members:
@@ -560,8 +560,10 @@ class PoolService:
         fetch_manifest = (dict(manifest, transfer_ticket=transfer_ticket)
                           if transfer_ticket else manifest)
         fetcher = members[self._caller_key_id]
-        return prop.fetch(manifest=fetch_manifest, fetcher=fetcher, dest=Path(dest),
-                          verify_chain=False)
+        allowed_roots = [L._plugin_base_dir(), Path(self._worktree_root)]
+        safe_dest = _resolve_dest(dest, allowed_roots=allowed_roots)
+        return prop.fetch(manifest=fetch_manifest, fetcher=fetcher, dest=safe_dest,
+                          verify_chain=False, allowed_roots=allowed_roots)
 
     def _recorded_verify_key_hex(self, key_id) -> str:
         """The recorded verify key for ``key_id`` from this gateway's
@@ -2449,8 +2451,7 @@ class PoolService:
             pool_id=pool_id,
             maintainer_key_id=maintainer_id, maintainer_signing_key=maintainer_sk,
             members=members,
-            clamd_socket=self._clamd_socket,
-            auto_provision=self._auto_provision)
+            clamd_socket=self._clamd_socket)
 
     # -- audit -------------------------------------------------------
 

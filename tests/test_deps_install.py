@@ -84,7 +84,7 @@ def test_registered_equals_declared_after_schema_change():
     # New config keys present with sane defaults.
     schema = manifest["config_schema"]
     assert schema["clamd_socket"]["default"] == "/run/clamav/clamd.ctl"
-    assert schema["auto_provision"]["default"] is True
+    assert "auto_provision" not in schema
     assert schema["tor_binary"]["type"] == "str"
 
 
@@ -119,24 +119,10 @@ def test_install_deps_check_reports_components():
         assert "hermes plugins validate" in out
 
 
-def test_install_deps_script_is_scanner_safe():
-    # The validate scanner reads every file (Markdown included); the
-    # privilege-escalation command word must never appear literally.
-    forbidden = "su" + "do"
-    scanned = []
-    for root, dirs, files in os.walk(REPO):
-        # .hermes/ holds operator reports, not shipped plugin sources.
-        dirs[:] = [d for d in dirs if d not in (".hermes", "__pycache__", ".git")]
-        for f in files:
-            if f.endswith((".py", ".yaml", ".yml", ".sh", ".md", ".toml")):
-                scanned.append(os.path.join(root, f))
-    assert scanned
-    hits = []
-    for path in scanned:
-        try:
-            text = open(path, encoding="utf-8", errors="ignore").read()
-        except OSError:
-            continue
-        if re.search(rf"\b{forbidden}\b", text):
-            hits.append(os.path.relpath(path, REPO))
-    assert not hits, f"escalation literal in: {hits}"
+def test_install_scripts_use_literal_privilege_command():
+    word = "su" + "do"
+    for rel in ("scripts/install-deps.sh", "scripts/install-tor.sh"):
+        text = open(os.path.join(REPO, rel)).read()
+        assert re.search(rf"\b{word}\b", text), rel
+        assert "PRIV_NAME" not in text, rel
+        assert f"'{word[:2]}'\"{word[2:]}\"" not in text, rel

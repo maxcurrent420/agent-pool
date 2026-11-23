@@ -5,15 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# torrc: ops/torrc — ControlPort 127.0.0.1:9051, CookieAuthentication 0,
-# SocksPort 127.0.0.1:9055, DataDirectory under the plugin data dir.
+User=@TOR_USER@
+# torrc: /etc/tor/agent-pool.torrc (rendered from ops/agent-pool.torrc; CookieAuthentication 1)
+# ControlPort 127.0.0.1:9051, SocksPort 127.0.0.1:9055, DataDirectory in the gateway user's plugin-data dir.
 # No automatic recovery if tor crashes is a known Iroh-Tor limitation;
 # Restart=always is the mitigation (see ops/tor-build.md).
-ExecStart=/usr/sbin/tor -f /etc/tor/torrc
+ExecStart=/usr/sbin/tor -f /etc/tor/agent-pool.torrc
 Restart=always
 RestartSec=5
-# ControlPort is localhost-only with cookie auth OFF: only local
-# processes may command the daemon. Do not expose it.
+# ControlPort is localhost-only with a 0600 cookie: only the gateway user
+# (and children it starts) can authenticate. Do not expose it.
 ProtectSystem=strict
 ProtectHome=no
 PrivateTmp=true

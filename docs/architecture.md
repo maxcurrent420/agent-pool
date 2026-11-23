@@ -127,7 +127,9 @@ The plugin is a passive add-on: it tells the agent how to push and
 pull and exposes controls to maintain the pool; the agent runs the
 work. On claim the plugin hands the agent `worktree_path`
 (`<dest_root>/<repo_id>/worktree-<ticket_id>`, dest_root default
-`/tmp/agent-pool-worktrees`, env `AGENT_POOL_WORKTREE_ROOT`),
+`<plugin-data-dir>/worktrees`, env `AGENT_POOL_WORKTREE_ROOT`); fetch
+`--dest` is confined to that profile data dir / configured worktree root
+(no shared `/tmp` destination),
 `branch` (`pool/<ticket_id>`), `base_ref` (`v{accepted_version}`), the
 budget dict, and `stop_condition`
 `{"condition": "budget_exhausted", "enforce": true}`. The agent runs

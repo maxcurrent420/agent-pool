@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PLUGIN = Path("/home/maxcurrent/Documents/AntiGravityProjects/agent-pool")
+PLUGIN = Path(os.environ.get("AGENT_POOL_PLUGIN_PATH") or Path(__file__).resolve().parent.parent)
 PLUGINS_DIR = Path.home() / ".hermes" / "plugins"
 LINK = PLUGINS_DIR / "agent-pool"
 
@@ -76,7 +76,7 @@ def main():
 
     print("\n=== next commands (from scripts/live-discord-check.md) ===")
     steps = [
-        "1. ln -s /home/maxcurrent/Documents/AntiGravityProjects/agent-pool ~/.hermes/plugins/agent-pool",
+        f"1. ln -s {PLUGIN} ~/.hermes/plugins/agent-pool",
         "2. hermes plugins enable agent-pool",
         "3. Restart the gateway (slash sync adapter.py:1556-1558)",
         "4. Config: transport=real, transport_mode=tor (only value), budgets (no gateway_channel_id)",

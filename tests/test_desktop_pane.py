@@ -1357,3 +1357,12 @@ def test_prompt_companion_section_field_inventory_markers():
         assert marker in src, marker
     assert "host.composer" not in src
     assert src.count("PASTE_HINT") >= 10
+
+
+def test_pane_ledger_uses_profile_plugin_data(monkeypatch, tmp_path):
+    plugin = _load_plugin()
+    monkeypatch.setenv("AGENT_POOL_DATA_DIR", str(tmp_path / "profile-data"))
+    monkeypatch.delenv("AGENT_POOL_PANE_LEDGER", raising=False)
+    assert plugin._pane_ledger_path() == str(tmp_path / "profile-data" / "data.db")
+    monkeypatch.setenv("AGENT_POOL_PANE_LEDGER", str(tmp_path / "override.db"))
+    assert plugin._pane_ledger_path() == str(tmp_path / "override.db")

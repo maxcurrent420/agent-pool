@@ -14,7 +14,7 @@ Type=simple
 #
 # Enable it ONLY after the follow-up lands; until then the per-transfer
 # path needs no sendhermes unit — only agent-pool-tor.
-ExecStart=/home/maxcurrent/.local/bin/send_hermes serve --transport tor
+ExecStart=/usr/local/bin/send_hermes serve --transport tor
 Restart=always
 RestartSec=5
 ProtectSystem=strict

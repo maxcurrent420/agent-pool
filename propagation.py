@@ -56,6 +56,45 @@ except ImportError:  # flat import (pytest from repo root)
     from transport import TransportBackend, fetch_with_retry, mode_note
 
 # --------------------------------------------------------------------------
+# Fetch destination confinement (no shared /tmp by default).
+# --------------------------------------------------------------------------
+
+def _fetch_roots() -> list[Path]:
+    """The only roots a ``fetch --dest`` may resolve under: this profile's
+    plugin data dir and its configured worktree root."""
+    try:
+        from .ledger import _plugin_base_dir
+    except ImportError:
+        from ledger import _plugin_base_dir
+    base = _plugin_base_dir()
+    worktree = Path(os.environ.get("AGENT_POOL_WORKTREE_ROOT", "") or
+                    (base / "worktrees")).expanduser()
+    return [base, worktree]
+
+
+def _resolve_fetch_dest(dest=None, *, allowed_roots=None) -> Path:
+    roots = list(allowed_roots) if allowed_roots is not None else _fetch_roots()
+    candidate = (Path(dest).expanduser() if dest else _fetch_roots()[0] / "fetch")
+    resolved = candidate.resolve()
+    if not any(resolved.is_relative_to(Path(root).resolve()) for root in roots):
+        raise ValueError(
+            "fetch --dest must resolve under the plugin data dir or "
+            "AGENT_POOL_WORKTREE_ROOT (no shared /tmp destination)")
+    return resolved
+
+
+def _minimal_child_env() -> dict[str, str]:
+    """Minimal environment for production subprocesses (no provider keys).
+    Values are read at call time so a monkeypatched PATH is honored."""
+    env: dict[str, str] = {}
+    for key in ("PATH", "HOME", "LANG"):
+        value = os.environ.get(key, "")
+        if value:
+            env[key] = value
+    return env
+
+
+# --------------------------------------------------------------------------
 # Static audit (network-off sandbox).
 # --------------------------------------------------------------------------
 
@@ -167,7 +206,8 @@ def _sandbox_scan(clone_dir: Path) -> dict:
             "--dev-bind", "/dev", "/dev", "--proc", "/proc",
             py, str(script), str(clone_dir),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                              env=_minimal_child_env())
         if proc.returncode == 0:
             report = json.loads(proc.stdout)
             report["sandbox"] = "bwrap:network-off"
@@ -177,7 +217,8 @@ def _sandbox_scan(clone_dir: Path) -> dict:
         print(f"[agent-pool] bwrap failed rc={proc.returncode}: {proc.stderr[:300]}")
     # Fallback: SAME static checks, no sandbox. Caller must report this.
     proc = subprocess.run([sys.executable, str(script), str(clone_dir)],
-                          capture_output=True, text=True, timeout=120)
+                          capture_output=True, text=True, timeout=120,
+                          env=_minimal_child_env())
     report = json.loads(proc.stdout)
     report["sandbox"] = "fallback:unsandboxed (no sandbox binary available)"
     return report
@@ -201,7 +242,7 @@ class ClamAVUnavailable(RuntimeError):
 def _clamav_signature_version() -> str:
     try:
         proc = subprocess.run(["clamscan", "--version"], capture_output=True,
-                              text=True, timeout=30)
+                              text=True, timeout=30, env=_minimal_child_env())
         first = (proc.stdout or "").strip().splitlines()
         return first[0] if first else "unknown"
     except Exception:
@@ -267,7 +308,7 @@ def _clamscan_fallback(clone_dir: Path) -> list[dict] | None:
         return None
     proc = subprocess.run(
         ["clamscan", "-r", "--no-summary", "--stdout", str(clone_dir)],
-        capture_output=True, text=True, timeout=600)
+        capture_output=True, text=True, timeout=600, env=_minimal_child_env())
     infected: list[dict] = []
     for line in (proc.stdout or "").splitlines():
         if line.endswith("FOUND"):
@@ -315,6 +356,7 @@ def pack_bundle(repo_path: Path) -> bytes:
         proc = subprocess.run(
             ["git", "-C", str(repo_path), "bundle", "create", bundle_path, "--all"],
             capture_output=True, text=True, timeout=120,
+            env=_minimal_child_env(),
         )
         if proc.returncode != 0:
             raise RuntimeError(f"git bundle failed: {proc.stderr.strip()[:500]}")
@@ -380,8 +422,7 @@ class RepoPropagator:
                  transport: TransportBackend = None, gateway=None, pool_id: str,
                  maintainer_key_id: str, maintainer_signing_key,
                  members: dict[str, Member],
-                 clamd_socket: str = DEFAULT_CLAMD_SOCKET,
-                 auto_provision: bool = True):
+                 clamd_socket: str = DEFAULT_CLAMD_SOCKET):
         # Positional-compat: old call sites passed (conn, gateway, transport).
         # Gateway is ignored — Hermes posts; propagator only returns content.
         if args:
@@ -412,7 +453,6 @@ class RepoPropagator:
         # ClamAV ingestion scan config (config_schema keys, threaded by
         # the service layer; defaults match plugin.yaml).
         self._clamd_socket = clamd_socket or DEFAULT_CLAMD_SOCKET
-        self._auto_provision = bool(auto_provision)
         if maintainer_key_id not in members:
             raise ValueError("maintainer must be in the members map")
 
@@ -663,48 +703,18 @@ class RepoPropagator:
             raise RuntimeError("BLAKE3 mismatch: fetched bundle does not match manifest content_hash")
         return plaintext, dek, "tor_fetch"
 
-    def _provision_clamav_once(self) -> bool:
-        """One-shot system provisioning behind a lockfile under the plugin
-        data dir (never in the checkout, never a retry loop): runs only
-        the system steps of scripts/install-deps.sh. Returns True when a
-        provisioning attempt was made (caller re-probes afterwards)."""
-        try:  # package import (Hermes loads plugins as a package)
-            from .ledger import default_db_path
-        except ImportError:
-            try:
-                from ledger import default_db_path
-            except ImportError:
-                return False
-        lockfile = default_db_path().parent / "clamav-provision.attempted"
-        if lockfile.exists():
-            return False
-        script = Path(__file__).resolve().parent / "scripts" / "install-deps.sh"
-        lockfile.write_text("attempted\n")
-        if not script.is_file():
-            return False
-        try:
-            subprocess.run(["bash", str(script), "--system-only"],
-                           capture_output=True, text=True, timeout=900)
-        except Exception:
-            return False
-        return True
-
     def _clamav_or_fail_closed(self, clone_dir: Path) -> dict:
-        """Mandatory real-engine scan: provision once, then re-probe; a
-        still-absent engine fails the audit closed (never keyword-only)."""
+        """Mandatory real-engine scan. A missing engine is an immediate
+        fail-closed refusal with the operator's remediation command;
+        a keyword-only verdict is never accepted."""
         try:
             return clamav_scan(clone_dir, clamd_socket=self._clamd_socket)
-        except ClamAVUnavailable:
-            if self._auto_provision and self._provision_clamav_once():
-                try:
-                    return clamav_scan(clone_dir,
-                                       clamd_socket=self._clamd_socket)
-                except ClamAVUnavailable:
-                    pass
+        except ClamAVUnavailable as exc:
             raise RuntimeError(
                 "audit refused: ClamAV unavailable — run "
-                "bash scripts/install-deps.sh (system services) and retry; "
-                "a keyword-only verdict is never accepted")
+                "bash scripts/install-deps.sh on this gateway and retry; "
+                "a keyword-only verdict is never accepted "
+                f"({str(exc)[:160]})") from exc
 
     def _persist_verified_bundle(self, manifest: dict,
                                   plaintext: bytes) -> str:
@@ -751,7 +761,7 @@ class RepoPropagator:
 
         Both layers run on the cloned bundle: the real ClamAV engine is
         the mandatory verdict source (infected refuses; an unavailable
-        engine fails closed after one provisioning attempt); the keyword
+        engine fails closed immediately with the operator install command); the keyword
         sandbox scan stays as a supplementary layer whose hits still
         flag a ClamAV-clean tree. Stores the combined report in the
         ledger; ``report_hash`` covers both sub-reports."""
@@ -765,6 +775,7 @@ class RepoPropagator:
             proc = subprocess.run(
                 ["git", "clone", "--quiet", str(bundle_file), str(clone_dir)],
                 capture_output=True, text=True, timeout=120,
+                env=_minimal_child_env(),
             )
             if proc.returncode != 0:
                 raise RuntimeError(f"git clone of bundle failed: {proc.stderr.strip()[:400]}")
@@ -952,7 +963,8 @@ class RepoPropagator:
     # -- fetch ---------------------------------------------------------------
 
     def fetch(self, *, manifest: dict, fetcher: Member, dest: Path,
-              verify_chain: bool = True) -> dict:
+              verify_chain: bool = True,
+              allowed_roots: list[Path] | None = None) -> dict:
         """Verify chain -> ACL -> Iroh-fetch -> decrypt -> BLAKE3 -> git clone.
 
         ``verify_chain=False`` is the cross-gateway ``/fetch repo --manifest``
@@ -964,7 +976,7 @@ class RepoPropagator:
         the DEK), and the BLAKE3 check against the manifest still pins the
         bytes. Chain verification stays mandatory for pool-gateway fetches.
         """
-        dest = Path(dest)
+        dest = _resolve_fetch_dest(dest, allowed_roots=allowed_roots)
         dest.mkdir(parents=True, exist_ok=True)
 
         if verify_chain:
@@ -1003,6 +1015,7 @@ class RepoPropagator:
         proc = subprocess.run(
             ["git", "clone", "--quiet", str(bundle_file), str(clone_dir)],
             capture_output=True, text=True, timeout=120,
+            env=_minimal_child_env(),
         )
         if proc.returncode != 0:
             raise RuntimeError(f"git clone failed: {proc.stderr.strip()[:400]}")

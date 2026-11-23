@@ -3,7 +3,12 @@
 The only byte transport is Iroh QUIC over Tor via
 `hermes-iroh-interconnect` (`send_hermes` rebuilt with the Tor custom
 transport): peer-to-peer, no server to run, BLAKE3-verified bearer
-tickets. Known ceilings (stated without pinned throughput numbers —
+tickets. The tor-enabled `send_hermes` is built from the third-party fork
+`github.com/rahlquist/sendme` at pinned commit
+`c700cbcaedb8f626716b8769dcbc5571ec64d088`, patched with
+`iroh-tor-transport=0.1.0`; upstream `n0-computer/sendme` has no custom
+transport endpoint or `--transport tor` CLI, so it cannot provide
+Iroh-over-Tor on its own. Known ceilings (stated without pinned throughput numbers —
 actual speed depends on the Tor path, network conditions, and
 repo size): the sender must stay alive during transfer; repos well
 above the gigabyte range are out of scope for the current design.

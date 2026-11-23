@@ -21,7 +21,9 @@ are downloaded over the configured Tor transport (using the fresh
 top-level ticket override), BLAKE3-verified, written to
 ``<dest>/bundle-v<N>.git`` and git-cloned into ``<dest>/worktree-v<N>``.
 
-``--dest`` defaults to ``/tmp/agent-pool-worktrees/<repo_id>``.
+``--dest`` defaults to ``<plugin-data-dir>/fetch`` (overridable via
+``AGENT_POOL_WORKTREE_ROOT``); it must resolve under the profile's plugin
+data dir or worktree root — a shared ``/tmp`` destination is refused.
 ``--ticket`` names an optional ticket id recorded in the ledger event
 (pass-through; fetch_repo_download itself does not consume it).
 
@@ -52,7 +54,7 @@ from identity import ensure_identity  # noqa: E402
 from tickets import PoolService  # noqa: E402
 from transport import RealSendHermesTransport, TorNotReady, tor_ready  # noqa: E402
 
-# Defaults match plugin.yaml / ops/torrc and _service_for with no ctx.
+# Defaults match plugin.yaml / ops/agent-pool.torrc and _service_for with no ctx.
 TOR_CONTROL_PORT = 9051
 TOR_SOCKS_PORT = 9055
 BUDGET_DEFAULTS = {"max_turns": 25, "max_tasks_per_day": 5,
@@ -176,7 +178,7 @@ def build_parser():
                    help="fresh top-level transfer_ticket (with --manifest)")
     p.add_argument("--dest", default=None,
                    help="destination dir (default: "
-                        "/tmp/agent-pool-worktrees/<repo_id>)")
+                        "<plugin-data-dir>/worktrees/<repo_id>)")
     p.add_argument("--ticket", dest="ticket_id", default=None,
                    help="optional ticket id (recorded for reference)")
     p.add_argument("--data-dir", default=None,
@@ -202,7 +204,8 @@ def main(argv=None):
         print(f"error: {exc}", file=sys.stderr)
         return 1
     repo_id = manifest.get("repo_id") or "repo"
-    dest = Path(args.dest) if args.dest else Path("/tmp/agent-pool-worktrees") / str(repo_id)
+    dest = (Path(args.dest) if args.dest
+            else L._plugin_base_dir() / "worktrees" / str(repo_id))
     try:
         svc = build_service(args.data_dir)
         result = svc.fetch_repo_download(manifest, dest=dest,
