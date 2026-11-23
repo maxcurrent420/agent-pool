@@ -1,5 +1,5 @@
 name: agent-pool
-version: "2.8.0"
+version: "2.8.1"
 description: >-
   Agent Pool — friends form an agent team; repos propagate via Iroh-over-Tor
   only (Iroh + Tor custom transport via the tor-enabled send_hermes sidecar;

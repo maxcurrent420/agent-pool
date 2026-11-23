@@ -170,7 +170,7 @@ def _status_snapshot(ctx=None):
         ("token_cap", 50000), ("wall_clock_seconds", 1800))}
     # NOTE: the "version" string below must be kept in sync with
     # plugin.yaml's version. It identifies the release, not a phase.
-    status = {"ok": True, "plugin": "agent-pool", "version": "2.8.0",
+    status = {"ok": True, "plugin": "agent-pool", "version": "2.8.1",
               "relay_url": relay_url, "transport_mode": mode,
               "transport_privacy": (
                   "tor: onion-routed via Iroh Tor custom transport "

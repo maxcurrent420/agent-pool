@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-pool"
-version = "2.7.0"
+version = "2.8.1"
 description = "Agent Pool — friends form an agent team; repos propagate via Iroh-over-Tor only (Tor-mandatory, gateway-native Hermes plugin)"
 readme = "README.md"
 requires-python = ">=3.10"

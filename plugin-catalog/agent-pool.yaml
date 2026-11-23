@@ -56,7 +56,7 @@ maintainer: maxcurrent420
 tier: community
 category: tools
 requires_hermes: ">=0.23.0"
-version: "2.8.0"
+version: "2.8.1"
 readme: true
 platforms: []
 capabilities:
