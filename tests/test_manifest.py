@@ -73,7 +73,7 @@ def test_manifest_strict_yaml_no_duplicate_keys():
 def test_manifest_version_is_string():
     data = _load_manifest_strict()
     assert isinstance(data["version"], str)
-    assert data["version"] == "2.8.0"
+    assert data["version"] == "2.8.1"
 
 
 def test_manifest_declares_requires_env():
